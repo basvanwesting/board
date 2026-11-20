@@ -9,12 +9,14 @@
 //! started: 2026-11-20T17:02:11Z
 //!
 //! # Title
+//! ## Task
 //! ```
 
 use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::id::{BacklogId, BriefId};
 use crate::raw;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -313,7 +315,41 @@ pub struct Brief {
     body: Vec<u8>,
 }
 
+/// The section that runs to the end of the file, whatever lines it holds.
+const REPORT: &str = "Report";
+
+/// A `## Name` section of a brief's body: the lines after its heading, up to
+/// the next section's heading or the end of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section<'a> {
+    /// The heading's text after `## `, trimmed.
+    pub name: &'a [u8],
+    /// The section's lines, raw, without the heading line.
+    pub text: &'a [u8],
+}
+
+impl Section<'_> {
+    /// Names are matched ignoring ASCII case: `## Out of Scope` is the
+    /// section `Out of scope`, as a reader takes it.
+    pub fn is_named(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_bytes())
+    }
+
+    /// Whether a line of the section is not blank.
+    pub fn has_text(&self) -> bool {
+        raw::lines(self.text).any(|line| !raw::is_blank(raw::content(line)))
+    }
+}
+
 impl Brief {
+    /// A new brief's file: `id`, `status: draft`, `base`, `created` and one
+    /// blank line. The planner writes the rest.
+    pub fn new(id: BriefId, base: &str, created: Stamp) -> Brief {
+        Brief::parse(
+            format!("id: {id}\nstatus: draft\nbase: {base}\ncreated: {created}\n\n").as_bytes(),
+        )
+    }
+
     /// Never fails: a file without header lines (an archived brief placed by
     /// hand) is all body.
     pub fn parse(bytes: &[u8]) -> Brief {
@@ -371,6 +407,67 @@ impl Brief {
                 self.header.push([line.as_slice(), terminator].concat());
             }
         }
+    }
+
+    /// Writes the backlog items the brief resolves, which `file` deletes:
+    /// `closes: b41, b52`.
+    pub(crate) fn set_closes(&mut self, ids: &[BacklogId]) {
+        let ids: Vec<String> = ids.iter().map(BacklogId::to_string).collect();
+        self.set("closes", &ids.join(", "));
+    }
+
+    /// The `## ` sections of the body, in file order.
+    ///
+    /// A heading is a line that starts with `## ` outside a code fence (a
+    /// line whose first non-blank characters are ```` ``` ````, which opens
+    /// or closes one): a brief quotes markdown, and a heading in a quoted
+    /// block is not the brief's. `## Report` runs to the end of the file, so
+    /// a report may hold `## ` lines of its own; the tool keeps it last.
+    pub fn sections(&self) -> Vec<Section<'_>> {
+        let body = self.body.as_slice();
+        let mut sections = Vec::new();
+        // The open section: its name and where its text starts.
+        let mut open: Option<(&[u8], usize)> = None;
+        let mut fenced = false;
+        let mut at = 0;
+        for line in raw::lines(body) {
+            let start = at;
+            at += line.len();
+            let content = raw::content(line);
+            if content.trim_ascii_start().starts_with(b"```") {
+                fenced = !fenced;
+                continue;
+            }
+            let Some(name) = content.strip_prefix(b"## ").filter(|_| !fenced) else {
+                continue;
+            };
+            if let Some((name, from)) = open {
+                sections.push(Section {
+                    name,
+                    text: &body[from..start],
+                });
+            }
+            let name = name.trim_ascii();
+            open = Some((name, at));
+            if name.eq_ignore_ascii_case(REPORT.as_bytes()) {
+                break;
+            }
+        }
+        if let Some((name, from)) = open {
+            sections.push(Section {
+                name,
+                text: &body[from..],
+            });
+        }
+        sections
+    }
+
+    /// The first section with this name. A name written twice by hand reads
+    /// as its first section, like a header key.
+    pub fn section(&self, name: &str) -> Option<Section<'_>> {
+        self.sections()
+            .into_iter()
+            .find(|section| section.is_named(name))
     }
 
     /// The status the header states. Not a field: it is read off the header
@@ -828,7 +925,201 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_new_brief_is_its_header_and_a_blank_line() {
+        let brief = Brief::new(BriefId::new(129), "86743aa8", stamp("2026-11-20T16:31:07Z"));
+        assert_eq!(
+            utf8(&brief.to_bytes()),
+            "id: 129\nstatus: draft\nbase: 86743aa8\ncreated: 2026-11-20T16:31:07Z\n\n"
+        );
+        assert_eq!(brief.status(), Ok(Status::Draft));
+        assert_eq!(brief.sections(), []);
+    }
+
+    #[test]
+    fn closes_is_written_in_place_or_added() {
+        let ids = [BacklogId::new(41).unwrap(), BacklogId::new(52).unwrap()];
+        let mut brief = Brief::parse(b"id: 1\nstatus: draft\n\n# T\n");
+        brief.set_closes(&ids);
+        assert_eq!(
+            utf8(&brief.to_bytes()),
+            "id: 1\nstatus: draft\ncloses: b41, b52\n\n# T\n"
+        );
+        brief.set_closes(&ids[1..]);
+        assert_eq!(
+            utf8(&brief.to_bytes()),
+            "id: 1\nstatus: draft\ncloses: b52\n\n# T\n"
+        );
+    }
+
+    // ---- sections ----
+
+    fn sections(text: &str) -> Vec<(String, String)> {
+        Brief::parse(text.as_bytes())
+            .sections()
+            .iter()
+            .map(|s| (utf8(s.name).to_owned(), utf8(s.text).to_owned()))
+            .collect()
+    }
+
+    fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, text)| ((*name).to_owned(), (*text).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_section_runs_to_the_next_heading() {
+        assert_eq!(
+            sections(
+                "id: 1\n\n# Title\nintro\n## Task\ndo it\n\n##  Design \r\n### Sub\nx\n##Not\n## Last"
+            ),
+            owned(&[
+                ("Task", "do it\n\n"),
+                ("Design", "### Sub\nx\n##Not\n"),
+                ("Last", ""),
+            ])
+        );
+        assert_eq!(sections("# Title\nno sections\n"), []);
+    }
+
+    #[test]
+    fn a_heading_in_a_code_fence_is_quoted_text() {
+        assert_eq!(
+            sections("## Task\n```markdown\n## Design\n```\n## Design\n  ```\n## Not\n"),
+            owned(&[
+                ("Task", "```markdown\n## Design\n```\n"),
+                // An unclosed fence runs to the end.
+                ("Design", "  ```\n## Not\n"),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_report_runs_to_the_end_of_the_file() {
+        assert_eq!(
+            sections("## Task\nx\n## report\nran:\n## Checks\n```\n## Task\n"),
+            owned(&[
+                ("Task", "x\n"),
+                ("report", "ran:\n## Checks\n```\n## Task\n")
+            ])
+        );
+    }
+
+    #[test]
+    fn a_section_is_found_by_its_name_in_any_case() {
+        let brief = Brief::parse(b"## Out Of Scope\n\n## out of scope\nsecond\n## Task\n \t\n");
+        let out = brief.section("Out of scope").unwrap();
+        // The first of two: it has no text, and the second does not help.
+        assert_eq!((out.name, out.has_text()), (&b"Out Of Scope"[..], false));
+        assert!(!brief.section("task").unwrap().has_text());
+        assert_eq!(brief.section("Design"), None);
+        assert!(
+            Brief::parse(b"## Design\n\nx")
+                .section("design")
+                .unwrap()
+                .has_text()
+        );
+    }
+
     // ---- properties ----
+
+    /// A body line that is likely to matter to sections: headings, fences,
+    /// near misses of both.
+    fn section_line() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => prop::sample::select(&[
+                "## Task", "## task ", "## Design", "## Report", "## REPORT", "## ",
+                "```", "  ```rust", "### Sub", "##Task", " ## Task", "# Title",
+            ][..])
+            .prop_map(String::from),
+            2 => "[a-z #`]{0,8}",
+        ]
+    }
+
+    /// Any body bytes: the lines, `\n` or `\r\n`, the last with or without.
+    fn section_body() -> impl Strategy<Value = Vec<u8>> {
+        (
+            prop::collection::vec((section_line(), any::<bool>()), 0..14),
+            any::<bool>(),
+        )
+            .prop_map(|(lines, ends_terminated)| {
+                let count = lines.len();
+                let mut bytes = Vec::new();
+                for (index, (content, crlf)) in lines.into_iter().enumerate() {
+                    bytes.extend_from_slice(content.as_bytes());
+                    if index + 1 < count || ends_terminated {
+                        bytes.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+                    }
+                }
+                bytes
+            })
+    }
+
+    proptest! {
+        /// The sections cover the body from the first heading on, each its
+        /// heading line and then its text; a `## ` line outside a fence is a
+        /// heading, or in the report; nothing comes after the report.
+        #[test]
+        fn the_sections_split_the_body_at_its_headings(body in section_body()) {
+            let mut bytes = b"id: 1\n\n".to_vec();
+            bytes.extend_from_slice(&body);
+            let brief = Brief::parse(&bytes);
+            let body = brief.body();
+            let found = brief.sections();
+
+            // Rebuilt: the part before the first heading, then per section
+            // its heading line and its text.
+            let lines = raw_lines(body);
+            let mut offsets = Vec::new();
+            let mut at = 0;
+            for line in &lines {
+                offsets.push(at);
+                at += line.len();
+            }
+            let mut rest = &body[body.len()..];
+            let mut headings = Vec::new();
+            if let Some(first) = found.first() {
+                // The first heading line ends where the first text starts.
+                let text_at = first.text.as_ptr() as usize - body.as_ptr() as usize;
+                let line = offsets.iter().rposition(|o| *o < text_at).unwrap();
+                rest = &body[offsets[line]..];
+            }
+            for section in &found {
+                let (heading, after) = rest.split_at(rest.iter().position(|b| *b == b'\n').map_or(rest.len(), |n| n + 1));
+                let content = content_of(heading);
+                prop_assert!(content.starts_with(b"## "), "{:?}", utf8(heading));
+                prop_assert_eq!(content[3..].trim_ascii(), section.name);
+                prop_assert!(after.starts_with(section.text));
+                headings.push(heading.as_ptr() as usize - body.as_ptr() as usize);
+                rest = &after[section.text.len()..];
+            }
+            prop_assert!(rest.is_empty());
+
+            // Every `## ` line outside a fence is a heading, or is in the
+            // report, which is last.
+            let report = found.iter().position(|s| s.is_named("Report"));
+            if let Some(report) = report {
+                prop_assert_eq!(report + 1, found.len());
+            }
+            let report_text_at = report.map(|r| found[r].text.as_ptr() as usize - body.as_ptr() as usize);
+            let mut fenced = false;
+            for (line, offset) in lines.iter().zip(&offsets) {
+                let content = content_of(line);
+                if report_text_at.is_some_and(|r| *offset >= r) {
+                    break;
+                }
+                if content.trim_ascii_start().starts_with(b"```") {
+                    fenced = !fenced;
+                } else if !fenced && content.starts_with(b"## ") {
+                    prop_assert!(headings.contains(offset), "{:?} is no heading", utf8(line));
+                } else {
+                    prop_assert!(!headings.contains(offset));
+                }
+            }
+        }
+    }
 
     /// A header line as hand edits leave it: the tool's keys in any order,
     /// repeated or missing, unknown keys, loose spacing.

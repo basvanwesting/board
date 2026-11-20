@@ -15,11 +15,11 @@ mod raw;
 mod sync;
 
 pub use board::{Board, BriefRow, ListRow, Snapshot};
-pub use brief::{BadStatus, Brief, Stamp, Status, Transition, TransitionError};
+pub use brief::{BadStatus, Brief, Section, Stamp, Status, Transition, TransitionError};
 pub use error::{Error, Exit};
 pub use id::{BacklogId, BriefId, ChoreId, InvalidId, ItemId, ListKind};
 pub use lint::{Finding, Problem, lint};
 pub use list::{Entry, FindError, IdsExhausted, Line, ListFile, NoCheck, RemoveError};
 pub use ops::NewChore;
-pub use project::{BoardPath, BriefFile, BriefName, Env, Project, ProjectName};
+pub use project::{BoardPath, BriefFile, BriefName, Env, InvalidSlug, Project, ProjectName, Slug};
 pub use sync::Note;

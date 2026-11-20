@@ -4,5 +4,3 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc cb49c032fd1281de6b4793b0ad63b252b8a915ca58c9cff2fc4909857cea90c4 # shrinks to [Cmd { who: A, op: AddChore { group: false }, fault: Some(WindowEdit(Brief { second: false })) }]
-cc c9bb886e49b2b7d7549e1b0b08433cfc11fbb96ff1be1f9ad6defd9ea68d1bc1 # shrinks to [HandEdit { who: B, edit: Brief { second: false } }, Cmd { who: A, op: AddChore { group: false }, fault: Some(WindowEdit(Brief { second: false })) }, Cmd { who: A, op: Drop(Index(439067838)), fault: Some(WindowEdit(AddIdLess { backlog: true })) }, Cmd { who: B, op: AddChore { group: false }, fault: Some(KillAfterPush) }]

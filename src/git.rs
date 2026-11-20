@@ -75,7 +75,7 @@ impl fmt::Display for Failure {
 pub(crate) struct Oid(String);
 
 impl Oid {
-    fn parse(stdout: &[u8]) -> Result<Oid, Failure> {
+    pub(crate) fn parse(stdout: &[u8]) -> Result<Oid, Failure> {
         let text = stdout.strip_suffix(b"\n").unwrap_or(stdout);
         match str::from_utf8(text) {
             Ok(hex)
@@ -521,7 +521,8 @@ impl Git {
     /// signature check printed in the log, and a file taken for binary
     /// (`-diff`, `binary` or a NUL byte), whose patch would hold no lines.
     /// An external diff needs `--ext-diff` in `git log`, which no
-    /// configuration sets.
+    /// configuration sets. `--root`: the root commit's patch, whatever
+    /// `log.showRoot` says.
     pub(crate) fn file_history(&self, commit: &Oid, path: &str) -> Result<Vec<u8>, Failure> {
         let log = |follow: &[&str]| {
             self.run(
@@ -529,6 +530,7 @@ impl Git {
                     &["log"],
                     follow,
                     &[
+                        "--root",
                         "--full-history",
                         "--format=",
                         "-p",
@@ -548,6 +550,37 @@ impl Git {
         let mut patches = log(&["--follow"])?;
         patches.extend(log(&[])?);
         Ok(patches)
+    }
+
+    /// Every path below `dir` that a commit reachable from `commit` added,
+    /// relative to the top, once per add.
+    ///
+    /// `--full-history`: a file added and deleted on a merged side branch is
+    /// in no commit of the simplified history. `--no-renames`: a file moved
+    /// in (a project directory renamed) counts as added there, whatever
+    /// `diff.renames` says. `--root`: the files of the root commit, whatever
+    /// `log.showRoot` says.
+    pub(crate) fn added_files(&self, commit: &Oid, dir: &str) -> Result<Vec<String>, Failure> {
+        let stdout = self.run(&[
+            "log",
+            "--root",
+            "--full-history",
+            "--no-renames",
+            "--diff-filter=A",
+            "--name-only",
+            "-z",
+            "--format=",
+            "--no-show-signature",
+            commit.as_str(),
+            "--",
+            &format!("{dir}/"),
+        ])?;
+        Ok(stdout
+            .split(|b| *b == 0)
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| str::from_utf8(path).ok())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Stores a blob and gives its id. The bytes go in as they are: no

@@ -175,6 +175,27 @@ impl World {
         output.status.success().then_some(output.stdout)
     }
 
+    /// The files below `dir` in the remote's `main`, relative to the top.
+    pub fn remote_files(&self, dir: &str) -> Vec<String> {
+        let output = self.git_output(
+            &self.remote(),
+            [
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "main",
+                "--",
+                &format!("{dir}/"),
+            ],
+        );
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The subjects of the remote's commits, newest first.
     pub fn remote_log(&self) -> Vec<String> {
         let output = self.git_output(&self.remote(), ["log", "--format=%s", "main"]);
@@ -461,6 +482,11 @@ impl Machine<'_> {
     /// The commit `main` of the board-data clone is on.
     pub fn main(&self) -> String {
         rev(&self.world.git_output(&self.data(), ["rev-parse", "main"]))
+    }
+
+    /// The commit `HEAD` of a repository of the machine is on.
+    pub fn head_of(&self, repository: &Path) -> String {
+        rev(&self.world.git_output(repository, ["rev-parse", "HEAD"]))
     }
 
     /// What `git status --porcelain` says of the board-data clone.

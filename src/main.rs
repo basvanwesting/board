@@ -1,9 +1,11 @@
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::process::ExitCode;
 
 use board::{
-    BacklogId, Board, BriefRow, ChoreId, Env, Error, Exit, ItemId, Line, ListKind, ListRow,
-    NewChore, Snapshot, Status,
+    BacklogId, Board, BriefId, BriefRow, ChoreId, Env, Error, Exit, ItemId, Line, ListKind,
+    ListRow, NewChore, Slug, Snapshot, Status,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -36,6 +38,21 @@ enum Command {
     },
     /// Check the board's files: `ok`, or a line per finding
     Lint,
+    /// Write a new draft brief's header; prints its path
+    New {
+        #[command(subcommand)]
+        item: NewItem,
+    },
+    /// Hand a draft brief to the worker
+    Queue {
+        /// Like 128
+        id: BriefId,
+        /// The backlog items the brief resolves, deleted when it is filed
+        #[arg(long, value_name = "IDS", value_delimiter = ',')]
+        closes: Option<Vec<BacklogId>>,
+    },
+    /// Claim the brief queued longest; prints its path, or `queue empty`
+    Next,
     /// Add a chore or a backlog item; prints its new id
     Add {
         #[command(subcommand)]
@@ -55,6 +72,15 @@ enum Command {
     },
     /// Bring the board-data clone and the remote to the same commit
     Sync,
+}
+
+#[derive(Subcommand)]
+enum NewItem {
+    /// A brief, numbered after every brief the project ever had
+    Brief {
+        /// Like fix-login: a-z and 0-9, words joined by dashes
+        slug: Slug,
+    },
 }
 
 #[derive(Subcommand)]
@@ -167,6 +193,11 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::Ls { kind, status }) => Run::Ls(Selection::new(kind, status)?),
         Some(Command::Show { id }) => Run::Show(id),
         Some(Command::Lint) => Run::Lint,
+        Some(Command::New {
+            item: NewItem::Brief { slug },
+        }) => Run::NewBrief(slug),
+        Some(Command::Queue { id, closes }) => Run::Queue(id, closes),
+        Some(Command::Next) => Run::Next,
         Some(Command::Add {
             item:
                 AddItem::Chore {
@@ -196,6 +227,15 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
     match command {
         Run::Ls(selection) => Ok((ls(&board.snapshot()?, &selection), Exit::Ok)),
         Run::Show(id) => Ok((board.show(id)?, Exit::Ok)),
+        Run::NewBrief(slug) => Ok((path_line(&board.new_brief(&slug)?), Exit::Ok)),
+        Run::Queue(id, closes) => {
+            board.queue(id, closes.as_deref())?;
+            line(format!("queued {id}"))
+        }
+        Run::Next => match board.next()? {
+            Some(path) => Ok((path_line(&path), Exit::Ok)),
+            None => line("queue empty".to_owned()),
+        },
         Run::AddChore(new) => line(board.add_chore(&new)?.to_string()),
         Run::AddBacklog(text, from) => line(board.add_backlog(&text, from)?.to_string()),
         Run::Done(ids) => line(board.done(&ids)?),
@@ -224,6 +264,9 @@ enum Run {
     Ls(Selection),
     Show(ItemId),
     Lint,
+    NewBrief(Slug),
+    Queue(BriefId, Option<Vec<BacklogId>>),
+    Next,
     AddChore(NewChore),
     AddBacklog(Line, Option<ItemId>),
     Done(Vec<ChoreId>),
@@ -251,6 +294,12 @@ fn brief_lines<'a>(rows: impl Iterator<Item = &'a BriefRow>) -> Vec<u8> {
     rows.map(|row| format!("{} {} {}\n", row.number, row.status_word(), row.slug))
         .collect::<String>()
         .into_bytes()
+}
+
+/// A path as a line of its bytes: the clone may sit below a directory whose
+/// name is not UTF-8.
+fn path_line(path: &Path) -> Vec<u8> {
+    [path.as_os_str().as_bytes(), b"\n"].concat()
 }
 
 /// Bytes, not text: a list line is shown as the file has it, UTF-8 or not.

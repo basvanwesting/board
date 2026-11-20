@@ -36,8 +36,10 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
+use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
 use crate::git::{Failure, Git, Oid, TreeEntry};
@@ -176,14 +178,46 @@ impl Tx<'_> {
         Ok(BacklogId::new(number).expect("a next id is past 0"))
     }
 
+    /// The next brief number of the project: one past every number among
+    /// its brief files and every one ever added under its `briefs/`.
+    pub(crate) fn alloc_brief(&mut self) -> Result<BriefId, Error> {
+        self.require_remote()?;
+        let mark = brief_mark(self.git, &self.base, self.project.name())?;
+        let highest = self
+            .project
+            .briefs()
+            .iter()
+            .map(|file| file.name.number().get())
+            .chain(mark)
+            .max();
+        match highest {
+            None => Ok(BriefId::new(1)),
+            Some(highest) => highest.checked_add(1).map(BriefId::new).ok_or_else(|| {
+                Error::Refused(format!(
+                    "{}: brief {highest} has been used, the highest number there is; \
+                     no number is left",
+                    self.what
+                ))
+            }),
+        }
+    }
+
+    /// Refuses a command that has to act on what the remote has. Where an id
+    /// is allocated this is checked for every command; a command that
+    /// allocates none but claims something shared (`next`) asks for it.
+    pub(crate) fn require_remote(&self) -> Result<(), Error> {
+        match self.offline {
+            Some(offline) => Err(Error::NeedsRemote(offline.message(self.what))),
+            None => Ok(()),
+        }
+    }
+
     /// The next id of a list, on the fetched remote tip only: another clone
     /// may hand out the same id meanwhile, and it is the push that decides
     /// which one has it. Refused here rather than per command, so no command
     /// can forget.
     fn alloc(&mut self, kind: ListKind) -> Result<u32, Error> {
-        if let Some(offline) = self.offline {
-            return Err(Error::NeedsRemote(offline.message(self.what)));
-        }
+        self.require_remote()?;
         let mark = history_mark(self.git, &self.base, self.project.name(), kind)?;
         self.project
             .list(kind)
@@ -240,6 +274,28 @@ fn history_mark(
         .unwrap_or(0))
 }
 
+/// The highest brief number any file ever added under the project's
+/// `briefs/` had, in the history of `commit`; `None` when there was none.
+///
+/// The same rule as list ids, for the same reason: a brief deleted by hand
+/// would otherwise free its number, and `file` on the brief that gets it
+/// next would count the old brief's `Brief:` commits. A path is read by the
+/// one path grammar. Not followed across a rename of the project's
+/// directory: a brief deleted before such a rename frees its number.
+fn brief_mark(git: &Git, commit: &Oid, project: &ProjectName) -> Result<Option<u32>, Error> {
+    let dir = format!("{project}/briefs");
+    let added = git
+        .added_files(commit, &dir)
+        .map_err(|failure| Error::Git(format!("cannot read the history of {dir}: {failure}")))?;
+    Ok(added
+        .iter()
+        .filter_map(|path| match BoardPath::parse(path)? {
+            BoardPath::Brief { name, .. } => Some(name.number().get()),
+            BoardPath::List { .. } => None,
+        })
+        .max())
+}
+
 /// What a write works with.
 struct Ctx<'a> {
     root: &'a Path,
@@ -250,6 +306,26 @@ struct Ctx<'a> {
     /// Whether the write said it merged: once, however many rounds merge
     /// the same local commits again.
     merge_noted: Cell<bool>,
+    /// This write's mark in its command's commit: see [`run_mark`].
+    run: String,
+}
+
+/// A mark no other write has, for the message of the command's commit.
+///
+/// A commit is its parent, tree, identity, second and message, so two
+/// clones of one user running the same command on the same remote tip in
+/// the same second build the same commit. The landed check would then take
+/// the other clone's push for its own, and both would print its result:
+/// two workers told `next` gave each of them the same brief. The mark makes
+/// "my commit is on the remote" mean this write's. Rejected: a committer per
+/// clone, which is configuration every clone would have to get right.
+fn run_mark() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    // Keyed from the operating system's randomness at every process start.
+    let random = RandomState::new().hash_one((nanos, std::process::id()));
+    format!("{random:016x}")
 }
 
 /// One round's commit and what it holds.
@@ -289,6 +365,7 @@ pub(crate) fn write<T>(
         what,
         notes,
         merge_noted: Cell::new(false),
+        run: run_mark(),
     };
 
     let is_sync = apply.is_none();
@@ -555,13 +632,17 @@ fn build<T>(
                 offline,
             };
             match apply(&mut tx) {
+                // A command that changed nothing (`next` on an empty queue)
+                // makes no commit: an empty one would be pushed and logged
+                // for every look at the queue.
+                Ok((value, _)) if tx.project.changed.is_empty() => (base, Some(Ok(value))),
                 Ok((value, subject)) => (
                     commit(
                         ctx.root,
                         ctx.git,
                         &base,
                         &tx.project,
-                        &format!("{}: {subject}", ctx.project),
+                        &format!("{}: {subject}\n\nBoard-Run: {}", ctx.project, ctx.run),
                     )?,
                     Some(Ok(value)),
                 ),

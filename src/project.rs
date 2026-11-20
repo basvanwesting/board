@@ -8,12 +8,13 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
-use crate::brief::{BadStatus, Brief, Status};
+use crate::brief::{BadStatus, Brief, Stamp, Status, Transition, TransitionError};
 use crate::error::Error;
 use crate::git::{self, Git, Oid};
 use crate::id::{BriefId, ListKind};
-use crate::list::ListFile;
+use crate::list::{FindError, ListFile};
 
 /// What a command takes from the process it runs in. `main` fills it once;
 /// nothing below reads the environment or the current directory again, so a
@@ -233,6 +234,16 @@ pub struct BriefName {
 }
 
 impl BriefName {
+    /// The name `new brief` gives: `<number>-<slug>.md`.
+    pub fn new(number: BriefId, slug: &Slug) -> BriefName {
+        let digits = number.to_string();
+        BriefName {
+            number,
+            file_name: format!("{digits}-{slug}.md"),
+            digits: digits.len(),
+        }
+    }
+
     pub fn parse(file_name: &str) -> Option<BriefName> {
         let (digits, rest) = file_name.split_once('-')?;
         let slug = rest.strip_suffix(".md")?;
@@ -259,6 +270,63 @@ impl BriefName {
         &self.file_name
     }
 }
+
+/// The part of a new brief's file name after its number:
+/// `[a-z0-9]+(-[a-z0-9]+)*`, at most [`Slug::MAX`] bytes.
+///
+/// Narrower than what a brief's name may be (an archived brief keeps the name
+/// it had), so that every name the tool writes types and greps the same way.
+/// Bounded, because the name has to fit in a file name on every clone: a
+/// brief whose file no clone can write would stop every clone's checkout from
+/// moving past the commit that added it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slug(String);
+
+impl Slug {
+    pub const MAX: usize = 100;
+}
+
+impl fmt::Display for Slug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for Slug {
+    type Err = InvalidSlug;
+
+    fn from_str(s: &str) -> Result<Slug, InvalidSlug> {
+        let word = |word: &str| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        };
+        if s.len() <= Slug::MAX && s.split('-').all(word) {
+            Ok(Slug(s.to_owned()))
+        } else {
+            Err(InvalidSlug(s.to_owned()))
+        }
+    }
+}
+
+/// A word that is not a [`Slug`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSlug(String);
+
+impl fmt::Display for InvalidSlug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` is not a slug: words of a-z and 0-9 joined by single dashes, \
+             like fix-login, at most {} characters",
+            self.0.escape_debug(),
+            Slug::MAX
+        )
+    }
+}
+
+impl std::error::Error for InvalidSlug {}
 
 /// A path the board owns, relative to `$BOARD_ROOT`:
 ///
@@ -367,6 +435,21 @@ impl BriefFile {
         }
     }
 
+    /// Makes the move from the brief's status on the board. Not the header's
+    /// alone: a brief in `briefs/done/` is filed whatever its header says,
+    /// and no move leaves filed.
+    pub fn transition(
+        &mut self,
+        transition: Transition,
+        now: Stamp,
+    ) -> Result<Status, TransitionError> {
+        let from = self.status().map_err(TransitionError::BadStatus)?;
+        if transition.apply(from).is_none() {
+            return Err(TransitionError::NotFrom(from));
+        }
+        self.brief.transition(transition, now)
+    }
+
     pub fn path(&self, project: &ProjectName) -> BoardPath {
         BoardPath::Brief {
             project: project.clone(),
@@ -425,6 +508,39 @@ impl Project {
 
     pub fn briefs(&self) -> &[BriefFile] {
         &self.briefs
+    }
+
+    /// The one brief file with this number, open or filed: a number on two
+    /// files names no brief until one of them is renamed.
+    pub fn find_brief(&self, number: BriefId) -> Result<&BriefFile, FindError> {
+        let mut files = self
+            .briefs
+            .iter()
+            .filter(|file| file.name.number() == number);
+        match (files.next(), files.count()) {
+            (None, _) => Err(FindError::Missing),
+            (Some(file), 0) => Ok(file),
+            (Some(_), more) => Err(FindError::Duplicate(more + 1)),
+        }
+    }
+
+    /// The one brief with this number, to edit; the edit is committed by the
+    /// write it runs in.
+    pub(crate) fn brief_mut(&mut self, number: BriefId) -> Result<&mut BriefFile, FindError> {
+        let path = self.find_brief(number)?.path(&self.name);
+        self.changed.insert(path);
+        Ok(self
+            .briefs
+            .iter_mut()
+            .find(|file| file.name.number() == number)
+            .expect("found above"))
+    }
+
+    /// Adds a brief file; the write it runs in commits it.
+    pub(crate) fn create_brief(&mut self, file: BriefFile) {
+        self.changed.insert(file.path(&self.name));
+        self.briefs.push(file);
+        self.briefs.sort_by(brief_order);
     }
 
     /// A list to edit; the edit is committed by the write it runs in.
@@ -566,13 +682,16 @@ impl Project {
     }
 
     fn sorted(mut self) -> Project {
-        self.briefs.sort_by(|a, b| {
-            (a.name.number(), a.filed, &a.name).cmp(&(b.name.number(), b.filed, &b.name))
-        });
+        self.briefs.sort_by(brief_order);
         self.misnamed.sort();
         self.copies.sort();
         self
     }
+}
+
+/// By number, an open brief before a filed one, then by file name.
+fn brief_order(a: &BriefFile, b: &BriefFile) -> std::cmp::Ordering {
+    (a.name.number(), a.filed, &a.name).cmp(&(b.name.number(), b.filed, &b.name))
 }
 
 /// The paths a merge saves the local version of a brief at: `<path>.local`,
@@ -748,6 +867,82 @@ mod tests {
             brief("shop/briefs/1-done.md"),
             Some(("shop".into(), 1, "done".into(), false))
         );
+    }
+
+    #[test]
+    fn a_brief_in_done_moves_from_filed_whatever_its_header_says() {
+        let now: Stamp = "2026-11-20T16:40:12Z".parse().unwrap();
+        let file = |path: &str| match BoardPath::parse(path) {
+            Some(BoardPath::Brief { name, filed, .. }) => BriefFile {
+                name,
+                filed,
+                brief: Brief::parse(b"status: draft\n"),
+            },
+            _ => panic!("{path} is no brief path"),
+        };
+        let mut filed = file("shop/briefs/done/1-a.md");
+        assert_eq!(
+            filed.transition(Transition::Queue, now),
+            Err(TransitionError::NotFrom(Status::Filed))
+        );
+        assert_eq!(filed.brief.to_bytes(), b"status: draft\n");
+        let mut open = file("shop/briefs/1-a.md");
+        assert_eq!(open.transition(Transition::Queue, now), Ok(Status::Queued));
+    }
+
+    #[test]
+    fn slug_grammar() {
+        for slug in [
+            "a",
+            "fix-login",
+            "v2",
+            "2026-11-review",
+            &"a".repeat(Slug::MAX),
+        ] {
+            assert_eq!(
+                slug.parse::<Slug>().map(|s| s.to_string()),
+                Ok(slug.to_owned())
+            );
+        }
+        for not_a_slug in [
+            "",
+            "-",
+            "Fix-login",
+            "fix--login",
+            "-fix",
+            "fix-",
+            "fix_login",
+            "fix login",
+            "fix/login",
+            "fix.md",
+            "é",
+            &"a".repeat(Slug::MAX + 1),
+        ] {
+            assert!(not_a_slug.parse::<Slug>().is_err(), "{not_a_slug}");
+        }
+        assert_eq!(
+            "Fix".parse::<Slug>().unwrap_err().to_string(),
+            "`Fix` is not a slug: words of a-z and 0-9 joined by single dashes, like fix-login, \
+             at most 100 characters"
+        );
+    }
+
+    proptest! {
+        /// A name `new brief` gives is a brief path of the one grammar, with
+        /// its number and slug.
+        #[test]
+        fn a_new_brief_s_name_is_a_brief_path(
+            number in any::<u32>(),
+            slug in "[a-z0-9]{1,5}(-[a-z0-9]{1,5}){0,3}",
+        ) {
+            let slug: Slug = slug.parse().unwrap();
+            let name = BriefName::new(BriefId::new(number), &slug);
+            prop_assert_eq!(name.number(), BriefId::new(number));
+            prop_assert_eq!(name.slug(), slug.to_string());
+            prop_assert_eq!(BriefName::parse(name.as_str()), Some(name.clone()));
+            let path = format!("shop/briefs/{}", name.as_str());
+            prop_assert_eq!(BoardPath::parse(&path).map(|p| p.to_string()), Some(path));
+        }
     }
 
     fn any_board_path() -> impl Strategy<Value = String> {

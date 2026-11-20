@@ -2,17 +2,23 @@
 
 use std::path::PathBuf;
 
-use crate::brief::Status;
+use crate::brief::{Stamp, Status};
 use crate::error::Error;
+use crate::git::{Failure, Git, Oid};
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
 use crate::lint::{Finding, lint};
 use crate::list::{Entry, Line, ListFile};
 use crate::ops::{self, NewChore};
-use crate::project::{BriefFile, Env, Project, ProjectName, resolve};
+use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Note};
 
 pub struct Board {
+    /// Absolute: a path the board prints is one an agent can open from
+    /// anywhere.
     root: PathBuf,
+    /// Where the command runs: the project repository whose `HEAD` a new
+    /// brief is based on, also when `--board` names the project.
+    cwd: PathBuf,
     project: ProjectName,
     /// Where a write says what happens along the way. A note is passed on
     /// as it comes: `waiting for lock` has to show before the wait.
@@ -35,7 +41,8 @@ impl Board {
             )));
         }
         Ok(Board {
-            root: env.root,
+            root: env.cwd.join(env.root),
+            cwd: env.cwd,
             project,
             notes,
         })
@@ -60,20 +67,10 @@ impl Board {
         let project = self.load()?;
         let refused = |why: String| Error::Refused(format!("show {id}: {why}"));
         match id {
-            ItemId::Brief(number) => {
-                let mut files = project
-                    .briefs()
-                    .iter()
-                    .filter(|file| file.name.number() == number);
-                match (files.next(), files.count()) {
-                    (None, _) => Err(refused("no such brief".to_owned())),
-                    (Some(file), 0) => Ok(file.brief.to_bytes()),
-                    (Some(_), more) => Err(refused(format!(
-                        "{number} is on {} files; fix the duplicate first",
-                        more + 1
-                    ))),
-                }
-            }
+            ItemId::Brief(number) => project
+                .find_brief(number)
+                .map(|file| file.brief.to_bytes())
+                .map_err(|why| refused(ops::no_brief(number, why))),
             ItemId::Chore(chore) => {
                 item(project.list(ListKind::Chores), chore.get()).map_err(refused)
             }
@@ -124,6 +121,69 @@ impl Board {
         })
     }
 
+    /// Adds the project's next brief, its header written; gives the brief's
+    /// path. The base is the commit the project repository is on now.
+    pub fn new_brief(&self, slug: &Slug) -> Result<PathBuf, Error> {
+        let base = self.project_head()?;
+        let now = now()?;
+        let path = self.command("new brief", &|tx| {
+            let number = tx.alloc_brief()?;
+            let path = ops::new_brief(&mut tx.project, number, slug, &base, now);
+            Ok((path, format!("new brief {number}-{slug}")))
+        })?;
+        Ok(self.path(&path))
+    }
+
+    /// Queues a draft, writing the backlog items it closes when `closes` is
+    /// given.
+    pub fn queue(&self, id: BriefId, closes: Option<&[BacklogId]>) -> Result<(), Error> {
+        let now = now()?;
+        self.command("queue", &|tx| {
+            let queued = ops::queue(&mut tx.project, id, closes, now)?;
+            Ok(((), queued))
+        })
+    }
+
+    /// Claims the brief queued longest; gives its path, `None` when the queue
+    /// is empty.
+    ///
+    /// Only with the remote: a claim is shared like an id, and two clones
+    /// claiming one brief offline would each hand it to a worker.
+    pub fn next(&self) -> Result<Option<PathBuf>, Error> {
+        let now = now()?;
+        let path = self.command("next", &|tx| {
+            tx.require_remote()?;
+            Ok(match ops::next(&mut tx.project, now)? {
+                Some((number, path)) => (Some(path), format!("started {number}")),
+                // Nothing changed, so nothing is committed under a subject.
+                None => (None, String::new()),
+            })
+        })?;
+        Ok(path.map(|path| self.path(&path)))
+    }
+
+    /// Where a board path is on this machine.
+    fn path(&self, path: &BoardPath) -> PathBuf {
+        self.root.join(path.to_string())
+    }
+
+    /// The commit the repository the command runs in is on: a new brief's
+    /// base, read before the write starts.
+    fn project_head(&self) -> Result<Oid, Error> {
+        let at = self.cwd.display();
+        match Git::at(&self.cwd).commit("HEAD") {
+            Ok(Some(head)) => Ok(head),
+            Ok(None) => Err(Error::Refused(format!(
+                "new brief: the repository at {at} has no commit to base the brief on"
+            ))),
+            Err(Failure::Said(said)) => Err(Error::Usage(format!(
+                "new brief: no repository at {at} to base the brief on ({said}); \
+                 run it in the project's checkout"
+            ))),
+            Err(failure @ Failure::NotRun(_)) => Err(Error::Git(failure.to_string())),
+        }
+    }
+
     /// The write loop with no command: hand edits committed, and the clone
     /// and the remote on the same commit. Without the remote the commits
     /// stay on the clone and it is [`Error::NeedsRemote`].
@@ -136,6 +196,13 @@ impl Board {
         let value = sync::write(&self.root, &self.project, what, &*self.notes, Some(apply))?;
         Ok(value.expect("a write that runs a command gives its value"))
     }
+}
+
+/// The time a write stamps, taken once, before the write: every round of it
+/// writes the same.
+fn now() -> Result<Stamp, Error> {
+    Stamp::now()
+        .ok_or_else(|| Error::Setup("the clock is outside the years 1970 to 9999".to_owned()))
 }
 
 /// The line of the one item with this id, else why the id names no single
