@@ -1,5 +1,5 @@
-//! The brief commands through the binary: `new brief`, `queue`, `next`, on
-//! two clones of one bare remote.
+//! The brief commands through the binary: `new brief`, `queue`, `next`,
+//! `block`, `amend`, `report`, on two clones of one bare remote.
 
 mod common;
 
@@ -433,5 +433,237 @@ fn two_clones_claiming_at_once_get_different_briefs() {
     for file in ["proj/briefs/1-one.md", "proj/briefs/2-two.md"] {
         assert_eq!(header(&world, file, "status").as_deref(), Some("started"));
     }
+    in_step(&world, &a);
+}
+
+// ---- block, amend, report ----
+
+/// A brief that is new, written, queued and claimed by `next`.
+fn started(machine: &Machine, number: u32, slug: &str) {
+    queued(machine, number, slug);
+    let path = machine.board(&["next"]).ok();
+    assert!(path.ends_with(&format!("/{number}-{slug}.md\n")), "{path}");
+}
+
+/// The lines of a brief on the remote after `from` (a line of it), with
+/// every stamp written as `<T>`.
+fn after(world: &World, file: &str, from: &str) -> String {
+    let text = text(world.remote_file(file));
+    let at = text
+        .find(from)
+        .unwrap_or_else(|| panic!("{from} in {text}"));
+    text[at..]
+        .lines()
+        .map(|line| match line.strip_prefix("### ") {
+            Some(stamp) if stamp.len() == 20 && stamp.ends_with('Z') => "### <T>\n".to_owned(),
+            _ => format!("{line}\n"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_brief_is_blocked_amended_and_reported() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    started(&a, 1, "x");
+    let file = "proj/briefs/1-x.md";
+
+    assert_eq!(a.board(&["block", "1", "Which db?"]).ok(), "blocked 1\n");
+    assert_eq!(header(&world, file, "status").as_deref(), Some("blocked"));
+    a_stamp(header(&world, file, "blocked"));
+    assert_eq!(a.board(&["ls", "briefs"]).ok(), "1 blocked x\n");
+
+    // The planner answers on the other clone.
+    let ran = b.board_with_input(&["amend", "1"], b"\nUse sqlite.\n\n");
+    assert_eq!(ran.out(0), "amended 1, resumed\n");
+    assert_eq!(header(&world, file, "status").as_deref(), Some("started"));
+    assert_eq!(
+        b.board_with_input(&["amend", "1"], b"Also: ```code```\n")
+            .ok(),
+        "amended 1\n"
+    );
+
+    let report = "Ran: cargo test\n## Checks\nall green\n";
+    assert_eq!(
+        a.board_with_input(&["report", "1"], report.as_bytes()).ok(),
+        "reported 1\n"
+    );
+    assert_eq!(header(&world, file, "status").as_deref(), Some("reported"));
+    a_stamp(header(&world, file, "reported"));
+    assert_eq!(
+        after(&world, file, "## Worker protocol\n"),
+        "## Worker protocol\nw\n\
+         ## Questions\n\n### <T>\n\nWhich db?\n\
+         ## Amendments\n\n### <T>\n\nUse sqlite.\n\n### <T>\n\nAlso: ```code```\n\
+         ## Report\nRan: cargo test\n## Checks\nall green\n"
+    );
+    // `started:` is the first start; a resume is none.
+    assert_eq!(
+        text(world.remote_file(file))
+            .lines()
+            .filter(|line| line.starts_with("started: "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        world.remote_log()[..4],
+        [
+            "proj: reported 1",
+            "proj: amended 1",
+            "proj: amended 1",
+            "proj: blocked 1"
+        ]
+    );
+    in_step(&world, &a);
+}
+
+#[test]
+fn block_amend_and_report_refuse_what_does_not_fit() {
+    let world = World::new();
+    let a = world.a();
+    queued(&a, 1, "x");
+    let log = world.remote_log();
+    assert_eq!(
+        a.board(&["block", "1", "q"]).failed(1),
+        "board: block 1: it is queued, not started\n"
+    );
+    assert_eq!(
+        a.board_with_input(&["report", "1"], b"r").failed(1),
+        "board: report 1: it is queued, not started\n"
+    );
+    assert_eq!(
+        a.board_with_input(&["amend", "2"], b"a").failed(1),
+        "board: amend 2: no such brief\n"
+    );
+    assert_eq!(world.remote_log(), log);
+    a.board(&["next"]).ok();
+    let log = world.remote_log();
+    assert_eq!(
+        a.board(&["block", "1", "Two options:\n## A\nor B"])
+            .failed(1),
+        "board: block 1: the line `## A` outside a code fence would start a section of its \
+         own; use `###` for a heading\n"
+    );
+    assert_eq!(
+        a.board_with_input(&["amend", "1"], b"```\n## quoted\n")
+            .failed(1),
+        "board: amend 1: a code fence is opened and not closed, which would make the sections \
+         after it quoted text\n"
+    );
+    // Nothing to write is a command line that does not say what to do.
+    assert_eq!(
+        a.board_with_input(&["amend", "1"], b" \n\n").failed(2),
+        "board: amend 1: no text on stdin, which is where it is read from\n"
+    );
+    a.board(&["report", "1"]).failed(2);
+    let said = a.board(&["block", "1", " "]).failed(2);
+    assert!(said.contains("the text is empty"), "{said}");
+    for args in [&["block", "1"][..], &["block", "c1", "q"], &["amend"]] {
+        a.board(args).failed(2);
+    }
+    assert_eq!(world.remote_log(), log);
+
+    // Reported: no more amendments, and no second report.
+    a.board_with_input(&["report", "1"], b"done").ok();
+    assert_eq!(
+        a.board_with_input(&["amend", "1"], b"late").failed(1),
+        "board: amend 1: it is reported, not queued, started or blocked\n"
+    );
+    assert_eq!(
+        a.board_with_input(&["report", "1"], b"again").failed(1),
+        "board: report 1: it is reported, not started\n"
+    );
+    in_step(&world, &a);
+}
+
+/// Offline the brief commands commit on the clone, and the next write that
+/// reaches the remote pushes them.
+#[test]
+fn block_amend_and_report_offline_wait_on_the_clone() {
+    let world = World::new();
+    let a = world.a();
+    started(&a, 1, "x");
+    a.set_online(false);
+    let file = "proj/briefs/1-x.md";
+    let ran = a.board(&["block", "1", "q"]);
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"blocked 1\n"[..]));
+    assert!(
+        ran.stderr.starts_with("board: not pushed: 1 commit ("),
+        "{ran:?}"
+    );
+    let ran = a.board_with_input(&["amend", "1"], b"a");
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice()),
+        (0, &b"amended 1, resumed\n"[..])
+    );
+    assert!(
+        ran.stderr.starts_with("board: not pushed: 2 commits ("),
+        "{ran:?}"
+    );
+    let ran = a.board_with_input(&["report", "1"], b"r");
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"reported 1\n"[..]));
+    assert_eq!(header(&world, file, "status").as_deref(), Some("started"));
+    assert!(text(a.file(file)).starts_with("id: 1\nstatus: reported\n"));
+
+    a.set_online(true);
+    a.board(&["sync"]).ok();
+    assert_eq!(header(&world, file, "status").as_deref(), Some("reported"));
+    assert_eq!(
+        world.remote_log()[..3],
+        ["proj: reported 1", "proj: amended 1", "proj: blocked 1"]
+    );
+    in_step(&world, &a);
+}
+
+/// The push of an amendment reached the remote, but `board` heard that it
+/// failed: the amendment is not appended a second time.
+#[test]
+fn an_amendment_that_landed_unheard_is_not_made_twice() {
+    let world = World::new();
+    let a = world.a();
+    started(&a, 1, "x");
+    a.board(&["block", "1", "q"]).ok();
+    a.hook_once("pre-push", pre_push::LOST_ACK);
+    let ran = a.board_with_input(&["amend", "1"], b"once");
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert_eq!(ran.stdout, b"amended 1, resumed\n");
+    assert!(!a.has_hook("pre-push"));
+    let file = "proj/briefs/1-x.md";
+    assert_eq!(
+        after(&world, file, "## Amendments\n"),
+        "## Amendments\n\n### <T>\n\nonce\n"
+    );
+    assert_eq!(header(&world, file, "status").as_deref(), Some("started"));
+    in_step(&world, &a);
+}
+
+/// The planner's amendment lands while the worker's report pushes: the
+/// report is made again on the brief with the amendment, which stays.
+#[test]
+fn a_report_made_while_an_amendment_lands_keeps_the_amendment() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    started(&a, 1, "x");
+    b.board(&["sync"]).ok();
+    let input = world.dir().join("amendment");
+    fs::write(&input, "Mind the cache.\n").unwrap();
+    a.hook_once(
+        "pre-push",
+        &pre_push::window(&b.script_with_input(&["amend", "1"], &input), world.dir()),
+    );
+    let ran = a.board_with_input(&["report", "1"], b"All done.\n");
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"reported 1\n"[..]));
+    assert!(ran.stderr.contains("board: retry 2/4"), "{ran:?}");
+    let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
+    assert_eq!(window("window.code"), "0\n");
+    assert_eq!(window("window.out"), "amended 1\n");
+    assert_eq!(
+        after(&world, "proj/briefs/1-x.md", "## Amendments\n"),
+        "## Amendments\n\n### <T>\n\nMind the cache.\n## Report\nAll done.\n"
+    );
+    assert_eq!(
+        world.remote_log()[..2],
+        ["proj: reported 1", "proj: amended 1"]
+    );
     in_step(&world, &a);
 }

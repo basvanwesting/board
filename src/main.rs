@@ -1,11 +1,11 @@
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::ExitCode;
 
 use board::{
-    BacklogId, Board, BriefId, BriefRow, ChoreId, Env, Error, Exit, ItemId, Line, ListKind,
-    ListRow, NewChore, Slug, Snapshot, Status,
+    BacklogId, Board, BriefId, BriefRow, ChoreId, EmptyText, Env, Error, Exit, ItemId, Line,
+    ListKind, ListRow, NewChore, Slug, Snapshot, Status, Text,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -53,6 +53,23 @@ enum Command {
     },
     /// Claim the brief queued longest; prints its path, or `queue empty`
     Next,
+    /// Stop on a started brief with a question, put under ## Questions
+    Block {
+        /// Like 128
+        id: BriefId,
+        /// No `## ` line outside a code fence; use `###`
+        question: Text,
+    },
+    /// Append stdin under ## Amendments; a blocked brief resumes
+    Amend {
+        /// Like 128
+        id: BriefId,
+    },
+    /// Make stdin the started brief's ## Report
+    Report {
+        /// Like 128
+        id: BriefId,
+    },
     /// Add a chore or a backlog item; prints its new id
     Add {
         #[command(subcommand)]
@@ -198,6 +215,9 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         }) => Run::NewBrief(slug),
         Some(Command::Queue { id, closes }) => Run::Queue(id, closes),
         Some(Command::Next) => Run::Next,
+        Some(Command::Block { id, question }) => Run::Block(id, question),
+        Some(Command::Amend { id }) => Run::Amend(id, stdin_text(&format!("amend {id}"))?),
+        Some(Command::Report { id }) => Run::Report(id, stdin_text(&format!("report {id}"))?),
         Some(Command::Add {
             item:
                 AddItem::Chore {
@@ -236,6 +256,15 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
             Some(path) => Ok((path_line(&path), Exit::Ok)),
             None => line("queue empty".to_owned()),
         },
+        Run::Block(id, question) => {
+            board.block(id, &question)?;
+            line(format!("blocked {id}"))
+        }
+        Run::Amend(id, text) => line(board.amend(id, &text)?),
+        Run::Report(id, text) => {
+            board.report(id, &text)?;
+            line(format!("reported {id}"))
+        }
         Run::AddChore(new) => line(board.add_chore(&new)?.to_string()),
         Run::AddBacklog(text, from) => line(board.add_backlog(&text, from)?.to_string()),
         Run::Done(ids) => line(board.done(&ids)?),
@@ -267,11 +296,34 @@ enum Run {
     NewBrief(Slug),
     Queue(BriefId, Option<Vec<BacklogId>>),
     Next,
+    Block(BriefId, Text),
+    Amend(BriefId, Text),
+    Report(BriefId, Text),
     AddChore(NewChore),
     AddBacklog(Line, Option<ItemId>),
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
     Sync,
+}
+
+/// The text of `amend` and `report`, read whole from stdin before anything
+/// else happens: it is part of the command line, and a write may run its
+/// command more than once.
+fn stdin_text(what: &str) -> Result<Text, Error> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .lock()
+        .read_to_end(&mut bytes)
+        .map_err(|source| Error::Io {
+            action: "read",
+            path: "stdin".into(),
+            source,
+        })?;
+    Text::new(&bytes).map_err(|EmptyText| {
+        Error::Usage(format!(
+            "{what}: no text on stdin, which is where it is read from"
+        ))
+    })
 }
 
 fn ls(snapshot: &Snapshot, selection: &Selection) -> Vec<u8> {

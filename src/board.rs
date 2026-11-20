@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::brief::{Stamp, Status};
+use crate::brief::{EntryText, Stamp, Status, Text};
 use crate::error::Error;
 use crate::git::{Failure, Git, Oid};
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
@@ -162,6 +162,37 @@ impl Board {
         Ok(path.map(|path| self.path(&path)))
     }
 
+    /// Blocks a started brief on a question, which goes under
+    /// `## Questions`.
+    pub fn block(&self, id: BriefId, question: &Text) -> Result<(), Error> {
+        let question = entry(question, &format!("block {id}"))?;
+        let now = now()?;
+        self.command("block", &|tx| {
+            let blocked = ops::block(&mut tx.project, id, &question, now)?;
+            Ok(((), blocked))
+        })
+    }
+
+    /// Appends an amendment under `## Amendments`; a blocked brief resumes.
+    /// Gives what it did, as `amended 128, resumed`.
+    pub fn amend(&self, id: BriefId, text: &Text) -> Result<String, Error> {
+        let text = entry(text, &format!("amend {id}"))?;
+        let now = now()?;
+        self.command("amend", &|tx| {
+            let amended = ops::amend(&mut tx.project, id, &text, now)?;
+            Ok((amended, format!("amended {id}")))
+        })
+    }
+
+    /// Makes the text the started brief's `## Report` and reports it.
+    pub fn report(&self, id: BriefId, text: &Text) -> Result<(), Error> {
+        let now = now()?;
+        self.command("report", &|tx| {
+            let reported = ops::report(&mut tx.project, id, text, now)?;
+            Ok(((), reported))
+        })
+    }
+
     /// Where a board path is on this machine.
     fn path(&self, path: &BoardPath) -> PathBuf {
         self.root.join(path.to_string())
@@ -203,6 +234,12 @@ impl Board {
 fn now() -> Result<Stamp, Error> {
     Stamp::now()
         .ok_or_else(|| Error::Setup("the clock is outside the years 1970 to 9999".to_owned()))
+}
+
+/// The text of a question or an amendment, refused before the write when it
+/// would not stay in its section: no state of the board makes it fit.
+fn entry(text: &Text, what: &str) -> Result<EntryText, Error> {
+    EntryText::new(text.clone()).map_err(|why| Error::Refused(format!("{what}: {why}")))
 }
 
 /// The line of the one item with this id, else why the id names no single

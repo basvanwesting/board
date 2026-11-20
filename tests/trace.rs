@@ -21,12 +21,13 @@
 //! - every id a command printed or assigned is on the remote with its token,
 //!   and nothing refused or never pushed is anywhere; a brief `new brief`
 //!   printed is on the remote under its number, and the remote has as many
-//!   more claimed briefs as `next` printed paths;
+//!   more claimed briefs as `next` printed paths; the line `block`, `amend`
+//!   or `report` wrote is in its brief, and one they refused is in none;
 //! - convergence, at `Quiesce` and at the end: after `sync` on A, B and A,
 //!   both clones are on the remote's commit with no board file changed,
 //!   every token added and not closed is there once, and every line written
-//!   into a brief is in the brief or in a conflict copy of the clone that
-//!   wrote it.
+//!   into a brief, by hand or by a command, is in the brief or in a
+//!   conflict copy of the clone that wrote it.
 //!
 //! Every item's text and every free-text line carries a token (`t7`) used
 //! once, so a line applied twice, lost or given two ids shows.
@@ -87,6 +88,15 @@ enum Op {
         write: bool,
     },
     Next,
+    /// A started brief of the clone or the remote, picked when the step
+    /// runs.
+    Block(Index),
+    /// A queued, started or blocked brief of the clone or the remote,
+    /// picked when the step runs.
+    Amend(Index),
+    /// A started brief of the clone or the remote, picked when the step
+    /// runs.
+    Report(Index),
 }
 
 /// Which brief a hand edit writes into.
@@ -178,6 +188,9 @@ fn op() -> impl Strategy<Value = Op> {
         3 => (any::<Index>(), prop::bool::weighted(0.8))
             .prop_map(|(pick, write)| Op::Queue { pick, write }),
         2 => Just(Op::Next),
+        2 => any::<Index>().prop_map(Op::Block),
+        2 => any::<Index>().prop_map(Op::Amend),
+        2 => any::<Index>().prop_map(Op::Report),
     ]
 }
 
@@ -388,6 +401,40 @@ enum Subject {
     NewBrief(String),
     Queue(u32),
     Next,
+    /// The brief, and the token of the line the command writes into it.
+    Block(u32, String),
+    Amend(u32, String),
+    Report(u32, String),
+}
+
+impl Subject {
+    /// The brief a command writes a line into, the line's token and the
+    /// command's word.
+    fn brief_line(&self) -> Option<(u32, &str, &'static str)> {
+        match self {
+            Subject::Block(number, token) => Some((*number, token, "block")),
+            Subject::Amend(number, token) => Some((*number, token, "amend")),
+            Subject::Report(number, token) => Some((*number, token, "report")),
+            Subject::Add(_)
+            | Subject::Close(_)
+            | Subject::NewBrief(_)
+            | Subject::Queue(_)
+            | Subject::Next => None,
+        }
+    }
+
+    /// What the command reads from stdin: the text of `amend` and `report`.
+    fn input(&self) -> Option<String> {
+        match self {
+            Subject::Amend(_, token) | Subject::Report(_, token) => Some(format!("body {token}\n")),
+            Subject::Block(..)
+            | Subject::Add(_)
+            | Subject::Close(_)
+            | Subject::NewBrief(_)
+            | Subject::Queue(_)
+            | Subject::Next => None,
+        }
+    }
 }
 
 /// What a hand edit does, for the oracle to record once it is made.
@@ -426,6 +473,9 @@ struct Depth {
     briefs_queued: u32,
     briefs_claimed: u32,
     queue_empty: u32,
+    briefs_blocked: u32,
+    briefs_resumed: u32,
+    briefs_reported: u32,
 }
 
 impl Depth {
@@ -450,6 +500,9 @@ impl Depth {
         self.briefs_queued += other.briefs_queued;
         self.briefs_claimed += other.briefs_claimed;
         self.queue_empty += other.queue_empty;
+        self.briefs_blocked += other.briefs_blocked;
+        self.briefs_resumed += other.briefs_resumed;
+        self.briefs_reported += other.briefs_reported;
     }
 }
 
@@ -486,6 +539,9 @@ struct Oracle<'w> {
     /// Slugs of `new brief` runs that were refused or never pushed: on no
     /// file anywhere.
     briefs_never: BTreeSet<String>,
+    /// Tokens of lines `block`, `amend` or `report` were refused to write:
+    /// in no brief anywhere.
+    lines_never: BTreeSet<String>,
     /// The highest id typed by hand so far, per list.
     typed: BTreeMap<char, u32>,
     online: [bool; 2],
@@ -511,6 +567,7 @@ impl<'w> Oracle<'w> {
             brief_lines: Vec::new(),
             remote_briefs: BTreeMap::new(),
             briefs_never: BTreeSet::new(),
+            lines_never: BTreeSet::new(),
             typed: BTreeMap::new(),
             online: [true; 2],
             unpushed: [false; 2],
@@ -710,7 +767,55 @@ impl<'w> Oracle<'w> {
                 )
             }
             Op::Next => (owned(&["next"]), Subject::Next),
+            Op::Block(pick) | Op::Amend(pick) | Op::Report(pick) => {
+                let statuses: &[&str] = match op {
+                    Op::Amend(_) => &["queued", "started", "blocked"],
+                    _ => &["started"],
+                };
+                let numbers = self.open_with(who, statuses);
+                // Nothing to pick: a brief that is not there, for a refusal.
+                let number = if numbers.is_empty() {
+                    999_999
+                } else {
+                    *pick.get(&numbers)
+                };
+                let token = self.token();
+                let line = format!("body {token}");
+                let (args, subject) = match op {
+                    Op::Block(_) => (
+                        owned(&["block", &number.to_string(), &line]),
+                        Subject::Block(number, token),
+                    ),
+                    Op::Amend(_) => (
+                        owned(&["amend", &number.to_string()]),
+                        Subject::Amend(number, token),
+                    ),
+                    _ => (
+                        owned(&["report", &number.to_string()]),
+                        Subject::Report(number, token),
+                    ),
+                };
+                (args, subject)
+            }
         }
+    }
+
+    /// The numbers of the open briefs of the clone and the remote that have
+    /// one of these statuses.
+    fn open_with(&self, who: Who, statuses: &[&str]) -> Vec<u32> {
+        let numbers: BTreeSet<u32> = [who.slot(), 2]
+            .into_iter()
+            .flat_map(|place| self.briefs(place))
+            .filter(|brief| {
+                !brief.filed
+                    && brief
+                        .status
+                        .as_deref()
+                        .is_some_and(|status| statuses.contains(&status))
+            })
+            .map(|brief| brief.number)
+            .collect();
+        numbers.into_iter().collect()
     }
 
     /// A hand edit of `who`'s files: the file and its new bytes, and what
@@ -979,9 +1084,50 @@ impl<'w> Oracle<'w> {
         self.check_everywhere()
     }
 
+    /// For `block`, `amend` and `report` when neither the clone nor the
+    /// remote has a brief they take: the commands that bring one there, as
+    /// the planner and the worker would have run them, each judged as a
+    /// command of its own. Left to chance, a trace seldom gets a brief from
+    /// new to started before it ends.
+    fn prepare(&mut self, who: Who, op: &Op) -> Result<(), TestCaseError> {
+        let wanted: &[&str] = match op {
+            Op::Block(_) | Op::Report(_) => &["started"],
+            Op::Amend(_) => &["queued", "started", "blocked"],
+            Op::AddChore { .. }
+            | Op::AddBacklog
+            | Op::Done(_)
+            | Op::Drop(_)
+            | Op::NewBrief
+            | Op::Queue { .. }
+            | Op::Next => return Ok(()),
+        };
+        // At most new, queue and next; fewer when one is refused.
+        for _ in 0..3 {
+            if !self.open_with(who, wanted).is_empty() {
+                break;
+            }
+            let before = if !self.open_with(who, &["queued"]).is_empty() {
+                Op::Next
+            } else if !self.drafts(who).is_empty() {
+                Op::Queue {
+                    pick: first(),
+                    write: true,
+                }
+            } else {
+                Op::NewBrief
+            };
+            self.command(who, &before, None)?;
+        }
+        Ok(())
+    }
+
     fn command(&mut self, who: Who, op: &Op, fault: Option<&Fault>) -> Result<(), TestCaseError> {
         let machine = self.machine(who);
         let other = self.machine(who.other());
+        self.prepare(who, op)?;
+        if let Some(Fault::WindowOp(window_op)) = fault {
+            self.prepare(who.other(), window_op)?;
+        }
         let rejecting = self.world.rejects_left() > 0;
         let (args, subject) = self.args(who, op);
         self.write_before_queue(who, op, &subject)?;
@@ -993,10 +1139,15 @@ impl<'w> Oracle<'w> {
                 let (window_args, window_subject) = self.args(who.other(), window_op);
                 self.write_before_queue(who.other(), window_op, &window_subject)?;
                 let words: Vec<&str> = window_args.iter().map(String::as_str).collect();
-                machine.hook_once(
-                    "pre-push",
-                    &pre_push::window(&other.script(&words), self.world.dir()),
-                );
+                let script = match window_subject.input() {
+                    Some(input) => {
+                        let file = self.world.dir().join("window-input");
+                        fs::write(&file, input).unwrap();
+                        other.script_with_input(&words, &file)
+                    }
+                    None => other.script(&words),
+                };
+                machine.hook_once("pre-push", &pre_push::window(&script, self.world.dir()));
                 window = Some(window_subject);
             }
             Some(Fault::WindowEdit(edit)) => {
@@ -1038,7 +1189,14 @@ impl<'w> Oracle<'w> {
         }
 
         let claimed_before = self.claimed_on_remote();
-        let output = machine.command().args(&args).output().expect("run board");
+        let mut command = machine.command();
+        command.args(&args);
+        if let Some(input) = subject.input() {
+            let file = self.world.dir().join("input");
+            fs::write(&file, input).unwrap();
+            command.stdin(fs::File::open(&file).unwrap());
+        }
+        let output = command.output().expect("run board");
         // A one-shot hook that is gone has run.
         let hook_ran = !machine.has_hook("pre-push");
         machine.unhook("pre-push");
@@ -1238,7 +1396,8 @@ impl<'w> Oracle<'w> {
             Some(1) => {
                 self.depth.refused += 1;
                 prop_assert!(
-                    matches!(subject, Subject::Close(_) | Subject::Queue(_)),
+                    matches!(subject, Subject::Close(_) | Subject::Queue(_))
+                        || subject.brief_line().is_some(),
                     "{run:?}"
                 );
             }
@@ -1434,6 +1593,80 @@ impl<'w> Oracle<'w> {
                 );
                 self.depth.briefs_claimed += 1;
             }
+            Subject::Block(number, token)
+            | Subject::Amend(number, token)
+            | Subject::Report(number, token) => {
+                self.judge_brief_line(who, subject, run, pushed, (*number, token))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A `block`, `amend` or `report` run: what it printed, and its line in
+    /// the brief of the place it wrote to, with a status the command can
+    /// have left (or one the brief moved on to since, by the other run of
+    /// the step).
+    fn judge_brief_line(
+        &mut self,
+        who: Who,
+        subject: &Subject,
+        run: &Run,
+        pushed: bool,
+        (number, token): (u32, &str),
+    ) -> Result<(), TestCaseError> {
+        let (_, _, word) = subject.brief_line().expect("a brief line");
+        match run.code {
+            Some(0) => {
+                let (printed, after) = match subject {
+                    Subject::Block(..) => {
+                        self.depth.briefs_blocked += 1;
+                        (format!("blocked {number}\n"), "blocked")
+                    }
+                    Subject::Report(..) => {
+                        self.depth.briefs_reported += 1;
+                        (format!("reported {number}\n"), "reported")
+                    }
+                    _ => {
+                        if run.stdout == format!("amended {number}, resumed\n") {
+                            self.depth.briefs_resumed += 1;
+                            (run.stdout.clone(), "started")
+                        } else {
+                            (format!("amended {number}\n"), "queued")
+                        }
+                    }
+                };
+                prop_assert_eq!(&run.stdout, &printed);
+                let place = if pushed { 2 } else { who.slot() };
+                let line = format!("body {token}");
+                let found: Vec<BriefSeen> = self
+                    .briefs(place)
+                    .into_iter()
+                    .filter(|brief| brief.number == number && !brief.filed)
+                    .collect();
+                prop_assert!(
+                    matches!(&found[..], [brief] if brief.text.lines().any(|l| l == line)
+                        && brief.status.as_deref().is_some_and(|s| reachable(after, s))),
+                    "{} {} is not in brief {}, {}: {:?} after {:?}",
+                    word,
+                    token,
+                    number,
+                    after,
+                    found,
+                    run
+                );
+                self.brief_lines.push((token.to_owned(), who, number));
+            }
+            Some(1) => {
+                let last = run.stderr.lines().last().unwrap_or_default();
+                prop_assert!(
+                    last.starts_with(&format!("board: {word} {number}: ")),
+                    "{:?}",
+                    run
+                );
+                self.lines_never.insert(token.to_owned());
+            }
+            // Killed: written or not.
+            Some(_) | None => {}
         }
         Ok(())
     }
@@ -1474,6 +1707,17 @@ impl<'w> Oracle<'w> {
                     .any(|slug| brief.name.ends_with(&format!("-{slug}.md"))),
                 "{} was never made, and is in {}",
                 brief.name,
+                name
+            );
+            let refused = brief.text.lines().find(|line| {
+                line.strip_prefix("body ")
+                    .is_some_and(|token| self.lines_never.contains(token))
+            });
+            prop_assert!(
+                refused.is_none(),
+                "{:?} was refused, and is in brief {} of {}",
+                refused,
+                brief.number,
                 name
             );
         }
@@ -1761,6 +2005,9 @@ fn the_traces_get_deep() {
     assert!(depth.briefs_queued > 0, "{depth:?}");
     assert!(depth.briefs_claimed > 0, "{depth:?}");
     assert!(depth.queue_empty > 0, "{depth:?}");
+    assert!(depth.briefs_blocked > 0, "{depth:?}");
+    assert!(depth.briefs_resumed > 0, "{depth:?}");
+    assert!(depth.briefs_reported > 0, "{depth:?}");
     assert!(
         depth.succeeded * 10 >= depth.commands * 6,
         "fewer than 60% of the commands succeeded: {depth:?}"

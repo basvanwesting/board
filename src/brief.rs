@@ -341,6 +341,160 @@ impl Section<'_> {
     }
 }
 
+/// Where a section is in a brief's body.
+#[derive(Debug, Clone)]
+struct Span {
+    /// Where its heading line starts.
+    heading: usize,
+    /// What follows `## ` on the heading line, untrimmed.
+    name: std::ops::Range<usize>,
+    /// Its lines after the heading line.
+    text: std::ops::Range<usize>,
+}
+
+impl Span {
+    fn name<'a>(&self, body: &'a [u8]) -> &'a [u8] {
+        body[self.name.clone()].trim_ascii()
+    }
+
+    fn is_named(&self, body: &[u8], name: &str) -> bool {
+        self.name(body).eq_ignore_ascii_case(name.as_bytes())
+    }
+}
+
+/// What a line of a brief's body is to its sections: the one reading of a
+/// line, for the sections of a brief and for text a command puts into one.
+enum BodyLine {
+    /// A line whose first non-blank characters are ```` ``` ````: it opens
+    /// or closes a code fence.
+    Fence,
+    /// A line that starts with `## `: a heading when it is outside a fence.
+    Heading,
+    Other,
+}
+
+impl BodyLine {
+    fn of(content: &[u8]) -> BodyLine {
+        if content.trim_ascii_start().starts_with(b"```") {
+            BodyLine::Fence
+        } else if content.starts_with(b"## ") {
+            BodyLine::Heading
+        } else {
+            BodyLine::Other
+        }
+    }
+}
+
+/// Text a command writes into a brief: a question, an amendment, a report.
+/// Not blank; blank lines before it and blanks at its end are dropped, as
+/// they would only push it away from its heading and the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Text(Vec<u8>);
+
+/// Text that is blank or empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyText;
+
+impl fmt::Display for EmptyText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the text is empty")
+    }
+}
+
+impl std::error::Error for EmptyText {}
+
+impl Text {
+    pub fn new(bytes: &[u8]) -> Result<Text, EmptyText> {
+        let start = raw::lines(bytes)
+            .take_while(|line| raw::is_blank(raw::content(line)))
+            .map(<[u8]>::len)
+            .sum::<usize>();
+        let text = bytes[start..].trim_ascii_end();
+        if text.is_empty() {
+            Err(EmptyText)
+        } else {
+            Ok(Text(text.to_vec()))
+        }
+    }
+
+    /// Without a terminator at the end.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl FromStr for Text {
+    type Err = EmptyText;
+
+    fn from_str(s: &str) -> Result<Text, EmptyText> {
+        Text::new(s.as_bytes())
+    }
+}
+
+/// Text that stays in the section it is appended to: a question or an
+/// amendment, which other sections may follow.
+///
+/// A `## ` line outside a code fence would be read as the heading of a
+/// section of its own, and a fence the text opens and does not close would
+/// make every heading after it quoted text: either way the sections after
+/// the entry would change. A report is plain [`Text`]: it is the last
+/// section, by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryText(Text);
+
+/// Why a text would not stay in its section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitsSection {
+    /// The `## ` line, as it is in the text.
+    Heading(String),
+    OpenFence,
+}
+
+impl fmt::Display for SplitsSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SplitsSection::Heading(line) => write!(
+                f,
+                "the line `{}` outside a code fence would start a section of its own; \
+                 use `###` for a heading",
+                line.escape_debug()
+            ),
+            SplitsSection::OpenFence => f.write_str(
+                "a code fence is opened and not closed, which would make the sections after it \
+                 quoted text",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SplitsSection {}
+
+impl EntryText {
+    pub fn new(text: Text) -> Result<EntryText, SplitsSection> {
+        let mut fenced = false;
+        for line in raw::lines(text.as_bytes()) {
+            let content = raw::content(line);
+            match BodyLine::of(content) {
+                BodyLine::Fence => fenced = !fenced,
+                BodyLine::Heading if !fenced => {
+                    return Err(SplitsSection::Heading(
+                        String::from_utf8_lossy(content).into_owned(),
+                    ));
+                }
+                BodyLine::Heading | BodyLine::Other => {}
+            }
+        }
+        if fenced {
+            return Err(SplitsSection::OpenFence);
+        }
+        Ok(EntryText(text))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
 impl Brief {
     /// A new brief's file: `id`, `status: draft`, `base`, `created` and one
     /// blank line. The planner writes the rest.
@@ -418,48 +572,173 @@ impl Brief {
 
     /// The `## ` sections of the body, in file order.
     ///
-    /// A heading is a line that starts with `## ` outside a code fence (a
-    /// line whose first non-blank characters are ```` ``` ````, which opens
-    /// or closes one): a brief quotes markdown, and a heading in a quoted
+    /// A heading is a line that starts with `## ` outside a code fence (see
+    /// [`BodyLine`]): a brief quotes markdown, and a heading in a quoted
     /// block is not the brief's. `## Report` runs to the end of the file, so
     /// a report may hold `## ` lines of its own; the tool keeps it last.
     pub fn sections(&self) -> Vec<Section<'_>> {
         let body = self.body.as_slice();
-        let mut sections = Vec::new();
-        // The open section: its name and where its text starts.
-        let mut open: Option<(&[u8], usize)> = None;
+        self.spans()
+            .into_iter()
+            .map(|span| Section {
+                name: span.name(body),
+                text: &body[span.text],
+            })
+            .collect()
+    }
+
+    /// Where each section is in the body.
+    fn spans(&self) -> Vec<Span> {
+        let mut spans = Vec::new();
+        // The open section, its text running to the end so far.
+        let mut open: Option<Span> = None;
         let mut fenced = false;
         let mut at = 0;
-        for line in raw::lines(body) {
+        for line in raw::lines(&self.body) {
             let start = at;
             at += line.len();
             let content = raw::content(line);
-            if content.trim_ascii_start().starts_with(b"```") {
-                fenced = !fenced;
-                continue;
+            match BodyLine::of(content) {
+                BodyLine::Fence => {
+                    fenced = !fenced;
+                    continue;
+                }
+                BodyLine::Heading if !fenced => {}
+                BodyLine::Heading | BodyLine::Other => continue,
             }
-            let Some(name) = content.strip_prefix(b"## ").filter(|_| !fenced) else {
-                continue;
+            if let Some(mut span) = open.take() {
+                span.text.end = start;
+                spans.push(span);
+            }
+            let span = Span {
+                heading: start,
+                name: start + "## ".len()..start + content.len(),
+                text: at..at,
             };
-            if let Some((name, from)) = open {
-                sections.push(Section {
-                    name,
-                    text: &body[from..start],
-                });
-            }
-            let name = name.trim_ascii();
-            open = Some((name, at));
-            if name.eq_ignore_ascii_case(REPORT.as_bytes()) {
+            let is_report = span.is_named(&self.body, REPORT);
+            open = Some(span);
+            if is_report {
                 break;
             }
         }
-        if let Some((name, from)) = open {
-            sections.push(Section {
-                name,
-                text: &body[from..],
-            });
+        if let Some(mut span) = open {
+            span.text.end = self.body.len();
+            spans.push(span);
         }
-        sections
+        spans
+    }
+
+    /// The terminator a line the tool adds gets: the one of the file's first
+    /// line, as for a list file.
+    fn terminator(&self) -> &'static [u8] {
+        let first = self
+            .header
+            .first()
+            .map(Vec::as_slice)
+            .or_else(|| raw::lines(&self.body).next());
+        raw::terminator_of(first)
+    }
+
+    /// Gives the file's last line a terminator when it has none, so a line
+    /// can follow it.
+    fn terminate_last_line(&mut self, terminator: &[u8]) {
+        let last = if self.body.is_empty() {
+            self.header.last_mut()
+        } else {
+            Some(&mut self.body)
+        };
+        if let Some(last) = last
+            && !last.ends_with(b"\n")
+        {
+            last.extend_from_slice(terminator);
+        }
+    }
+
+    /// Appends `### <now>`, a blank line and the text at the end of the
+    /// section `name` (a question, an amendment), and makes the section when
+    /// the brief has none: before `## Report`, which runs to the end of the
+    /// file, else at the end. Every other section keeps its bytes, but for a
+    /// terminator on a last line that had none.
+    ///
+    /// An entry is set off by a blank line from what comes before it in its
+    /// section and from a heading after it; a new section's heading follows
+    /// the line before it directly, as a blank line there would be the text
+    /// of the section above.
+    ///
+    /// A brief whose own text leaves a code fence open to the end of the
+    /// file gets the entry inside that fence, where no heading is read: the
+    /// text is kept, the section is not found again. Not refused: `block`
+    /// is the worker's way out, and the fence is the planner's to close.
+    pub(crate) fn append_entry(&mut self, name: &str, now: Stamp, text: &EntryText) {
+        let terminator = self.terminator();
+        let spans = self.spans();
+        let target = spans
+            .iter()
+            .find(|span| span.is_named(&self.body, name))
+            .cloned();
+        let report = spans.iter().find(|span| span.is_named(&self.body, REPORT));
+        let mut insert = Vec::new();
+        let mut at = match &target {
+            Some(span) => span.text.end,
+            None => report.map_or(self.body.len(), |span| span.heading),
+        };
+        if at == self.body.len() {
+            self.terminate_last_line(terminator);
+            at = self.body.len();
+        }
+        if target.is_none() {
+            insert.extend_from_slice(format!("## {name}").as_bytes());
+            insert.extend_from_slice(terminator);
+        }
+        // The line before the entry: the section's last, or its heading.
+        let before = match &target {
+            Some(span) if !span.text.is_empty() => {
+                raw::lines(&self.body[span.text.start..at]).last()
+            }
+            Some(span) => Some(&self.body[span.heading..span.text.start]),
+            None => None,
+        };
+        if before.is_none_or(|line| !raw::is_blank(raw::content(line))) {
+            insert.extend_from_slice(terminator);
+        }
+        insert.extend_from_slice(format!("### {now}").as_bytes());
+        insert.extend_from_slice(terminator);
+        insert.extend_from_slice(terminator);
+        insert.extend_from_slice(text.as_bytes());
+        insert.extend_from_slice(terminator);
+        if at < self.body.len() {
+            insert.extend_from_slice(terminator);
+        }
+        self.body.splice(at..at, insert);
+    }
+
+    /// Makes the text the whole of `## Report`, which is added at the end of
+    /// the file when the brief has none. A report runs to the end of the
+    /// file, so it may hold `## ` lines of its own.
+    pub(crate) fn set_report(&mut self, text: &Text) {
+        let terminator = self.terminator();
+        let report = self
+            .spans()
+            .into_iter()
+            .find(|span| span.is_named(&self.body, REPORT));
+        let from = match report {
+            // A heading that ends the file without a terminator.
+            Some(span) if span.text.is_empty() && !self.body.ends_with(b"\n") => {
+                self.body.extend_from_slice(terminator);
+                self.body.len()
+            }
+            Some(span) => span.text.start,
+            None => {
+                self.terminate_last_line(terminator);
+                self.body
+                    .extend_from_slice(format!("## {REPORT}").as_bytes());
+                self.body.extend_from_slice(terminator);
+                self.body.len()
+            }
+        };
+        self.body.truncate(from);
+        self.body.extend_from_slice(text.as_bytes());
+        self.body.extend_from_slice(terminator);
     }
 
     /// The first section with this name. A name written twice by hand reads
@@ -1023,6 +1302,136 @@ mod tests {
         );
     }
 
+    // ---- text a command writes ----
+
+    fn entry(text: &str) -> EntryText {
+        EntryText::new(text.parse().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn text_is_what_is_not_blank() {
+        let text = |bytes: &[u8]| Text::new(bytes).map(|text| utf8(text.as_bytes()).to_owned());
+        assert_eq!(text(b"q"), Ok("q".to_owned()));
+        assert_eq!(
+            text(b" \n\r\n  first\n\n  second \n\n"),
+            Ok("  first\n\n  second".to_owned())
+        );
+        assert_eq!(text(b""), Err(EmptyText));
+        assert_eq!(text(b" \n\t\r\n"), Err(EmptyText));
+    }
+
+    #[test]
+    fn an_entry_may_not_start_a_section_or_leave_a_fence_open() {
+        let check = |text: &str| EntryText::new(text.parse().unwrap()).map(drop);
+        for fits in [
+            "plain",
+            "### Sub\nx",
+            " ## indented",
+            "##tight",
+            "```\n## quoted\n```",
+            "  ```md\n## quoted\n```\n```\n## \n```",
+        ] {
+            assert_eq!(check(fits), Ok(()), "{fits}");
+        }
+        assert_eq!(
+            check("x\n## Design\ny"),
+            Err(SplitsSection::Heading("## Design".to_owned()))
+        );
+        assert_eq!(
+            check("```\n```\n## \nx"),
+            Err(SplitsSection::Heading("## ".to_owned()))
+        );
+        assert_eq!(check("```\n## quoted"), Err(SplitsSection::OpenFence));
+        assert_eq!(
+            check("a\r\n## B\r\n").unwrap_err().to_string(),
+            "the line `## B` outside a code fence would start a section of its own; \
+             use `###` for a heading"
+        );
+    }
+
+    const AT: &str = "2026-11-20T17:10:00Z";
+
+    fn appended(bytes: &str, name: &str, text: &str) -> String {
+        let mut brief = Brief::parse(bytes.as_bytes());
+        brief.append_entry(name, stamp(AT), &entry(text));
+        String::from_utf8(brief.to_bytes()).unwrap()
+    }
+
+    #[test]
+    fn an_entry_goes_at_the_end_of_its_section() {
+        // Made at the end, then added to.
+        let once = appended("id: 1\n\n## Task\nt\n", "Questions", "Why?");
+        assert_eq!(
+            once,
+            format!("id: 1\n\n## Task\nt\n## Questions\n\n### {AT}\n\nWhy?\n")
+        );
+        assert_eq!(
+            appended(&once, "Questions", "And?\n\n"),
+            format!("id: 1\n\n## Task\nt\n## Questions\n\n### {AT}\n\nWhy?\n\n### {AT}\n\nAnd?\n")
+        );
+        // In the middle: set off from the heading after it.
+        assert_eq!(
+            appended(
+                "## Amendments\n### old\nx\n## Questions\nq\n",
+                "amendments",
+                "a"
+            ),
+            format!("## Amendments\n### old\nx\n\n### {AT}\n\na\n\n## Questions\nq\n")
+        );
+        // Before the report, which stays last.
+        assert_eq!(
+            appended(
+                "## Task\nt\n## report\n## Not a section\n",
+                "Amendments",
+                "a"
+            ),
+            format!("## Task\nt\n## Amendments\n\n### {AT}\n\na\n\n## report\n## Not a section\n")
+        );
+    }
+
+    #[test]
+    fn an_entry_takes_the_terminator_of_the_first_line() {
+        assert_eq!(
+            appended("id: 1\r\n\r\n## Task\r\nt", "Questions", "line 1\nline 2"),
+            format!(
+                "id: 1\r\n\r\n## Task\r\nt\r\n## Questions\r\n\r\n### {AT}\r\n\r\nline 1\nline 2\r\n"
+            )
+        );
+        // A header that is the whole file, without a terminator.
+        assert_eq!(
+            appended("status: started", "Questions", "q"),
+            format!("status: started\n## Questions\n\n### {AT}\n\nq\n")
+        );
+        // A heading that ends the file without one.
+        assert_eq!(
+            appended("## Questions", "Questions", "q"),
+            format!("## Questions\n\n### {AT}\n\nq\n")
+        );
+    }
+
+    fn reported(bytes: &str, text: &str) -> String {
+        let mut brief = Brief::parse(bytes.as_bytes());
+        brief.set_report(&text.parse().unwrap());
+        String::from_utf8(brief.to_bytes()).unwrap()
+    }
+
+    #[test]
+    fn a_report_is_the_whole_of_the_last_section() {
+        assert_eq!(
+            reported("id: 1\n\n## Task\nt", "Ran:\n## Checks\nok\n"),
+            "id: 1\n\n## Task\nt\n## Report\nRan:\n## Checks\nok\n"
+        );
+        assert_eq!(
+            reported("## Task\nt\n## REPORT \nold\n## Old\n", "new"),
+            "## Task\nt\n## REPORT \nnew\n"
+        );
+        assert_eq!(reported("## Report", "new"), "## Report\nnew\n");
+        assert_eq!(
+            reported("status: started\r\n", "new"),
+            "status: started\r\n## Report\r\nnew\r\n"
+        );
+    }
+
     // ---- properties ----
 
     /// A body line that is likely to matter to sections: headings, fences,
@@ -1032,6 +1441,7 @@ mod tests {
             3 => prop::sample::select(&[
                 "## Task", "## task ", "## Design", "## Report", "## REPORT", "## ",
                 "```", "  ```rust", "### Sub", "##Task", " ## Task", "# Title",
+                "## Questions", "## amendments ",
             ][..])
             .prop_map(String::from),
             2 => "[a-z #`]{0,8}",
@@ -1316,6 +1726,234 @@ mod tests {
             now in any_stamp(),
         ) {
             check_transition(&bytes, (allowed, pick), now)?;
+        }
+    }
+
+    /// Text for a question, an amendment or a report: mostly lines that fit
+    /// anywhere, now and then a heading or a fence.
+    fn text_bytes() -> impl Strategy<Value = Vec<u8>> {
+        let line = prop_oneof![
+            6 => "[a-z ]{0,8}",
+            1 => prop::sample::select(&["### Sub", "## Checks", "```", " ## x", "  "][..])
+                .prop_map(String::from),
+        ];
+        prop::collection::vec((line, any::<bool>()), 1..5).prop_map(|lines| {
+            let mut bytes = Vec::new();
+            for (content, crlf) in lines {
+                bytes.extend_from_slice(content.as_bytes());
+                bytes.extend_from_slice(if crlf { b"\r\n" } else { b"\n" });
+            }
+            bytes
+        })
+    }
+
+    /// Whether the body ends inside a code fence, by a reading of the format
+    /// that shares nothing with the parser: a heading added at the end is
+    /// then quoted text. A brief the planner left that way keeps what is
+    /// written after it inside the fence; that is the brief's, not the edit's.
+    fn ends_fenced(body: &[u8]) -> bool {
+        let mut fenced = false;
+        for line in raw_lines(body) {
+            let content = utf8(content_of(&line));
+            if content.trim_start().starts_with("```") {
+                fenced = !fenced;
+            } else if !fenced
+                && content
+                    .strip_prefix("## ")
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("report"))
+            {
+                return false;
+            }
+        }
+        fenced
+    }
+
+    /// A brief cut into its header, the body before the first section, and
+    /// the sections as `(name, text)`.
+    type Parts = (Vec<u8>, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>);
+
+    fn parts(brief: &Brief) -> Parts {
+        let body = brief.body();
+        let preamble = brief
+            .spans()
+            .first()
+            .map_or(body.len(), |span| span.heading);
+        let sections = brief
+            .sections()
+            .iter()
+            .map(|section| (section.name.to_vec(), section.text.to_vec()))
+            .collect();
+        (brief.header.concat(), body[..preamble].to_vec(), sections)
+    }
+
+    /// `new` is `old`, or, for the last part of the file, `old` with the
+    /// terminator it lacked.
+    fn kept(old: &[u8], new: &[u8], last: bool, terminator: &[u8]) -> bool {
+        new == old || (last && !old.ends_with(b"\n") && new == [old, terminator].concat())
+    }
+
+    const PREFIXES: [&str; 3] = [
+        "",
+        "id: 1\nstatus: started\n\n",
+        "id: 1\r\nstatus: started\r\n",
+    ];
+
+    /// An entry lands at the end of its section, which is made before the
+    /// report or at the end when missing; every other byte stays.
+    fn check_entry(
+        prefix: &str,
+        body: &[u8],
+        name: &str,
+        text: &[u8],
+        now: Stamp,
+    ) -> Result<(), TestCaseError> {
+        let Some(entry) = Text::new(text)
+            .ok()
+            .and_then(|text| EntryText::new(text).ok())
+        else {
+            return Ok(());
+        };
+        if ends_fenced(body) {
+            return Ok(());
+        }
+        let before = Brief::parse(&[prefix.as_bytes(), body].concat());
+        let terminator = before.terminator();
+        let mut after = before.clone();
+        after.append_entry(name, now, &entry);
+        let (old_header, old_preamble, old) = parts(&before);
+        let (new_header, new_preamble, new) = parts(&after);
+        prop_assert_eq!(new_header, old_header);
+        prop_assert!(kept(
+            &old_preamble,
+            &new_preamble,
+            old.is_empty(),
+            terminator
+        ));
+
+        let core = [
+            format!("### {now}").as_bytes(),
+            terminator,
+            terminator,
+            entry.as_bytes(),
+            terminator,
+        ]
+        .concat();
+        let target = old
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()));
+        let report = old
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(b"Report"));
+        let (at, made) = match target {
+            Some(at) => (at, false),
+            None => (report.unwrap_or(old.len()), true),
+        };
+        prop_assert_eq!(new.len(), old.len() + usize::from(made));
+        let at_end = at + usize::from(!made) == old.len();
+        for (index, (old_name, old_text)) in old.iter().enumerate() {
+            let last = index + 1 == old.len();
+            let moved = if made && index >= at {
+                index + 1
+            } else {
+                index
+            };
+            let (new_name, new_text) = &new[moved];
+            prop_assert_eq!(new_name, old_name);
+            if made || index != at {
+                prop_assert!(
+                    kept(old_text, new_text, last, terminator),
+                    "section {} changed",
+                    index
+                );
+                continue;
+            }
+            // The target: its old text, then the entry, set off by blank
+            // lines from a line before it and a heading after it.
+            let mut kept_text = old_text.clone();
+            if last && !kept_text.is_empty() && !kept_text.ends_with(b"\n") {
+                kept_text.extend_from_slice(terminator);
+            }
+            let blank_before = match raw_lines(&kept_text).last() {
+                Some(line) => !content_of(line).iter().all(u8::is_ascii_whitespace),
+                None => true,
+            };
+            let expected = [
+                kept_text.as_slice(),
+                if blank_before { terminator } else { b"" },
+                &core,
+                if at_end { b"" } else { terminator },
+            ]
+            .concat();
+            prop_assert_eq!(utf8(new_text), utf8(&expected));
+        }
+        if made {
+            let (new_name, new_text) = &new[at];
+            prop_assert_eq!(utf8(new_name), name);
+            let expected = [terminator, &core, if at_end { b"" } else { terminator }].concat();
+            prop_assert_eq!(utf8(new_text), utf8(&expected));
+        }
+        Ok(())
+    }
+
+    /// The report is the text and the last section; every other byte stays.
+    fn check_report(prefix: &str, body: &[u8], text: &[u8]) -> Result<(), TestCaseError> {
+        let Ok(text) = Text::new(text) else {
+            return Ok(());
+        };
+        if ends_fenced(body) {
+            return Ok(());
+        }
+        let before = Brief::parse(&[prefix.as_bytes(), body].concat());
+        let terminator = before.terminator();
+        let mut after = before.clone();
+        after.set_report(&text);
+        let (old_header, old_preamble, old) = parts(&before);
+        let (new_header, new_preamble, new) = parts(&after);
+        prop_assert_eq!(new_header, old_header);
+        prop_assert!(kept(
+            &old_preamble,
+            &new_preamble,
+            old.is_empty(),
+            terminator
+        ));
+        let report = old
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(b"Report"));
+        prop_assert_eq!(new.len(), old.len() + usize::from(report.is_none()));
+        let (new_name, new_text) = new.last().unwrap();
+        match report {
+            Some(at) => prop_assert_eq!(new_name, &old[at].0),
+            None => prop_assert_eq!(utf8(new_name), "Report"),
+        }
+        prop_assert_eq!(new_text, &[text.as_bytes(), terminator].concat());
+        let others = report.unwrap_or(old.len());
+        for (index, (old_name, old_text)) in old[..others].iter().enumerate() {
+            let (new_name, new_text) = &new[index];
+            prop_assert_eq!(new_name, old_name);
+            prop_assert!(kept(old_text, new_text, index + 1 == old.len(), terminator));
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn an_entry_leaves_every_other_section_as_it_was(
+            prefix in prop::sample::select(&PREFIXES[..]),
+            body in section_body(),
+            name in prop::sample::select(&["Questions", "Amendments"][..]),
+            text in text_bytes(),
+            now in any_stamp(),
+        ) {
+            check_entry(prefix, &body, name, &text, now)?;
+        }
+
+        #[test]
+        fn a_report_leaves_every_other_section_as_it_was(
+            prefix in prop::sample::select(&PREFIXES[..]),
+            body in section_body(),
+            text in text_bytes(),
+        ) {
+            check_report(prefix, &body, &text)?;
         }
     }
 }

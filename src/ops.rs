@@ -3,7 +3,7 @@
 //! without either. The write loop in `sync.rs` loads the project, runs one of
 //! these and commits what it changed.
 
-use crate::brief::{BadStatus, Brief, Stamp, Status, Transition, TransitionError};
+use crate::brief::{BadStatus, Brief, EntryText, Stamp, Status, Text, Transition, TransitionError};
 use crate::error::Error;
 use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
@@ -137,6 +137,100 @@ pub(crate) fn next(
     file.transition(Transition::Claim, now)
         .map_err(|error| refused(not_moved(&error, Status::Queued)))?;
     Ok(Some((number, file.path(&name))))
+}
+
+/// The tool's sections, each the place of one command's entries.
+const QUESTIONS: &str = "Questions";
+const AMENDMENTS: &str = "Amendments";
+
+/// Blocks a started brief on a question, appended under `## Questions`.
+pub(crate) fn block(
+    project: &mut Project,
+    number: BriefId,
+    question: &EntryText,
+    now: Stamp,
+) -> Result<String, Error> {
+    let refused = |why: String| Error::Refused(format!("block {number}: {why}"));
+    let file = started(project, number).map_err(refused)?;
+    file.brief.append_entry(QUESTIONS, now, question);
+    file.transition(Transition::Block, now)
+        .map_err(|error| refused(not_moved(&error, Status::Started)))?;
+    Ok(format!("blocked {number}"))
+}
+
+/// Appends an amendment under `## Amendments` to a brief the worker has or
+/// will have; a blocked brief resumes, as the amendment is the answer it
+/// waits for. Gives what `amend` prints.
+///
+/// A draft is still the planner's to edit, and a reported brief is done:
+/// what is decided after a report is the next brief's.
+pub(crate) fn amend(
+    project: &mut Project,
+    number: BriefId,
+    text: &EntryText,
+    now: Stamp,
+) -> Result<String, Error> {
+    let refused = |why: String| Error::Refused(format!("amend {number}: {why}"));
+    let file = project
+        .find_brief(number)
+        .map_err(|why| refused(no_brief(number, why)))?;
+    let resume = match file.status() {
+        Ok(Status::Queued | Status::Started) => false,
+        Ok(Status::Blocked) => true,
+        Ok(status @ (Status::Draft | Status::Reported | Status::Filed)) => {
+            return Err(refused(format!(
+                "it is {status}, not queued, started or blocked"
+            )));
+        }
+        Err(bad) => return Err(refused(bad_status(&bad))),
+    };
+    let file = project
+        .brief_mut(number)
+        .map_err(|why| refused(no_brief(number, why)))?;
+    file.brief.append_entry(AMENDMENTS, now, text);
+    if resume {
+        file.transition(Transition::Resume, now)
+            .map_err(|error| refused(not_moved(&error, Status::Blocked)))?;
+        Ok(format!("amended {number}, resumed"))
+    } else {
+        Ok(format!("amended {number}"))
+    }
+}
+
+/// Makes the text the started brief's `## Report` and reports it.
+pub(crate) fn report(
+    project: &mut Project,
+    number: BriefId,
+    text: &Text,
+    now: Stamp,
+) -> Result<String, Error> {
+    let refused = |why: String| Error::Refused(format!("report {number}: {why}"));
+    let file = started(project, number).map_err(refused)?;
+    file.brief.set_report(text);
+    file.transition(Transition::Report, now)
+        .map_err(|error| refused(not_moved(&error, Status::Started)))?;
+    Ok(format!("reported {number}"))
+}
+
+/// The brief to edit, when it is started; else why not. Nothing is changed
+/// before it is known to be started.
+fn started(project: &mut Project, number: BriefId) -> Result<&mut BriefFile, String> {
+    let file = project
+        .find_brief(number)
+        .map_err(|why| no_brief(number, why))?;
+    match file.status() {
+        Ok(Status::Started) => {}
+        Ok(status) => {
+            return Err(not_moved(
+                &TransitionError::NotFrom(status),
+                Status::Started,
+            ));
+        }
+        Err(bad) => return Err(bad_status(&bad)),
+    }
+    project
+        .brief_mut(number)
+        .map_err(|why| no_brief(number, why))
 }
 
 /// Why a brief number names no single brief, as every command that takes one
@@ -552,6 +646,162 @@ mod tests {
             refused(next(&mut shop, at("2026-11-20T17:00:00Z"))),
             "next: 1 is on 2 files; fix the duplicate first"
         );
+    }
+
+    fn entry(text: &str) -> EntryText {
+        EntryText::new(text.parse().unwrap()).unwrap()
+    }
+
+    const T: &str = "2026-11-20T17:10:00Z";
+
+    #[test]
+    fn block_puts_the_question_under_questions_and_stamps_blocked() {
+        let mut shop = with_briefs(
+            &[(
+                "briefs/1-a.md",
+                "status: started\nstarted: 2026-11-20T17:00:00Z\n\n## Task\nt\n",
+            )],
+            "",
+        );
+        assert_eq!(
+            block(&mut shop, BriefId::new(1), &entry("Which db?"), at(T)).unwrap(),
+            "blocked 1"
+        );
+        assert_eq!(
+            text_of(&shop, "briefs/1-a.md"),
+            format!(
+                "status: blocked\nstarted: 2026-11-20T17:00:00Z\nblocked: {T}\n\n\
+                 ## Task\nt\n## Questions\n\n### {T}\n\nWhich db?\n"
+            )
+        );
+        assert_eq!(changed(&shop), ["shop/briefs/1-a.md"]);
+    }
+
+    #[test]
+    fn amend_resumes_a_blocked_brief_and_keeps_the_status_of_others() {
+        let mut shop = with_briefs(
+            &[
+                ("briefs/1-a.md", "status: blocked\n\n## Questions\nq\n"),
+                ("briefs/2-a.md", "status: queued\n"),
+                ("briefs/3-a.md", "status: started\nstarted: x\n"),
+            ],
+            "",
+        );
+        let mut amend_one = |number: u32| {
+            amend(
+                &mut shop,
+                BriefId::new(number),
+                &entry("Use sqlite."),
+                at(T),
+            )
+        };
+        assert_eq!(amend_one(1).unwrap(), "amended 1, resumed");
+        assert_eq!(amend_one(2).unwrap(), "amended 2");
+        assert_eq!(amend_one(3).unwrap(), "amended 3");
+        assert_eq!(
+            text_of(&shop, "briefs/1-a.md"),
+            format!(
+                "status: started\n\n## Questions\nq\n## Amendments\n\n### {T}\n\nUse sqlite.\n"
+            )
+        );
+        // A resume is no new start.
+        assert_eq!(
+            text_of(&shop, "briefs/3-a.md"),
+            format!("status: started\nstarted: x\n## Amendments\n\n### {T}\n\nUse sqlite.\n")
+        );
+        assert!(text_of(&shop, "briefs/2-a.md").starts_with("status: queued\n## Amendments\n"));
+    }
+
+    #[test]
+    fn report_makes_the_report_and_stamps_reported() {
+        let mut shop = with_briefs(&[("briefs/1-a.md", "status: started\n\n## Task\nt\n")], "");
+        let text: Text = "Ran:\n## Checks\nall green\n".parse().unwrap();
+        assert_eq!(
+            report(&mut shop, BriefId::new(1), &text, at(T)).unwrap(),
+            "reported 1"
+        );
+        assert_eq!(
+            text_of(&shop, "briefs/1-a.md"),
+            format!(
+                "status: reported\nreported: {T}\n\n## Task\nt\n## Report\nRan:\n## Checks\nall green\n"
+            )
+        );
+    }
+
+    /// Each command from every status it does not take, and on a number that
+    /// names no single brief: refused, nothing changed.
+    #[test]
+    fn block_amend_and_report_refuse_a_brief_in_the_wrong_status() {
+        let files: Vec<(String, String)> = ["draft", "queued", "started", "blocked", "reported"]
+            .iter()
+            .enumerate()
+            .map(|(n, status)| {
+                (
+                    format!("briefs/{}-{status}.md", n + 1),
+                    format!("status: {status}\n"),
+                )
+            })
+            .chain([
+                ("briefs/done/6-filed.md".to_owned(), String::new()),
+                ("briefs/7-none.md".to_owned(), "# no header\n".to_owned()),
+                ("briefs/8-a.md".to_owned(), "status: started\n".to_owned()),
+                ("briefs/done/8-b.md".to_owned(), String::new()),
+            ])
+            .collect();
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (&p[..], &t[..])).collect();
+        let text: Text = "x".parse().unwrap();
+        let mut refusals = Vec::new();
+        for number in 1..=9 {
+            let id = BriefId::new(number);
+            for command in 0..3 {
+                // Each on the files as they are: one that goes through
+                // changes the status the next one sees.
+                let mut shop = with_briefs(&files, "");
+                let result = match command {
+                    0 => block(&mut shop, id, &entry("x"), at(T)),
+                    1 => amend(&mut shop, id, &entry("x"), at(T)),
+                    _ => report(&mut shop, id, &text, at(T)),
+                };
+                if let Err(Error::Refused(why)) = result {
+                    refusals.push(why);
+                }
+            }
+        }
+        assert_eq!(
+            refusals,
+            [
+                "block 1: it is draft, not started",
+                "amend 1: it is draft, not queued, started or blocked",
+                "report 1: it is draft, not started",
+                "block 2: it is queued, not started",
+                "report 2: it is queued, not started",
+                "block 4: it is blocked, not started",
+                "report 4: it is blocked, not started",
+                "block 5: it is reported, not started",
+                "amend 5: it is reported, not queued, started or blocked",
+                "report 5: it is reported, not started",
+                "block 6: it is filed, not started",
+                "amend 6: it is filed, not queued, started or blocked",
+                "report 6: it is filed, not started",
+                "block 7: it has no `status:` line",
+                "amend 7: it has no `status:` line",
+                "report 7: it has no `status:` line",
+                "block 8: 8 is on 2 files; fix the duplicate first",
+                "amend 8: 8 is on 2 files; fix the duplicate first",
+                "report 8: 8 is on 2 files; fix the duplicate first",
+                "block 9: no such brief",
+                "amend 9: no such brief",
+                "report 9: no such brief",
+            ]
+        );
+        let mut shop = with_briefs(&files, "");
+        for number in [1, 5, 6, 7, 8, 9] {
+            let id = BriefId::new(number);
+            let _ = block(&mut shop, id, &entry("x"), at(T));
+            let _ = amend(&mut shop, id, &entry("x"), at(T));
+            let _ = report(&mut shop, id, &text, at(T));
+        }
+        assert_eq!(changed(&shop), Vec::<String>::new());
     }
 
     #[test]

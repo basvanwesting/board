@@ -26,10 +26,11 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 
 use tempfile::TempDir;
 
@@ -387,6 +388,33 @@ impl Machine<'_> {
         run(self.command().args(args))
     }
 
+    /// Runs `board <args>` in the project's repository with `input` on
+    /// stdin.
+    pub fn board_with_input(&self, args: &[&str], input: &[u8]) -> Ran {
+        let mut child = self
+            .command()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run board");
+        // Small enough for the pipe: written whole before the output is
+        // read.
+        child
+            .stdin
+            .take()
+            .expect("stdin was piped")
+            .write_all(input)
+            .expect("write stdin");
+        let Output {
+            status,
+            stdout,
+            stderr,
+        } = child.wait_with_output().expect("wait for board");
+        ran(status, stdout, stderr)
+    }
+
     /// Runs `board <args>` in another directory.
     pub fn board_in(&self, directory: &Path, args: &[&str]) -> Ran {
         run(self.command().current_dir(directory).args(args))
@@ -409,6 +437,14 @@ impl Machine<'_> {
             board = quote(env!("CARGO_BIN_EXE_board")),
             args = args.join(" ")
         )
+    }
+
+    /// [`Machine::script`] with the file `input` on stdin: the text of
+    /// `amend` or `report`.
+    pub fn script_with_input(&self, args: &[&str], input: &Path) -> String {
+        let script = self.script(args);
+        let script = script.strip_suffix(')').expect("a subshell");
+        format!("{script} <{})", quote(&input.to_string_lossy()))
     }
 
     /// Installs a hook in the board-data clone that runs once: it deletes
@@ -513,6 +549,10 @@ pub fn run(command: &mut Command) -> Ran {
         stdout,
         stderr,
     } = command.output().expect("run board");
+    ran(status, stdout, stderr)
+}
+
+fn ran(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Ran {
     Ran {
         // No code: killed by a signal, which no test expects.
         code: status
