@@ -33,7 +33,7 @@ The user has the board open in a pane of their own and refers to items by ID. Re
 1. Design with the user. A brief is written only once the user approves the design.
 2. `board new brief <slug>` gives the file (status draft, `base:` = HEAD now); write it from the template below; `board queue <id>` (`--closes b41,b52` for the backlog items it resolves; it refuses a brief with an empty section).
 3. Wake the worker with one line by `SendMessage`, no `notify_when_idle`: `Queue has work: run "board next" and follow the brief's Worker protocol.` The worker takes the briefs in order by itself and checks each one's premises at its start, so nothing else is sent per brief.
-4. No done message arrives. At every pause, before writing the next brief, and when the user asks for the board: `board ls reported`. For each, read the report (`board show <id>`), add its out-of-scope findings (`board add backlog … --from <id>`) and what the worker could not do (`board add chore … --check … --from <id>`), then `board file <id>`: it verifies the commits in the repository, not the report, and closes the backlog items the brief resolves.
+4. No done message arrives. At every pause, before writing the next brief, and when the user asks for the board: `board ls briefs --status reported`. For each, read the report (`board show <id>`), add its out-of-scope findings (`board add backlog … --from <id>`) and what the worker could not do (`board add chore … --check … --from <id>`), then `board file <id>`: it verifies the commits in the repository, not the report, and closes the backlog items the brief resolves.
 5. `blocked: <id>` is the one message the worker sends; the question is in the brief (`board show <id>`). Answer if the approved design covers it, otherwise ask the user at once (below). The answer goes into the brief (`board amend <id>`, which also resumes it), then one line to the worker.
 6. A brief that stays `started` with no commits: ask the worker what happened. Silence is not done.
 
@@ -47,6 +47,8 @@ The conversation with the user is a design conversation, and nothing from the wo
 - A decision the user makes while a brief is in flight goes into the brief (`board amend <id>`) and to the worker as one line, so the filed brief matches what was built.
 
 ## Brief template
+
+An amendment must not contain a `## ` line outside a code fence (use `###`): it would split the brief's section, and `board` refuses it. The worker's block question has the same rule (Worker protocol below).
 
 `board new brief` writes the header (id, status, base); the body is:
 
@@ -79,5 +81,5 @@ The conversation with the user is a design conversation, and nothing from the wo
 - A check that needs the dev server (visual checks through Playwright with the machine's installed Chrome or Chromium, Tidewave's runtime tools, probes) is not skipped because none runs: check its port, otherwise start `bin/dev` in the background and stop it after (global CLAUDE.md).
 - Out-of-scope findings: don't fix them, list them in the report.
 - Done: `board report <id>` with the report on stdin: the checks run (command and result), what you could not do, deviations from the Design, out-of-scope findings. Send the planner nothing. Then `board next`: take the next brief, or stop when the queue is empty.
-- Blocked: `board block <id> "<question>"`, one line to the planner by `SendMessage` (`blocked: <id>`), then wait for the answer.
+- Blocked: `board block <id> "<question>"` (no `## ` line outside a code fence in the question, use `###`: it would split the brief's section, and `board` refuses it), one line to the planner by `SendMessage` (`blocked: <id>`), then wait for the answer.
 ```

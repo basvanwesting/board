@@ -30,8 +30,8 @@ board-data/
   - Brief (`128`, a number per project, continuing the existing sequence): a markdown document. Header lines (`id`, `status`, `base`, `closes`, timestamps), then the planner's sections, then `## Amendments` and `## Report` as they come. Status: `draft` → `queued` → `started` ⇄ `blocked` → `reported` → `filed` (moved to `briefs/done/`).
   - Chore (`c12`): the user's own action. One line under a `## group` heading in `chores.md`: `- c12 <text>. Check: <how to see it is done>  (126)`. A chore without a check is refused. Done = the line is deleted; git history is the archive.
   - Backlog item (`b41`): one line in `backlog.md`: `- b41 <text>  (from 126)`. Line order is the user's priority order.
-- The ID is the first word after the dash, so it copies cleanly and greps. A list line without an ID (added by hand in an editor) gets the next ID at the next sync.
-- Plain markdown, editable in vim. The tool's parser is tolerant of free text after the ID; `board lint` (also run inside every sync) reports duplicate IDs, a chore without a check, a brief with an unknown status.
+- The ID is the first word after the dash, so it copies cleanly and greps. A list line without an ID (added by hand in an editor) gets the next ID at the next write that reaches the remote, whichever project it is for.
+- Plain markdown, editable in vim. The tool's parser is tolerant of free text after the ID; `board lint` (also run after every write) reports duplicate IDs, a chore without a check, a brief with an unknown status.
 
 ## Commands
 
@@ -61,10 +61,14 @@ board sync                     board lint
 
 The tool is the only thing that runs git in the board-data repo. It pushes: the board-data repo is data, the owner's "never push" rule for code does not apply to it (confirmed 2026-11-20: "a totally different scope, intention and ruleset").
 
-- Every write: take a lock (two sessions on one machine share one clone), pull with rebase, apply the change, commit only the touched paths (one commit per command, message `<project>: <what>`), push. A rejected push: pull and retry, a few times.
-- Offline: a write that allocates an ID is refused (agents are online anyway, and this makes a duplicate ID from two machines impossible outside the seconds between pull and push); other writes commit locally and are pushed by the next command. A race in those seconds: the command renumbers the item it just created and says so.
+- Every write: take a lock (two sessions on one machine share one clone), commit hand edits to board files (`board: hand edits`), fetch, merge, apply the change on the merged state, commit only the touched paths (one commit per command, message `<project>: <what>`), push, then fast-forward the checkout. Every write commits hand edits, not only `sync`: the change applies to the merged commit, so an edit left in the worktree would take no part.
+- Local commits (hand edits, offline writes) join the remote's by a merge commit (`board: merge`), never by a rebase: ancestry then records what is already pushed, so a crash between push and local update cannot apply a hand edit twice. Cost: merge commits in history when both sides changed.
+- A failed push: unless the push is found to have landed (its commit is an ancestor of the fetched remote; a push can reach the remote and still report failure, and re-applying then would publish the item twice), the command's commit is dropped and the command applied again on the fresh remote state, at most 4 pushes; an ID is printed only after the push that publishes it, so nothing is ever renumbered. Four failed pushes count as offline, even with a working fetch: an agent's command must end rather than retry without limit, and an ID not yet published may not be printed.
+- Offline: a write that allocates an ID is refused, and so is `next` (a claim is shared like an ID: two offline claims of one brief would conflict); other writes commit locally and are pushed by the next command. Accepted by the owner, 2026-11-20: "we need to be online for the agents anyway".
+- The next list ID and the next brief number are one past the highest ever used in git history (the list file's lines, the files ever added under the project's `briefs/`), not only among what is there now: a deleted line or a hand-deleted brief would otherwise free its number, and `file` would count the old brief's `Brief:` commits. History is the counter, so a shallow clone is refused. Rejected: a counter file, which a hand edit makes stale.
+- `chores.md` and `backlog.md` are merged by the tool itself, keyed by ID: adds from two machines both survive, a deleted ID stays deleted, a moved line is not duplicated. Hand-typed duplicate IDs keep both lines (lint reports them): renumbering one would guess which line `closes b41` meant. No `merge=union` and no `.gitattributes`: a plain union brings a deleted line back when the other machine edited or moved it.
+- A brief changed on two machines is never merged as text: the remote version stays, the local one is saved beside it as an untracked `<brief>.local`, and `lint` reports that copy after every write in its project until it is deleted. Rejected: stopping the sync, which blocks every project on that machine with git by hand as the only way out. See Open points.
 - Reads never touch the network. The TUI fetches in the background about once a minute and shows unpushed commits and the last sync in its header.
-- `chores.md` and `backlog.md` merge with `merge=union` (`.gitattributes`), so adds from two machines both survive. A brief changed on two machines is a real conflict: stop and say so, never resolve a document automatically.
 - Shell out to the `git` binary (the machines' credential helper already handles https); no libgit2.
 
 ## TUI
@@ -83,7 +87,7 @@ No `import` command. Each project's old planner folders (one per machine: `backl
 
 - `board add chore|backlog` for every open line (IDs are assigned fresh; nothing refers to old ones).
 - Filed briefs are an archive: the agent copies the old files into `briefs/done/` and runs `board sync`, which commits hand-placed files as it commits hand edits. `lint` accepts an archived brief without the header the tool writes (number and slug come from the file name).
-- The next brief number is one past the highest number among open and filed briefs, so a project's sequence continues.
+- The next brief number is one past the highest number among open and filed briefs, those deleted since included (Sync), so a project's sequence continues.
 
 ## Quality bar
 
@@ -107,3 +111,7 @@ Stack: Rust, `clap`, `ratatui` + `crossterm`, a file watcher (`notify`), propert
 - A Claude plugin, a web UI, a daemon or a systemd/launchd unit.
 - Sending messages between sessions: the skill does the two wake-ups (planner → worker "queue has work", worker → planner "blocked").
 - Notifications: herdr already shows the worker's state.
+
+## Open points
+
+- A brief changed on two machines: copy-and-continue (Sync) is chosen while the board has one user, the owner, who consolidates `.local` copies by hand. Reconsider when it has more; the alternative is stopping the sync and printing the git commands that resolve it.
