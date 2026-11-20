@@ -1,0 +1,107 @@
+# board: spec
+
+A file-based board for a planner/worker pair of coding agents and their user: one small binary, a CLI for the agents and a TUI for the user's terminal pane. Written by a planner session on 2026-11-20 from a design the owner approved; this file is the first brief of the project. Decisions carry their reason so they can be reopened.
+
+This repo is public: it holds the tool only. No project data, client names or ids in code, tests, fixtures or docs.
+
+## Why
+
+Two agent sessions per project: a planner (designs with the user, writes briefs) and a worker (implements one brief at a time, commits). Naming: `board` is the tool (this repo) and one project's view; `board-data` is the repo that holds every project's board. Until now reports travelled as chat messages between the sessions and the open items lived in files only the planner read, per machine. Problems: worker reports cluttered the design conversation; a report died with its transcript; the user could not pull the open items up; two machines had two boards; commit SHAs noted in items went stale after a rebase.
+
+Principle: the files are the record, a message is only a wake-up. The owner works in a terminal multiplexer (herdr) with three panes: work agent, plan agent, board. No Claude plugins: "file based and cli/tui managed".
+
+## Data: the board-data repo
+
+Separate from this repo: a private git repo named `board-data` (GitHub, over https; its owner is configuration, not this repo's business), one clone per machine at `$BOARD_ROOT` (default `~/Work/board-data`). One directory per project:
+
+```
+board-data/
+  <project>/
+    briefs/128-some-slug.md      open briefs
+    briefs/done/126-….md         filed briefs
+    chores.md
+    backlog.md
+```
+
+- The project is found from the directory the command runs in: the git toplevel's path relative to `~/Work`, `/` replaced by `-` (`~/Work/shop` → `shop`, `~/Work/tools/shop` → `tools-shop`). `--board <name>` or `BOARD` overrides. Reason: derived from existing state, no marker file in the project.
+- Three kinds of item:
+  - Brief (`128`, a number per project, continuing the existing sequence): a markdown document. Header lines (`id`, `status`, `base`, `closes`, timestamps), then the planner's sections, then `## Amendments` and `## Report` as they come. Status: `draft` → `queued` → `started` ⇄ `blocked` → `reported` → `filed` (moved to `briefs/done/`).
+  - Chore (`c12`): the user's own action. One line under a `## group` heading in `chores.md`: `- c12 <text>. Check: <how to see it is done>  (126)`. A chore without a check is refused. Done = the line is deleted; git history is the archive.
+  - Backlog item (`b41`): one line in `backlog.md`: `- b41 <text>  (from 126)`. Line order is the user's priority order.
+- The ID is the first word after the dash, so it copies cleanly and greps. A list line without an ID (added by hand in an editor) gets the next ID at the next sync.
+- Plain markdown, editable in vim. The tool's parser is tolerant of free text after the ID; `board lint` (also run inside every sync) reports duplicate IDs, a chore without a check, a brief with an unknown status.
+
+## Commands
+
+```
+board                          TUI on a terminal; the plain board when piped
+board ls [briefs|chores|backlog] [--status <s>]
+board show <id>
+board new brief <slug>         → path; header written (status draft, base = project HEAD)
+board queue <id> [--closes b41,b52]   refuses an empty required section
+board next                     worker: claim the first queued brief (status started) → path; says so when the queue is empty
+board block <id> "<question>"  status blocked, question appended
+board amend <id>               stdin appended under ## Amendments; a blocked brief resumes
+board report <id>              stdin becomes ## Report; status reported
+board file <id>                verify the brief's commits in the project repo, move to done/, delete the backlog lines it closes
+board add chore "<text>" --group <g> --check "<c>" [--from <id>]
+board add backlog "<text>" [--from <id>]
+board done <c-id>…             board drop <b-id>…
+board sync                     board lint
+```
+
+- Output is plain, stable text (agents read it); no JSON until something needs it.
+- Required brief sections (for `queue`): Task, Design, Premises, Out of scope, Verification, Not doable by the worker, Worker protocol. The template text is the planner skill's, not the tool's: agent rules stay under the owner's review, a data repo or a binary is the wrong home. The skill's draft is this project's to keep true: `skill/my-plan.SKILL.md` (the planner skill as it will read once the CLI exists; every command it names must exist as it names it). It is installed by the owner, who copies it into the chezmoi source (`dot_claude/skills/my-plan/SKILL.md`) after approving it; this project never writes there.
+- No roles or auth: which session runs which command is the skill's convention. But `report` and `block` touch only status and their own section, never the planner's text.
+- `file` verifies commits by the trailer `Brief: <id>` in the project repo (`git log --grep`), reachable from HEAD: the worker puts it on every commit of a brief. Decided by the owner, 2026-11-20, over SHAs noted in the report: a rebase changes every SHA and keeps the message. A brief without any such commit is not filed (`--no-commits` for a brief that changed nothing in the repo).
+
+## Sync
+
+The tool is the only thing that runs git in the board-data repo. It pushes: the board-data repo is data, the owner's "never push" rule for code does not apply to it (confirmed 2026-11-20: "a totally different scope, intention and ruleset").
+
+- Every write: take a lock (two sessions on one machine share one clone), pull with rebase, apply the change, commit only the touched paths (one commit per command, message `<project>: <what>`), push. A rejected push: pull and retry, a few times.
+- Offline: a write that allocates an ID is refused (agents are online anyway, and this makes a duplicate ID from two machines impossible outside the seconds between pull and push); other writes commit locally and are pushed by the next command. A race in those seconds: the command renumbers the item it just created and says so.
+- Reads never touch the network. The TUI fetches in the background about once a minute and shows unpushed commits and the last sync in its header.
+- `chores.md` and `backlog.md` merge with `merge=union` (`.gitattributes`), so adds from two machines both survive. A brief changed on two machines is a real conflict: stop and say so, never resolve a document automatically.
+- Shell out to the `git` binary (the machines' credential helper already handles https); no libgit2.
+
+## TUI
+
+`board` on a terminal. One column that fits a narrow pane; sections: briefs (started and blocked first, then reported, then queued), chores by group, backlog in order. Header: project, sync state, the brief in flight and for how long.
+
+- Keys, vim-flavoured: `j`/`k`, `gg`/`G`, `ctrl-d`/`ctrl-u`, `/` filter, `1` `2` `3` jump to a section, Enter opens the item (a brief with its report), `y` yanks the ID, `Y` the line, `d` done (chore), `x` drop (backlog), `J`/`K` move an item, `e` opens it in `$EDITOR`, `r` sync, `?` help, `q` quit. `d` and `x` ask once.
+- Esc closes a detail or clears a filter and does nothing else: the owner hits Esc by reflex.
+- No mouse capture, so the terminal's own selection and copy keep working. Yank through OSC 52, falling back to `wl-copy` / `pbcopy`.
+- Redraw when a file under the board changes (the worker's `next` and `report` show at once).
+- Every TUI action goes through the same code path as the CLI command.
+
+## Consolidating the old planner folders: not this tool's job
+
+No `import` command. Each project's old planner folders (one per machine: `backlog.md`, `chores.md`, `queue/`, `sent/`, `done/`) are moved onto the board by that project's own agents, who know what the items mean and can merge two machines' lists with judgement (the owner, 2026-11-20: "the agent only needs CRUD tools from the cli for it to do so"). What that asks of the tool, all of it ordinary use:
+
+- `board add chore|backlog` for every open line (IDs are assigned fresh; nothing refers to old ones).
+- Filed briefs are an archive: the agent copies the old files into `briefs/done/` and runs `board sync`, which commits hand-placed files as it commits hand edits. `lint` accepts an archived brief without the header the tool writes (number and slug come from the file name).
+- The next brief number is one past the highest number among open and filed briefs, so a project's sequence continues.
+
+## Quality bar
+
+The owner's rules (global CLAUDE.md) apply: guarantees over prose, commit when green, fresh-eyes review.
+
+- Tests run the real thing: temp dirs, a bare repo as the remote, two clones.
+- Trace-test the sync: random interleavings of the writing commands on two clones (with pushes failing and going offline in between); after every step: no item lost, no duplicate ID, both clones converge after a sync. Prove the check is not vacuous by breaking the lock or the retry once.
+- No sleeps in tests.
+- Parser round-trip: reading and writing a list file changes nothing but what the command changed (hand edits survive).
+
+## Build order
+
+1. CLI (everything under Commands and Sync). The planner skill switches to it when this is done; each project's agents then consolidate their old folders onto the board.
+2. TUI.
+3. Later, only if asked: chore checks the tool can run itself (a command per chore, run on demand, never automatically); herdr pane metadata.
+
+Stack: Rust, `clap`, `ratatui` + `crossterm`, a file watcher (`notify`), property tests (`proptest`). Install with `cargo install --path .` on each machine.
+
+## Not in scope
+
+- A Claude plugin, a web UI, a daemon or a systemd/launchd unit.
+- Sending messages between sessions: the skill does the two wake-ups (planner → worker "queue has work", worker → planner "blocked").
+- Notifications: herdr already shows the worker's state.
