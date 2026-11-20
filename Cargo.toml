@@ -6,5 +6,15 @@ description = "A file-based board for a planner/worker pair of coding agents and
 license = "MIT"
 publish = false
 
+[dependencies]
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = { version = "3", default-features = false }
+
+[lints.clippy]
+# `println!` and `eprintln!` panic when the reader has gone (`board ls | head -1`).
+# Output goes through a checked write in main.rs.
+print_stdout = "deny"
+print_stderr = "deny"
