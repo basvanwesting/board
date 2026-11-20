@@ -42,6 +42,8 @@ pub enum Problem {
     /// An `.md` file below `briefs/` that is not at
     /// `briefs/[done/]<number>-<slug>.md`.
     Misnamed,
+    /// The local version of a brief that lost to the remote's in a merge.
+    LocalCopy(BriefId),
 }
 
 impl fmt::Display for Finding {
@@ -91,6 +93,10 @@ impl fmt::Display for Problem {
             Problem::Misnamed => f.write_str(
                 "not at briefs/[done/]<number>-<slug>.md, so it is not a brief and not synced",
             ),
+            Problem::LocalCopy(number) => write!(
+                f,
+                "unmerged local version of brief {number}; merge it by hand, then delete this file"
+            ),
         }
     }
 }
@@ -99,7 +105,11 @@ const OPEN_STATUSES: &str =
     "a brief outside briefs/done/ is draft, queued, started, blocked or reported";
 
 /// Every finding of the project, in a fixed order: `chores.md`, `backlog.md`,
-/// the briefs by number, then the misnamed files.
+/// the briefs by number, the misnamed files, then the conflict copies.
+///
+/// A conflict copy is reported on every lint, and so after every write in its
+/// project, until it is deleted: the merge says so once, and a local version
+/// nobody merges is lost work that nothing else points at.
 pub fn lint(project: &Project) -> Vec<Finding> {
     let mut findings = Vec::new();
     for kind in ListKind::ALL {
@@ -110,6 +120,11 @@ pub fn lint(project: &Project) -> Vec<Finding> {
         file: file.clone(),
         line: None,
         problem: Problem::Misnamed,
+    }));
+    findings.extend(project.copies.iter().map(|(file, number)| Finding {
+        file: file.clone(),
+        line: None,
+        problem: Problem::LocalCopy(*number),
     }));
     findings
 }
@@ -350,6 +365,24 @@ mod tests {
             [
                 "shop/briefs/notes.md: not at briefs/[done/]<number>-<slug>.md, \
                  so it is not a brief and not synced"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_conflict_copy_is_named() {
+        let project = Project {
+            copies: vec![(
+                "shop/briefs/done/128-x.md.local2".to_owned(),
+                BriefId::new(128),
+            )],
+            ..shop()
+        };
+        assert_eq!(
+            lines(&project),
+            [
+                "shop/briefs/done/128-x.md.local2: unmerged local version of brief 128; \
+                 merge it by hand, then delete this file"
             ]
         );
     }

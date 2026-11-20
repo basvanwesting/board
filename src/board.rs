@@ -124,8 +124,9 @@ impl Board {
         })
     }
 
-    /// The write loop with no command: the clone and the remote end up on
-    /// the same commit.
+    /// The write loop with no command: hand edits committed, and the clone
+    /// and the remote on the same commit. Without the remote the commits
+    /// stay on the clone and it is [`Error::NeedsRemote`].
     pub fn sync(&self) -> Result<(), Error> {
         sync::write::<()>(&self.root, &self.project, "sync", &*self.notes, None).map(drop)
     }

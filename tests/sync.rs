@@ -323,32 +323,48 @@ fn a_refused_push_is_retried_on_fresh_state() {
     in_step(&world, &a);
 }
 
+/// Four refused pushes count as offline: an id is refused, since only a
+/// push may publish it, and any other write is committed on the clone and
+/// pushed by the next write that gets through.
 #[test]
-fn four_refused_pushes_change_nothing_and_exit_3() {
+fn four_refused_pushes_refuse_an_id_and_keep_other_writes_on_the_clone() {
     let world = World::new();
     let a = world.a();
     a.board(&["add", "chore", "x", "--group", "g", "--check", "x"])
         .ok();
     let before = world.remote_main();
     world.reject_pushes(9);
-    for (args, what) in [
-        (&["add", "backlog", "x"][..], "add backlog"),
-        (&["done", "c1"], "done"),
-    ] {
-        let said = a.board(args).failed(3);
-        let start = format!(
-            "board: retry 2/4\nboard: retry 3/4\nboard: retry 4/4\n\
-             board: {what}: not pushed after 4 attempts (! [remote rejected] "
-        );
-        assert!(said.starts_with(&start), "{said}");
-        assert!(
-            said.ends_with(" -> main (pre-receive hook declined)); nothing was changed\n"),
-            "{said}"
-        );
-    }
+    let retries = "board: retry 2/4\nboard: retry 3/4\nboard: retry 4/4\n";
+    let refused = " -> main (pre-receive hook declined))\n";
+
+    let said = a.board(&["add", "backlog", "x"]).failed(3);
+    assert!(
+        said.starts_with(&format!(
+            "{retries}board: add backlog: not pushed after 4 attempts (! [remote rejected] "
+        )),
+        "{said}"
+    );
+    assert!(said.ends_with(refused), "{said}");
+    assert_eq!(a.status(), "");
+    assert_eq!(a.main(), before);
+
+    let ran = a.board(&["done", "c1"]);
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"done c1\n"[..]));
+    assert!(
+        ran.stderr.starts_with(&format!(
+            "{retries}board: not pushed: 1 commit (! [remote rejected] "
+        )),
+        "{ran:?}"
+    );
+    assert!(ran.stderr.ends_with(refused), "{ran:?}");
     assert_eq!(world.remote_main(), before);
+    assert_eq!(text(a.file("proj/chores.md")), "## g\n");
+
+    world.reject_pushes(0);
+    assert_eq!(a.board(&["add", "backlog", "y"]).ok(), "b1\n");
+    assert_eq!(text(world.remote_file("proj/chores.md")), "## g\n");
+    assert_eq!(world.remote_log()[..2], ["proj: add b1", "proj: done c1"]);
     in_step(&world, &a);
-    assert_eq!(a.file("proj/backlog.md"), None);
 }
 
 /// B writes while A's push is on its way: A's push is refused, and A runs
@@ -462,33 +478,74 @@ fn a_command_killed_after_its_push_is_healed_by_the_next() {
     in_step(&world, &a);
 }
 
+/// Offline, a write that allocates an id is refused (exit 3) and any other
+/// write is committed on the clone, hand edits too; the next write that
+/// reaches the remote pushes them.
 #[test]
-fn without_the_remote_a_write_changes_nothing_and_exits_3() {
+fn offline_an_id_is_refused_and_other_writes_wait_on_the_clone() {
     let world = World::new();
     let a = world.a();
     a.board(&["add", "chore", "x", "--group", "g", "--check", "x"])
         .ok();
-    let gone = world.dir().join("gone");
-    a.git(
-        &a.data(),
-        ["remote", "set-url", "origin", gone.to_str().unwrap()],
+    let before = world.remote_main();
+    a.set_online(false);
+    let unreached = "needs the remote, which was not reached (fatal: ";
+
+    let said = a.board(&["add", "backlog", "x"]).failed(3);
+    assert!(
+        said.starts_with(&format!("board: add backlog: {unreached}")),
+        "{said}"
     );
-    let main = a.main();
-    for (args, what) in [
-        (&["add", "backlog", "x"][..], "add backlog"),
-        (&["done", "c1"], "done"),
-        (&["sync"], "sync"),
-    ] {
-        let said = a.board(args).failed(3);
-        assert!(
-            said.starts_with(&format!(
-                "board: {what}: needs the remote, which was not reached (fatal: "
-            )),
-            "{said}"
-        );
-    }
-    assert_eq!(a.main(), main);
+    assert_eq!(said.lines().count(), 1, "{said}");
+
+    let ran = a.board(&["done", "c1"]);
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"done c1\n"[..]));
+    assert!(
+        ran.stderr
+            .starts_with("board: not pushed: 1 commit (fatal: "),
+        "{ran:?}"
+    );
+    assert_eq!(ran.stderr.lines().count(), 1, "{ran:?}");
+
+    // A hand edit: `sync` commits it, and says it could not push.
+    a.write("proj/backlog.md", "- by hand\n");
+    let said = a.board(&["sync"]).failed(3);
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(lines.len(), 2, "{said}");
+    assert!(
+        lines[0].starts_with("board: not pushed: 2 commits (fatal: "),
+        "{said}"
+    );
+    assert!(
+        lines[1].starts_with(&format!("board: sync: {unreached}")),
+        "{said}"
+    );
     assert_eq!(a.status(), "");
+    assert_eq!(world.remote_main(), before);
+    // The item without an id waits for its id until the remote is there.
+    assert_eq!(text(a.file("proj/backlog.md")), "- by hand\n");
+
+    a.set_online(true);
+    let ran = a.board(&["add", "backlog", "next"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (0, &b"b2\n"[..], "board: assigned b1: by hand\n")
+    );
+    assert_eq!(text(world.remote_file("proj/chores.md")), "## g\n");
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b1 by hand\n- b2 next\n"
+    );
+    assert_eq!(
+        world.remote_log()[..4],
+        [
+            "proj: add b2",
+            "proj: assign b1",
+            "board: hand edits",
+            "proj: done c1"
+        ]
+    );
+    in_step(&world, &a);
 }
 
 // ---- the clone ----
@@ -537,16 +594,26 @@ fn a_second_write_on_a_clone_waits_for_the_first() {
     in_step(&world, &a);
 }
 
-/// git's lock on the tool's index, left by a command killed while git built
-/// its commit: the next write goes on.
+/// git's locks on the clone's index and the tool's, left by a command
+/// killed while git wrote one: the next write goes on, and commits a hand
+/// edit through the clone's index.
 #[test]
-fn a_stale_lock_on_the_tools_index_is_removed() {
+fn stale_locks_on_the_indexes_are_removed() {
     let world = World::new();
     let a = world.a();
-    let lock = a.data().join(".git").join("board.index.lock");
-    fs::write(&lock, "").unwrap();
+    let locks = ["index.lock", "board.index.lock"].map(|name| a.data().join(".git").join(name));
+    for lock in &locks {
+        fs::write(lock, "").unwrap();
+    }
+    a.write("proj/chores.md", "- c1 by hand. Check: x\n");
     assert_eq!(a.board(&["add", "backlog", "x"]).ok(), "b1\n");
-    assert!(!lock.exists());
+    for lock in &locks {
+        assert!(!lock.exists(), "{}", lock.display());
+    }
+    assert_eq!(
+        world.remote_log()[..2],
+        ["proj: add b1", "board: hand edits"]
+    );
     in_step(&world, &a);
 }
 
@@ -630,95 +697,496 @@ fn a_hostile_git_configuration_changes_nothing() {
     assert_eq!(text(world.remote_file("proj/backlog.md")), "- b6 three\n");
     assert_eq!(text(a.file("proj/backlog.md")), "- b6 three\n");
     in_step(&world, &a);
-    // An untracked board file is still seen when untracked files are hidden.
-    a.write("shop/chores.md", "- c1 hand. Check: x\n");
-    assert_eq!(a.board(&["add", "backlog", "four"]).code, 4);
-}
-
-/// A board file changed by hand, or a clone ahead of and behind the remote
-/// at once: a write cannot take either into account yet, so it refuses
-/// rather than lose the change.
-#[test]
-fn a_clone_with_changed_board_files_or_diverged_from_the_remote_is_refused() {
-    let world = World::new();
-    let (a, b) = (world.a(), world.b());
-    a.board(&["add", "backlog", "one"]).ok();
-    a.write("proj/backlog.md", "- b1 edited by hand\n");
-    let said = a.board(&["add", "backlog", "two"]).failed(4);
+    // An untracked board file is seen with untracked files hidden; the
+    // commit of hand edits, the merge and its line merge go by the tool's
+    // settings, not these; hooks that refuse every commit do not run.
+    for (key, value) in [
+        ("merge.conflictStyle", "zdiff3"),
+        ("diff.algorithm", "patience"),
+        ("status.renames", "copies"),
+        ("commit.verbose", "true"),
+        ("commit.cleanup", "verbatim"),
+    ] {
+        a.git(&a.data(), ["config", key, value]);
+    }
+    a.hook("pre-commit", "exit 1\n");
+    a.hook("commit-msg", "exit 1\n");
+    world.b().board(&["add", "backlog", "from b"]).ok();
+    a.write("shop/chores.md", "- hand. Check: x\n");
+    a.write("proj/backlog.md", "- b6 three, edited\n");
+    let ran = a.board(&["add", "backlog", "four"]);
     assert_eq!(
-        said,
-        format!(
-            "board: board files changed by hand in {} (proj/backlog.md); a write does not \
-             commit them yet: commit them with git on top of the remote's main first \
-             (git stash -u; git pull --ff-only; git stash pop; git commit), or restore them\n",
-            a.data().display()
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (
+            0,
+            &b"b8\n"[..],
+            "board: merged 1 local commit (by line: proj/backlog.md)\n\
+             board: assigned c1: hand. Check: x\n"
         )
     );
-    // A file that is not the board's is not in the way.
-    a.git(&a.data(), ["checkout", "--", "proj/backlog.md"]);
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b7 from b\n- b6 three, edited\n- b8 four\n"
+    );
+    assert_eq!(
+        text(world.remote_file("shop/chores.md")),
+        "- c1 hand. Check: x\n"
+    );
+    in_step(&world, &a);
+}
+
+// ---- hand edits and merges ----
+
+/// Every write commits the board files changed by hand first, and every
+/// write that reaches the remote gives an item without an id its id, in
+/// every project. What is not the board's stays untracked.
+#[test]
+fn hand_edits_are_committed_and_an_item_without_an_id_gets_one() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "chore", "one", "--group", "Home", "--check", "x"])
+        .ok();
+    a.write(
+        "proj/chores.md",
+        "## Home\n- c1 one, edited. Check: x\n- by hand. Check: y\n",
+    );
+    a.write("shop/backlog.md", "- elsewhere\n- b7 typed\n");
     a.write("README.md", "notes\n");
     a.write("proj/briefs/128-x.md.local", "a copy\n");
-    assert_eq!(a.board(&["add", "backlog", "two"]).ok(), "b2\n");
-    fs::remove_file(a.data().join("README.md")).unwrap();
-    fs::remove_file(a.data().join("proj/briefs/128-x.md.local")).unwrap();
-
-    // Diverged: a commit by hand here, another write there.
-    b.board(&["add", "backlog", "from b"]).ok();
-    a.write("shop/backlog.md", "- b1 by hand\n");
-    a.git(&a.data(), ["add", "-A"]);
-    a.git(&a.data(), ["commit", "-q", "-m", "by hand"]);
-    let said = a.board(&["add", "backlog", "three"]).failed(4);
+    let ran = a.board(&["add", "backlog", "x"]);
     assert_eq!(
-        said,
-        format!(
-            "board: main of {} and the remote's main have both moved on; a write does not \
-             merge them yet\n",
-            a.data().display()
+        (ran.code, ran.stdout.as_slice()),
+        (0, &b"b1\n"[..]),
+        "{ran:?}"
+    );
+    assert_eq!(
+        ran.stderr,
+        "board: assigned c2: by hand. Check: y\n\
+         board: assigned b8: elsewhere\n\
+         board: lint: proj/briefs/128-x.md.local: unmerged local version of brief 128; \
+         merge it by hand, then delete this file\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "## Home\n- c1 one, edited. Check: x\n- c2 by hand. Check: y\n"
+    );
+    assert_eq!(
+        text(world.remote_file("shop/backlog.md")),
+        "- b8 elsewhere\n- b7 typed\n"
+    );
+    assert_eq!(
+        world.remote_log()[..4],
+        [
+            "proj: add b1",
+            "shop: assign b8",
+            "proj: assign c2",
+            "board: hand edits"
+        ]
+    );
+    assert_eq!(world.remote_file("README.md"), None);
+    assert_eq!(a.main(), world.remote_main());
+    assert_eq!(a.status(), "?? README.md\n?? proj/briefs/128-x.md.local\n");
+}
+
+/// Both clones changed the backlog: the clone's commits are merged with the
+/// remote's by a merge commit, the list line by line, keyed by id. A delete
+/// beats an edit and a move, adds of both sides stay, the local edit wins.
+#[test]
+fn diverged_clones_are_merged_by_id() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    for item in ["one", "two", "three", "four"] {
+        a.board(&["add", "backlog", item]).ok();
+    }
+    a.write("proj/briefs/1-x.md", "id: 1\nstatus: draft\n");
+    a.board(&["sync"]).ok();
+    b.board(&["sync"]).ok();
+    // The remote: b1 dropped, b2 edited, b3 moved to the top, b5 added.
+    b.write(
+        "proj/backlog.md",
+        "- b3 three\n- b2 two, remote\n- b4 four\n",
+    );
+    assert_eq!(b.board(&["add", "backlog", "five"]).ok(), "b5\n");
+    // The clone: b1 edited, b3 dropped, b4 edited, an item without id, and
+    // the brief deleted.
+    a.write(
+        "proj/backlog.md",
+        "- b1 one, local\n- b2 two\n- b4 four, local\n- six\n",
+    );
+    fs::remove_file(a.data().join("proj/briefs/1-x.md")).unwrap();
+    let ran = a.board(&["add", "backlog", "seven"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (
+            0,
+            &b"b7\n"[..],
+            "board: merged 1 local commit (by line: proj/backlog.md)\n\
+             board: assigned b6: six\n"
         )
+    );
+    // The line order is the union's: b4 sits where the clone's edit of it
+    // was, after the remote's b5. Order is not data.
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b2 two, remote\n- b5 five\n- b4 four, local\n- b6 six\n- b7 seven\n"
+    );
+    assert_eq!(world.remote_file("proj/briefs/1-x.md"), None);
+    let log = world.remote_log();
+    assert_eq!(
+        log[..3],
+        ["proj: add b7", "proj: assign b6", "board: merge"]
+    );
+    assert!(log.contains(&"board: hand edits".to_owned()), "{log:?}");
+    in_step(&world, &a);
+    b.board(&["sync"]).ok();
+    in_step(&world, &b);
+}
+
+/// An id typed by hand on both clones for two items: both lines survive the
+/// merge (which one `closes b41` meant is a guess), lint says how to fix it,
+/// and a command refuses the id until it is fixed.
+#[test]
+fn a_duplicate_id_survives_a_merge_and_is_refused() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    b.write("proj/chores.md", "- c7 from b. Check: x\n");
+    b.board(&["sync"]).ok();
+    a.write("proj/chores.md", "- c7 from a. Check: x\n");
+    let duplicate = "board: lint: proj/chores.md:2: duplicate id c7, first on line 1; delete \
+                     the id on one of the lines and that line gets a new one\n";
+    let ran = a.board(&["sync"]);
+    assert_eq!(
+        (ran.code, ran.stderr),
+        (
+            0,
+            format!("board: merged 1 local commit (by line: proj/chores.md)\n{duplicate}")
+        )
+    );
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "- c7 from b. Check: x\n- c7 from a. Check: x\n"
+    );
+    assert_eq!(
+        a.board(&["done", "c7"]).failed(1),
+        format!("{duplicate}board: done c7: c7 is on 2 lines; fix the duplicate first\n")
+    );
+    // Deleting the id on one line gives that line a new one.
+    a.write(
+        "proj/chores.md",
+        "- c7 from b. Check: x\n- from a. Check: x\n",
+    );
+    let ran = a.board(&["done", "c7"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (
+            0,
+            &b"done c7\n"[..],
+            "board: assigned c8: from a. Check: x\n"
+        )
+    );
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "- c8 from a. Check: x\n"
     );
 }
 
-/// A file saved while the write's push is on its way: the change is on the
-/// remote, the clone's `main` and files stay behind, and the save is kept.
-/// The next write refuses the changed file, and the way out its message
-/// names gets the clone writing again with the save pushed.
+/// A brief both clones changed: the remote's version stays, the clone's is
+/// saved beside it, the note says so once and lint says so on every write
+/// in that project until the copy is deleted. Writes go on meanwhile.
 #[test]
-fn a_file_saved_during_the_push_is_kept_and_the_refusal_names_the_way_out() {
+fn a_brief_changed_on_both_clones_keeps_the_remote_s_and_saves_the_local_one() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    let brief = "proj/briefs/1-x.md";
+    let header = "id: 1\nstatus: draft\n\n# X\n";
+    a.write(brief, header);
+    a.board(&["sync"]).ok();
+    b.board(&["sync"]).ok();
+    b.write(brief, format!("{header}from b\n"));
+    b.board(&["sync"]).ok();
+    a.write(brief, format!("{header}from a\n"));
+
+    let copy = a.data().join("proj/briefs/1-x.md.local");
+    let finding = "board: lint: proj/briefs/1-x.md.local: unmerged local version of brief 1; \
+                   merge it by hand, then delete this file\n";
+    let ran = a.board(&["sync"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr),
+        (
+            0,
+            &b"synced\n"[..],
+            format!(
+                "board: merged 1 local commit\n\
+                 board: conflict: brief 1 changed here and on the remote; the remote version \
+                 is kept, yours is saved as {}\n{finding}",
+                copy.display()
+            )
+        )
+    );
+    assert_eq!(text(a.file(brief)), format!("{header}from b\n"));
+    assert_eq!(text(world.remote_file(brief)), format!("{header}from b\n"));
+    assert_eq!(
+        text(a.file("proj/briefs/1-x.md.local")),
+        format!("{header}from a\n")
+    );
+    assert_eq!(a.main(), world.remote_main());
+
+    // Another project's write knows nothing of it; this project's says it
+    // again, and so does lint.
+    let ran = a.board(&["--board", "shop", "add", "backlog", "x"]);
+    assert_eq!((ran.code, ran.stderr.as_str()), (0, ""));
+    let ran = a.board(&["add", "backlog", "y"]);
+    assert_eq!((ran.code, ran.stderr), (0, finding.to_owned()));
+    assert_eq!(a.board(&["lint"]).out(1), &finding["board: lint: ".len()..]);
+    fs::remove_file(&copy).unwrap();
+    assert_eq!(a.board(&["lint"]).ok(), "ok\n");
+    assert_eq!(a.board(&["add", "backlog", "z"]).ok(), "b2\n");
+}
+
+/// The local version is saved before the merge is pushed: a write killed
+/// right after its push leaves the copy, and the next write, which finds
+/// the merge on the remote already, has no conflict left to see.
+#[test]
+fn a_brief_s_local_version_is_saved_before_the_push() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    let brief = "proj/briefs/1-x.md";
+    let header = "id: 1\nstatus: draft\n\n# X\n";
+    b.write(brief, format!("{header}from b\n"));
+    b.board(&["sync"]).ok();
+    a.write(brief, format!("{header}from a\n"));
+    a.hook_once("pre-push", pre_push::KILL_AFTER_PUSH);
+    a.board_killed(&["add", "backlog", "x"]);
+    assert_eq!(
+        text(a.file("proj/briefs/1-x.md.local")),
+        format!("{header}from a\n")
+    );
+    let ran = a.board(&["sync"]);
+    assert_eq!(
+        (ran.code, ran.stderr.as_str()),
+        (
+            0,
+            "board: lint: proj/briefs/1-x.md.local: unmerged local version of brief 1; \
+             merge it by hand, then delete this file\n"
+        )
+    );
+    assert_eq!(text(a.file(brief)), format!("{header}from b\n"));
+    assert_eq!(a.status(), "?? proj/briefs/1-x.md.local\n");
+    assert_eq!(a.main(), world.remote_main());
+}
+
+/// A project directory renamed by hand and synced: the ids used before the
+/// rename stay used.
+#[test]
+fn a_project_directory_renamed_by_hand_keeps_its_ids_used() {
+    let world = World::new();
+    let b = world.b();
+    b.write("old/chores.md", "- c1 one. Check: x\n- c5 five. Check: x\n");
+    b.board(&["sync"]).ok();
+    b.write("old/chores.md", "- c1 one. Check: x\n");
+    b.board(&["sync"]).ok();
+    fs::rename(b.data().join("old"), b.data().join("proj")).unwrap();
+    assert_eq!(b.board(&["sync"]).ok(), "synced\n");
+    assert_eq!(
+        world
+            .a()
+            .board(&["add", "chore", "x", "--group", "g", "--check", "x"])
+            .ok(),
+        "c6\n"
+    );
+}
+
+/// A file saved while the write's push is on its way: the fast-forward
+/// refuses to overwrite it, so the save is committed and merged with the
+/// write's commit, from the exact base, and the next write pushes it. A save
+/// to a file the write did not change goes along with the fast-forward and
+/// is committed by the next write.
+#[test]
+fn a_file_saved_during_the_push_is_merged_in() {
     let world = World::new();
     let a = world.a();
     a.board(&["add", "backlog", "one"]).ok();
-    a.board(&["add", "backlog", "two"]).ok();
-    let before = a.main();
+    // Another file than the write's: the fast-forward carries it.
+    a.hook_once(
+        "pre-push",
+        "printf '%s\\n' '- by hand. Check: x' >proj/chores.md\n",
+    );
+    assert_eq!(a.board(&["add", "backlog", "two"]).ok(), "b2\n");
+    assert_eq!(a.main(), world.remote_main());
+    assert_eq!(a.status(), "?? proj/chores.md\n");
+
+    // The write's own file: committed and merged.
     a.hook_once(
         "pre-push",
         "printf '%s\\n' '- b1 one, edited' '- b2 two' >proj/backlog.md\n",
     );
     let ran = a.board(&["add", "backlog", "three"]);
-    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"b3\n"[..]));
-    assert!(
-        ran.stderr.starts_with("board: local files not updated: "),
-        "{ran:?}"
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (
+            0,
+            &b"b3\n"[..],
+            "board: merged 1 local commit (by line: proj/backlog.md)\n\
+             board: assigned c1: by hand. Check: x\n"
+        )
     );
     assert_eq!(
         text(world.remote_file("proj/backlog.md")),
         "- b1 one\n- b2 two\n- b3 three\n"
     );
-    assert_eq!(a.main(), before);
     assert_eq!(
         text(a.file("proj/backlog.md")),
-        "- b1 one, edited\n- b2 two\n"
+        "- b1 one, edited\n- b2 two\n- b3 three\n"
     );
+    assert_eq!(a.status(), "");
 
-    assert_eq!(a.board(&["add", "backlog", "four"]).code, 4);
-    let data = a.data();
-    a.git(&data, ["stash", "-q", "-u"]);
-    a.git(&data, ["pull", "-q", "--ff-only"]);
-    a.git(&data, ["stash", "pop", "-q"]);
-    a.git(&data, ["commit", "-q", "-am", "edit"]);
     assert_eq!(a.board(&["add", "backlog", "four"]).ok(), "b4\n");
     assert_eq!(
         text(world.remote_file("proj/backlog.md")),
         "- b1 one, edited\n- b2 two\n- b3 three\n- b4 four\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "- c1 by hand. Check: x\n"
+    );
+    in_step(&world, &a);
+}
+
+/// Killed after its push reached the remote, with the clone's own commits
+/// merged into that push: the clone is behind, and the next write catches up
+/// without merging the hand edit again, so the line is there once.
+#[test]
+fn a_command_killed_after_pushing_a_merge_is_healed_without_a_second_merge() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    b.board(&["add", "backlog", "from b"]).ok();
+    a.write("proj/backlog.md", "- by hand\n");
+    a.hook_once("pre-push", pre_push::KILL_AFTER_PUSH);
+    a.board_killed(&["add", "backlog", "landed"]);
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b1 from b\n- b2 by hand\n- b3 landed\n"
+    );
+    assert_eq!(a.board(&["add", "backlog", "next"]).ok(), "b4\n");
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b1 from b\n- b2 by hand\n- b3 landed\n- b4 next\n"
+    );
+    in_step(&world, &a);
+}
+
+/// A line without an id, published under an id while the clone's file still
+/// shows it without one (a save during the push; a kill after it), and then
+/// deleted or moved there: the delete and the move stand, read with the id
+/// the push gave, even after another clone edited that id.
+#[test]
+fn a_line_whose_id_was_being_published_is_deleted_and_moved_by_its_id() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+
+    // Deleted while the push runs.
+    a.write("proj/backlog.md", "- foo\n");
+    a.hook_once("pre-push", ": >proj/backlog.md\n");
+    let ran = a.board(&["add", "backlog", "x"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice()),
+        (0, &b"b2\n"[..]),
+        "{ran:?}"
+    );
+    assert_eq!(text(a.file("proj/backlog.md")), "- b2 x\n");
+    a.board(&["sync"]).ok();
+    assert_eq!(text(world.remote_file("proj/backlog.md")), "- b2 x\n");
+    in_step(&world, &a);
+
+    // Killed after the push; meanwhile another clone edits the published
+    // line; then the clone moves one line and deletes the other.
+    a.write("proj/backlog.md", "- b2 x\n- bar\n- baz\n");
+    a.hook_once("pre-push", pre_push::KILL_AFTER_PUSH);
+    a.board_killed(&["add", "backlog", "y"]);
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b2 x\n- b3 bar\n- b4 baz\n- b5 y\n"
+    );
+    assert_eq!(text(a.file("proj/backlog.md")), "- b2 x\n- bar\n- baz\n");
+    b.board(&["sync"]).ok();
+    b.write(
+        "proj/backlog.md",
+        "- b2 x\n- b3 bar, edited\n- b4 baz\n- b5 y\n",
+    );
+    b.board(&["sync"]).ok();
+    a.write("proj/backlog.md", "- baz\n- b2 x\n");
+    let ran = a.board(&["sync"]);
+    assert_eq!(
+        (ran.code, ran.stderr.as_str()),
+        (
+            0,
+            "board: merged 1 local commit (by line: proj/backlog.md)\n"
+        ),
+        "{ran:?}"
+    );
+    // Each line once; where the moved one sits is the union's, and its old
+    // neighbour changed on the remote. Order is not data.
+    let mut lines: Vec<String> = text(world.remote_file("proj/backlog.md"))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, ["- b2 x", "- b4 baz", "- b5 y"]);
+    in_step(&world, &a);
+}
+
+/// The residue of the case above: a line without an id whose text is changed
+/// while its id is published keeps the change under a new id, and the
+/// published id goes. Never two lines.
+#[test]
+fn a_line_changed_while_its_id_was_being_published_gets_a_new_id() {
+    let world = World::new();
+    let a = world.a();
+    a.write("proj/backlog.md", "- foo\n");
+    a.hook_once(
+        "pre-push",
+        "printf '%s\\n' '- foo, edited' >proj/backlog.md\n",
+    );
+    let ran = a.board(&["add", "backlog", "x"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (
+            0,
+            &b"b2\n"[..],
+            "board: merged 1 local commit (by line: proj/backlog.md)\n\
+             board: assigned b1: foo\n"
+        )
+    );
+    let ran = a.board(&["sync"]);
+    assert_eq!(
+        (ran.code, ran.stderr.as_str()),
+        (0, "board: assigned b3: foo, edited\n"),
+        "{ran:?}"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b2 x\n- b3 foo, edited\n"
+    );
+    in_step(&world, &a);
+}
+
+/// A board file staged as new and then deleted (a write killed between the
+/// add and the commit of its hand edits, then the file removed): in no
+/// version git knows, so there is nothing to commit for it, and the write
+/// goes on.
+#[test]
+fn a_new_file_staged_and_then_deleted_is_no_hand_edit() {
+    let world = World::new();
+    let a = world.a();
+    a.write("proj/chores.md", "- by hand. Check: x\n");
+    a.git(&a.data(), ["add", "proj/chores.md"]);
+    fs::remove_file(a.data().join("proj/chores.md")).unwrap();
+    a.write("proj/backlog.md", "- b9 typed\n");
+    assert_eq!(a.board(&["add", "backlog", "x"]).ok(), "b10\n");
+    assert_eq!(world.remote_file("proj/chores.md"), None);
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b9 typed\n- b10 x\n"
     );
     in_step(&world, &a);
 }

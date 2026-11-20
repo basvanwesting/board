@@ -388,6 +388,11 @@ pub struct Project {
     /// paths relative to the board-data root. The tool does not sync them;
     /// lint says so.
     pub(crate) misnamed: Vec<String>,
+    /// The local versions of briefs that lost to the remote's in a merge
+    /// (`<brief path>.local`, `.local2`, …), as paths relative to the
+    /// board-data root with their brief's number. Untracked, so only a load
+    /// from the files has them.
+    pub(crate) copies: Vec<(String, BriefId)>,
     /// The files an edit went through since the load: what a write commits.
     pub(crate) changed: BTreeSet<BoardPath>,
 }
@@ -402,6 +407,7 @@ impl Project {
             backlog: ListFile::parse(ListKind::Backlog, b""),
             briefs: Vec::new(),
             misnamed: Vec::new(),
+            copies: Vec::new(),
             changed: BTreeSet::new(),
         }
     }
@@ -484,7 +490,11 @@ impl Project {
                     project.add_brief(brief_name, filed, &bytes);
                 }
                 Some(BoardPath::List { .. }) | None => {
-                    project.not_a_brief(&relative.to_string_lossy());
+                    let relative = relative.to_string_lossy();
+                    match copy_of(&relative) {
+                        Some(number) => project.copies.push((relative.into_owned(), number)),
+                        None => project.not_a_brief(&relative),
+                    }
                 }
             }
         }
@@ -560,7 +570,30 @@ impl Project {
             (a.name.number(), a.filed, &a.name).cmp(&(b.name.number(), b.filed, &b.name))
         });
         self.misnamed.sort();
+        self.copies.sort();
         self
+    }
+}
+
+/// The paths a merge saves the local version of a brief at: `<path>.local`,
+/// then `.local2`, `.local3`, … for one that is there already with other
+/// bytes.
+pub(crate) fn copy_paths(brief: &str) -> impl Iterator<Item = String> + '_ {
+    (1u32..).map(move |n| match n {
+        1 => format!("{brief}.local"),
+        n => format!("{brief}.local{n}"),
+    })
+}
+
+/// The brief a conflict copy is of, when `path` is one: a brief path with
+/// `.local` or `.local<n>` (n from 2) after it.
+fn copy_of(path: &str) -> Option<BriefId> {
+    let (brief, n) = path.rsplit_once(".local")?;
+    let numbered =
+        n.is_empty() || (n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0') && n != "1");
+    match BoardPath::parse(brief) {
+        Some(BoardPath::Brief { name, .. }) if numbered => Some(name.number()),
+        Some(BoardPath::Brief { .. } | BoardPath::List { .. }) | None => None,
     }
 }
 
@@ -677,6 +710,33 @@ mod tests {
             "shop/briefs/done/128-a/b.md",
         ] {
             assert_eq!(BoardPath::parse(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_conflict_copy_is_a_brief_path_with_a_local_suffix() {
+        let brief = "shop/briefs/done/128-x.md";
+        let named: Vec<String> = copy_paths(brief).take(3).collect();
+        assert_eq!(
+            named,
+            [
+                "shop/briefs/done/128-x.md.local",
+                "shop/briefs/done/128-x.md.local2",
+                "shop/briefs/done/128-x.md.local3"
+            ]
+        );
+        for path in &named {
+            assert_eq!(copy_of(path), Some(BriefId::new(128)), "{path}");
+        }
+        for path in [
+            "shop/briefs/done/128-x.md.local1",
+            "shop/briefs/done/128-x.md.local02",
+            "shop/briefs/done/128-x.md.localx",
+            "shop/briefs/notes.md.local",
+            "shop/chores.md.local",
+            "shop/briefs/128-x.md",
+        ] {
+            assert_eq!(copy_of(path), None, "{path}");
         }
     }
 

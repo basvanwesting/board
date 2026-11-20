@@ -8,6 +8,7 @@ mod git;
 pub mod id;
 pub mod lint;
 pub mod list;
+mod merge;
 mod ops;
 pub mod project;
 mod raw;

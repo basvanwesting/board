@@ -19,7 +19,8 @@
 //! - something happening while a write pushes: a one-shot `pre-push` hook in
 //!   the machine's clone (it deletes itself first, so a retry runs without
 //!   it);
-//! - a remote that is gone: `origin` pointing at a path with nothing there.
+//! - a remote that is gone: `origin` pointing at a path with nothing there;
+//! - a file saved while a write pushes: a `pre-push` hook that writes it.
 
 #![allow(dead_code, reason = "each test crate uses a part of the harness")]
 
@@ -402,6 +403,39 @@ impl Machine<'_> {
     /// itself or [`Machine::unhook`].
     pub fn hook(&self, name: &str, body: &str) {
         install_hook(&self.data().join(".git").join("hooks").join(name), body);
+    }
+
+    /// Whether a hook is installed in the board-data clone: a one-shot hook
+    /// that is gone has run.
+    pub fn has_hook(&self, name: &str) -> bool {
+        self.data().join(".git").join("hooks").join(name).exists()
+    }
+
+    /// Points the clone's `origin` at the remote, or at a path with nothing
+    /// there: a fetch then fails at once.
+    pub fn set_online(&self, online: bool) {
+        let url = if online {
+            self.world.remote()
+        } else {
+            self.world.root.join("gone")
+        };
+        self.git(
+            &self.data(),
+            [
+                OsStr::new("remote"),
+                "set-url".as_ref(),
+                "origin".as_ref(),
+                url.as_ref(),
+            ],
+        );
+    }
+
+    /// The ref the board-data clone's `HEAD` is on; empty when detached.
+    pub fn head_ref(&self) -> String {
+        let output = self
+            .world
+            .git_output(&self.data(), ["symbolic-ref", "-q", "HEAD"]);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     /// Removes a hook from the board-data clone, run or not.

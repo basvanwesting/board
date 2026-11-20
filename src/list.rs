@@ -418,11 +418,19 @@ impl ListFile {
             .ok_or(IdsExhausted)?;
         let ids: Vec<u32> = (first..=last).collect();
         for (index, id) in without_id.into_iter().zip(&ids) {
-            let word = format!("{}{id} ", self.kind.prefix());
-            self.lines[index].splice(2..2, word.into_bytes());
+            self.lines[index] = with_id(self.kind, &self.lines[index], *id);
         }
         Ok(ids)
     }
+}
+
+/// The line of an item without an id, given `id`: the id goes in after the
+/// `- `, and nothing else changes. The one spelling of an assigned id, so
+/// the merge can tell such a line from the line it was.
+pub fn with_id(kind: ListKind, line: &[u8], id: u32) -> Vec<u8> {
+    let mut line = line.to_vec();
+    line.splice(2..2, format!("{}{id} ", kind.prefix()).into_bytes());
+    line
 }
 
 #[cfg(test)]

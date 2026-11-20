@@ -1,6 +1,7 @@
 //! The one place that spawns `git` (`clippy.toml` refuses `Command::new`
 //! everywhere else), so every call gets the same clean surroundings.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
@@ -98,6 +99,23 @@ impl Oid {
 impl fmt::Display for Oid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// What a tree holds at a path: its mode (`100644`, `120000`, …) and object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeEntry {
+    pub(crate) mode: String,
+    pub(crate) id: Oid,
+}
+
+impl TreeEntry {
+    /// A regular file with these contents.
+    pub(crate) fn file(id: Oid) -> TreeEntry {
+        TreeEntry {
+            mode: "100644".to_owned(),
+            id,
+        }
     }
 }
 
@@ -341,19 +359,36 @@ impl Git {
     }
 
     /// The blobs below `dir` in a commit's tree, as `(id, path)`, paths
-    /// relative to the top.
+    /// relative to the top. A symlink or a submodule holds no board file and
+    /// is left out.
     pub(crate) fn files(&self, commit: &Oid, dir: &str) -> Result<Vec<(Oid, String)>, Failure> {
-        let dir = format!("{dir}/");
-        let stdout = self.run(&[
-            "ls-tree",
-            "-r",
-            "-z",
-            "--full-tree",
-            commit.as_str(),
-            "--",
-            &dir,
-        ])?;
-        let mut files = Vec::new();
+        Ok(self
+            .ls_tree(commit, Some(&format!("{dir}/")))?
+            .into_iter()
+            .filter(|(_, entry)| matches!(entry.mode.as_str(), "100644" | "100755"))
+            .map(|(path, entry)| (entry.id, path))
+            .collect())
+    }
+
+    /// Every entry of a commit's tree but the directories: files, symlinks
+    /// and submodules, by path relative to the top. A path that is not UTF-8
+    /// is left out: no board path is, and the merge keeps the remote's
+    /// entry for it.
+    pub(crate) fn tree(&self, commit: &Oid) -> Result<BTreeMap<String, TreeEntry>, Failure> {
+        Ok(self.ls_tree(commit, None)?.into_iter().collect())
+    }
+
+    fn ls_tree(
+        &self,
+        commit: &Oid,
+        dir: Option<&str>,
+    ) -> Result<Vec<(String, TreeEntry)>, Failure> {
+        let mut args = vec!["ls-tree", "-r", "-z", "--full-tree", commit.as_str()];
+        if let Some(dir) = dir {
+            args.extend(["--", dir]);
+        }
+        let stdout = self.run(&args)?;
+        let mut entries = Vec::new();
         for entry in stdout.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
             // `<mode> SP <type> SP <id> TAB <path>`
             let malformed = || Failure::Said("git ls-tree printed an unexpected line".to_owned());
@@ -362,27 +397,57 @@ impl Git {
                 .position(|b| *b == b'\t')
                 .ok_or_else(malformed)?;
             let mut fields = entry[..tab].split(|b| *b == b' ');
-            let (Some(mode), Some(kind), Some(id)) = (fields.next(), fields.next(), fields.next())
+            let (Some(mode), Some(_kind), Some(id)) = (fields.next(), fields.next(), fields.next())
             else {
                 return Err(malformed());
             };
-            // A symlink or a submodule holds no board file.
-            if kind != b"blob" || mode == b"120000" {
-                continue;
-            }
-            if let Ok(path) = str::from_utf8(&entry[tab + 1..]) {
-                files.push((Oid::parse(id)?, path.to_owned()));
+            if let (Ok(path), Ok(mode)) = (str::from_utf8(&entry[tab + 1..]), str::from_utf8(mode))
+            {
+                entries.push((
+                    path.to_owned(),
+                    TreeEntry {
+                        mode: mode.to_owned(),
+                        id: Oid::parse(id)?,
+                    },
+                ));
             }
         }
-        Ok(files)
+        Ok(entries)
     }
 
     /// The contents of blobs, in the order asked, in one call.
     pub(crate) fn blobs(&self, ids: &[Oid]) -> Result<Vec<Vec<u8>>, Failure> {
-        if ids.is_empty() {
+        let names: Vec<String> = ids.iter().map(Oid::to_string).collect();
+        self.cat_blobs(&names)?
+            .into_iter()
+            .zip(&names)
+            .map(|(blob, name)| {
+                blob.ok_or_else(|| Failure::Said(format!("git cat-file: {name} missing")))
+            })
+            .collect()
+    }
+
+    /// A file as each of `commits` has it, `None` where it has none, in one
+    /// call.
+    pub(crate) fn file_at(
+        &self,
+        commits: &[Oid],
+        path: &str,
+    ) -> Result<Vec<Option<Vec<u8>>>, Failure> {
+        let names: Vec<String> = commits
+            .iter()
+            .map(|commit| format!("{commit}:{path}"))
+            .collect();
+        self.cat_blobs(&names)
+    }
+
+    /// The contents of the blobs `names` name (an id, `<commit>:<path>`), in
+    /// the order asked; `None` for a name that names nothing.
+    fn cat_blobs(&self, names: &[String]) -> Result<Vec<Option<Vec<u8>>>, Failure> {
+        if names.is_empty() {
             return Ok(Vec::new());
         }
-        let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+        let input: String = names.iter().map(|name| format!("{name}\n")).collect();
         let stdout = self.run_with(
             &["cat-file", "--batch"],
             Call {
@@ -390,25 +455,49 @@ impl Git {
                 ..Call::default()
             },
         )?;
-        // Per blob: `<id> SP blob SP <size> LF <contents> LF`.
+        // Per name: `<id> SP blob SP <size> LF <contents> LF`, or
+        // `<name> SP missing LF`.
         let malformed = || Failure::Said("git cat-file printed an unexpected answer".to_owned());
         let mut rest = &stdout[..];
-        let mut blobs = Vec::with_capacity(ids.len());
-        for _ in ids {
+        let mut blobs = Vec::with_capacity(names.len());
+        for name in names {
             let end = rest
                 .iter()
                 .position(|b| *b == b'\n')
                 .ok_or_else(malformed)?;
             let head = str::from_utf8(&rest[..end]).map_err(|_| malformed())?;
+            if head.strip_suffix(" missing") == Some(name.as_str()) {
+                blobs.push(None);
+                rest = &rest[end + 1..];
+                continue;
+            }
             let size: usize = match head.split(' ').collect::<Vec<_>>()[..] {
                 [_, "blob", size] => size.parse().map_err(|_| malformed())?,
                 _ => return Err(Failure::Said(format!("git cat-file: {head}"))),
             };
             let contents = rest.get(end + 1..end + 1 + size).ok_or_else(malformed)?;
-            blobs.push(contents.to_vec());
+            blobs.push(Some(contents.to_vec()));
             rest = rest.get(end + 1 + size + 1..).ok_or_else(malformed)?;
         }
         Ok(blobs)
+    }
+
+    /// The commits that are descendants of `from` and ancestors of `to`
+    /// (`to` included), parents before children.
+    pub(crate) fn ancestry_path(&self, from: &Oid, to: &Oid) -> Result<Vec<Oid>, Failure> {
+        let range = format!("{from}..{to}");
+        let stdout = self.run(&[
+            "rev-list",
+            "--ancestry-path",
+            "--topo-order",
+            "--reverse",
+            &range,
+        ])?;
+        stdout
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(Oid::parse)
+            .collect()
     }
 
     /// The patches of every commit reachable from `commit` that touched
@@ -486,25 +575,44 @@ impl Git {
         .map(drop)
     }
 
-    /// Sets files of the index file `index` to blobs, as regular files.
+    /// Sets paths of the index file `index` to entries; `None` removes the
+    /// path.
     pub(crate) fn update_index(
         &self,
         index: &Path,
-        files: &[(String, Oid)],
+        files: &[(String, Option<TreeEntry>)],
     ) -> Result<(), Failure> {
-        let input: Vec<u8> = files
-            .iter()
-            .flat_map(|(path, id)| format!("100644 {id}\t{path}\0").into_bytes())
-            .collect();
-        self.run_with(
-            &["update-index", "-z", "--index-info"],
-            Call {
-                input: Some(&input),
-                index: Some(index),
-                ..Call::default()
-            },
-        )
-        .map(drop)
+        let mut set = Vec::new();
+        let mut removed = Vec::new();
+        for (path, entry) in files {
+            match entry {
+                Some(TreeEntry { mode, id }) => {
+                    set.extend(format!("{mode} {id}\t{path}\0").into_bytes());
+                }
+                // Not as `--index-info` with mode 0: that line needs an
+                // object id of the repository's hash length.
+                None => removed.extend(format!("{path}\0").into_bytes()),
+            }
+        }
+        for (args, input) in [
+            (&["update-index", "-z", "--index-info"][..], set),
+            (
+                &["update-index", "-z", "--force-remove", "--stdin"][..],
+                removed,
+            ),
+        ] {
+            if !input.is_empty() {
+                self.run_with(
+                    args,
+                    Call {
+                        input: Some(&input),
+                        index: Some(index),
+                        ..Call::default()
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Writes the index file `index` as a tree.
@@ -519,22 +627,97 @@ impl Git {
         Oid::parse(&stdout)
     }
 
-    /// A commit of a tree on one parent; no ref moves.
+    /// A commit of a tree on its parents, the first parent first; no ref
+    /// moves.
     pub(crate) fn commit_tree(
         &self,
         tree: &Oid,
-        parent: &Oid,
+        parents: &[&Oid],
         message: &str,
     ) -> Result<Oid, Failure> {
-        let stdout = self.run(&[
-            "commit-tree",
-            tree.as_str(),
-            "-p",
-            parent.as_str(),
-            "-m",
-            message,
-        ])?;
+        let mut args = vec!["commit-tree", tree.as_str()];
+        for parent in parents {
+            args.extend(["-p", parent.as_str()]);
+        }
+        args.extend(["-m", message]);
+        let stdout = self.run(&args)?;
         Oid::parse(&stdout)
+    }
+
+    /// The best common ancestor of two commits.
+    pub(crate) fn merge_base(&self, a: &Oid, b: &Oid) -> Result<Oid, Failure> {
+        let stdout = self.run(&["merge-base", a.as_str(), b.as_str()])?;
+        Oid::parse(&stdout)
+    }
+
+    /// How many commits `to` has that `from` has not.
+    pub(crate) fn count_between(&self, from: &Oid, to: &Oid) -> Result<usize, Failure> {
+        let range = format!("{from}..{to}");
+        let stdout = self.run(&["rev-list", "--count", &range])?;
+        String::from_utf8_lossy(&stdout)
+            .trim()
+            .parse()
+            .map_err(|_| Failure::Said("git rev-list --count printed no number".to_owned()))
+    }
+
+    /// The three blobs' lines merged, with both sides of a conflict kept,
+    /// ours first: the line order of a list merge.
+    pub(crate) fn union(&self, ours: &Oid, base: &Oid, theirs: &Oid) -> Result<Vec<u8>, Failure> {
+        // With `--union` there are no conflicts, so a non-zero exit is an
+        // error.
+        self.run(&[
+            "merge-file",
+            "-p",
+            "--union",
+            "--object-id",
+            ours.as_str(),
+            base.as_str(),
+            theirs.as_str(),
+        ])
+    }
+
+    /// Commits `paths` as the work tree has them, added, changed or deleted,
+    /// and nothing else: whatever else is staged stays staged. No hook runs
+    /// that could refuse or change the commit.
+    pub(crate) fn commit_paths(&self, paths: &[String], message: &str) -> Result<(), Failure> {
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        self.run(&[&["add", "-A", "--"][..], &paths].concat())?;
+        // Only the paths that now differ from HEAD. A file staged as new and
+        // then deleted (a write killed between its add and its commit, then
+        // the file removed by hand) is in neither HEAD nor the index after
+        // the add, and `commit -- <path>` refuses the whole commit for a path
+        // git does not know.
+        let staged = self.run(
+            &[
+                &[
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--",
+                ][..],
+                &paths,
+            ]
+            .concat(),
+        )?;
+        let paths: Vec<&str> = staged
+            .split(|b| *b == 0)
+            .filter(|path| !path.is_empty())
+            .filter_map(|path| str::from_utf8(path).ok())
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.run(
+            &[
+                &["commit", "-q", "--no-verify", "-m", message, "--"][..],
+                &paths,
+            ]
+            .concat(),
+        )
+        .map(drop)
     }
 
     #[cfg(test)]
@@ -545,7 +728,7 @@ impl Git {
 
 /// The stdout of a git that succeeded, else the line of what it said that
 /// tells why: a push names the remote first and the reason on its ` ! `
-/// line, everything else leads with the reason.
+/// line, everything else leads with the reason, after any `hint:` lines.
 fn succeeded(args: &[&str], output: Output) -> Result<Vec<u8>, Failure> {
     let Output {
         status,
@@ -556,10 +739,11 @@ fn succeeded(args: &[&str], output: Output) -> Result<Vec<u8>, Failure> {
         Ok(stdout)
     } else {
         let said = String::from_utf8_lossy(&stderr);
+        // `hint:` lines are advice on what to type next, never the reason.
         let first_line = said
             .lines()
             .find(|line| line.starts_with(" ! "))
-            .or_else(|| said.lines().next())
+            .or_else(|| said.lines().find(|line| !line.starts_with("hint:")))
             .unwrap_or_default()
             .trim();
         Err(Failure::Said(if first_line.is_empty() {
