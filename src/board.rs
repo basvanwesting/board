@@ -4,19 +4,24 @@ use std::path::PathBuf;
 
 use crate::brief::Status;
 use crate::error::Error;
-use crate::id::{BriefId, ItemId, ListKind};
+use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
 use crate::lint::{Finding, lint};
-use crate::list::{Entry, FindError, ListFile};
+use crate::list::{Entry, Line, ListFile};
+use crate::ops::{self, NewChore};
 use crate::project::{BriefFile, Env, Project, ProjectName, resolve};
+use crate::sync::{self, Note};
 
 pub struct Board {
     root: PathBuf,
     project: ProjectName,
+    /// Where a write says what happens along the way. A note is passed on
+    /// as it comes: `waiting for lock` has to show before the wait.
+    notes: Box<dyn Fn(Note)>,
 }
 
 impl Board {
     /// Finds the project and the board-data clone; reads nothing yet.
-    pub fn open(env: Env) -> Result<Board, Error> {
+    pub fn open(env: Env, notes: Box<dyn Fn(Note)>) -> Result<Board, Error> {
         let project = resolve(&env)?;
         // A project without a directory is an empty board, so a root that
         // is not there would read as one too: every list empty, lint `ok`,
@@ -32,6 +37,7 @@ impl Board {
         Ok(Board {
             root: env.root,
             project,
+            notes,
         })
     }
 
@@ -68,10 +74,12 @@ impl Board {
                     ))),
                 }
             }
-            ItemId::Chore(chore) => item(project.list(ListKind::Chores), chore.get())
-                .map_err(|why| refused(why.unwrap_or_else(|| "no such chore".to_owned()))),
-            ItemId::Backlog(backlog) => item(project.list(ListKind::Backlog), backlog.get())
-                .map_err(|why| refused(why.unwrap_or_else(|| "no such backlog item".to_owned()))),
+            ItemId::Chore(chore) => {
+                item(project.list(ListKind::Chores), chore.get()).map_err(refused)
+            }
+            ItemId::Backlog(backlog) => {
+                item(project.list(ListKind::Backlog), backlog.get()).map_err(refused)
+            }
         }
     }
 
@@ -79,20 +87,62 @@ impl Board {
     pub fn lint(&self) -> Result<Vec<Finding>, Error> {
         self.load().map(|project| lint(&project))
     }
+
+    /// Adds a chore under its group; gives its new id.
+    pub fn add_chore(&self, new: &NewChore) -> Result<ChoreId, Error> {
+        self.command("add chore", &|tx| {
+            let id = tx.alloc_chore()?;
+            ops::add_chore(&mut tx.project, id, new)?;
+            Ok((id, format!("add {id}")))
+        })
+    }
+
+    /// Adds a backlog item below the others; gives its new id.
+    pub fn add_backlog(&self, text: &Line, from: Option<ItemId>) -> Result<BacklogId, Error> {
+        self.command("add backlog", &|tx| {
+            let id = tx.alloc_backlog()?;
+            ops::add_backlog(&mut tx.project, id, text, from);
+            Ok((id, format!("add {id}")))
+        })
+    }
+
+    /// Deletes chores' lines, all or none; gives what it did, as `done c12
+    /// c13`.
+    pub fn done(&self, ids: &[ChoreId]) -> Result<String, Error> {
+        self.command("done", &|tx| {
+            let done = ops::done(&mut tx.project, ids)?;
+            Ok((done.clone(), done))
+        })
+    }
+
+    /// Deletes backlog items' lines, all or none; gives what it did, as
+    /// `dropped b41`.
+    pub fn drop_items(&self, ids: &[BacklogId]) -> Result<String, Error> {
+        self.command("drop", &|tx| {
+            let dropped = ops::drop_items(&mut tx.project, ids)?;
+            Ok((dropped.clone(), dropped))
+        })
+    }
+
+    /// The write loop with no command: the clone and the remote end up on
+    /// the same commit.
+    pub fn sync(&self) -> Result<(), Error> {
+        sync::write::<()>(&self.root, &self.project, "sync", &*self.notes, None).map(drop)
+    }
+
+    /// A write that runs a command; `what` names it in an error.
+    fn command<T>(&self, what: &str, apply: sync::Apply<'_, T>) -> Result<T, Error> {
+        let value = sync::write(&self.root, &self.project, what, &*self.notes, Some(apply))?;
+        Ok(value.expect("a write that runs a command gives its value"))
+    }
 }
 
-/// The line of the one item with this id. The error is why the id names no
-/// single item, `None` when it is on no line at all (the caller has the
-/// word for the kind of item).
-fn item(list: &ListFile, number: u32) -> Result<Vec<u8>, Option<String>> {
-    match list.find(number) {
-        Ok(text) => Ok([text, b"\n"].concat()),
-        Err(FindError::Missing) => Err(None),
-        Err(FindError::Duplicate(lines)) => Err(Some(format!(
-            "{}{number} is on {lines} lines; fix the duplicate first",
-            list.kind().prefix()
-        ))),
-    }
+/// The line of the one item with this id, else why the id names no single
+/// item.
+fn item(list: &ListFile, number: u32) -> Result<Vec<u8>, String> {
+    list.find(number)
+        .map(|text| [text, b"\n"].concat())
+        .map_err(|why| ops::not_one(list.kind(), number, why))
 }
 
 /// What the board shows of a project: the briefs, the chores by group, the

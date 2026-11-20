@@ -2,10 +2,12 @@
 //! everywhere else), so every call gets the same clean surroundings.
 
 use std::ffi::OsString;
-use std::io;
+use std::fmt;
+use std::io::{self, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread;
 
 /// What `git rev-parse --local-env-vars` lists (git 2.56): the variables that
 /// tie a git process to one repository.
@@ -43,6 +45,10 @@ const CONFIG: [&str; 3] = [
     "color.ui=false",
 ];
 
+/// For fetch and push: a connection that stalls is given up instead of
+/// holding the board's lock for as long as TCP waits.
+const NETWORK: [&str; 2] = ["http.lowSpeedLimit=1000", "http.lowSpeedTime=20"];
+
 /// Why a git call gave no result. The two are kept apart because callers
 /// treat them differently: a git that said no is often an answer (not a
 /// repository), a git that did not run never is.
@@ -52,6 +58,58 @@ pub(crate) enum Failure {
     NotRun(io::Error),
     /// git ran and failed; the first line of what it said.
     Said(String),
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::NotRun(source) => write!(f, "cannot run git: {source}"),
+            Failure::Said(said) => f.write_str(said),
+        }
+    }
+}
+
+/// A commit, tree or blob, as git prints its id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct Oid(String);
+
+impl Oid {
+    fn parse(stdout: &[u8]) -> Result<Oid, Failure> {
+        let text = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+        match str::from_utf8(text) {
+            Ok(hex)
+                if matches!(hex.len(), 40 | 64)
+                    && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                Ok(Oid(hex.to_owned()))
+            }
+            _ => Err(Failure::Said(format!(
+                "git gave `{}` where an object id was expected",
+                String::from_utf8_lossy(text).escape_debug()
+            ))),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Oid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What a call needs beyond its arguments.
+#[derive(Default, Clone, Copy)]
+struct Call<'a> {
+    /// Written to git's stdin; without it stdin is empty.
+    input: Option<&'a [u8]>,
+    /// `GIT_INDEX_FILE`: an index of the tool's own, not the clone's.
+    index: Option<&'a Path>,
+    /// A fetch or a push.
+    network: bool,
 }
 
 /// git, run in one directory.
@@ -66,8 +124,8 @@ impl Git {
         }
     }
 
-    /// Runs `git <args>` in the directory and gives its stdout.
-    fn run<const N: usize>(&self, args: [&str; N]) -> Result<Vec<u8>, Failure> {
+    /// Starts `git <args>` in the directory and waits for it.
+    fn spawn(&self, args: &[&str], call: Call) -> Result<Output, Failure> {
         #[expect(
             clippy::disallowed_methods,
             reason = "this is the one place that spawns git"
@@ -82,32 +140,69 @@ impl Git {
             .env("GIT_TERMINAL_PROMPT", "0")
             // Messages are quoted to the user and, in one place, read.
             .env("LC_ALL", "C")
+            // A path is a path: a project or brief name is never a glob or
+            // a pathspec magic word.
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             // What the command reads is not git's to consume.
-            .stdin(Stdio::null());
+            .stdin(if call.input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
+        if let Some(index) = call.index {
+            command.env("GIT_INDEX_FILE", index);
+        }
         for setting in CONFIG {
             command.args(["-c", setting]);
         }
-        command.arg("-C").arg(&self.dir).args(args);
-        let Output {
-            status,
-            stdout,
-            stderr,
-        } = command.output().map_err(Failure::NotRun)?;
-        if status.success() {
-            Ok(stdout)
-        } else {
-            let said = String::from_utf8_lossy(&stderr);
-            let first_line = said.lines().next().unwrap_or_default().trim();
-            Err(Failure::Said(if first_line.is_empty() {
-                format!("git {} failed ({status})", args.join(" "))
-            } else {
-                first_line.to_owned()
-            }))
+        if call.network {
+            for setting in NETWORK {
+                command.args(["-c", setting]);
+            }
         }
+        command.arg("-C").arg(&self.dir).args(args);
+        let mut child = command.spawn().map_err(Failure::NotRun)?;
+        let Some(input) = call.input else {
+            return child.wait_with_output().map_err(Failure::NotRun);
+        };
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        // Written beside the read, so neither side waits on a full pipe.
+        thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                // A git that stops reading has failed and says why on
+                // stderr; that is the error worth reporting.
+                let _ = stdin.write_all(input);
+            });
+            let output = child.wait_with_output().map_err(Failure::NotRun);
+            let _ = writer.join();
+            output
+        })
+    }
+
+    /// Runs `git <args>` and gives its stdout.
+    fn run(&self, args: &[&str]) -> Result<Vec<u8>, Failure> {
+        self.run_with(args, Call::default())
+    }
+
+    fn run_with(&self, args: &[&str], call: Call) -> Result<Vec<u8>, Failure> {
+        let output = self.spawn(args, call)?;
+        succeeded(args, output)
+    }
+
+    /// Runs a `git <args>` that answers a yes/no question with its exit
+    /// code: `None` when git exits with 1, its "no".
+    fn ask(&self, args: &[&str]) -> Result<Option<Vec<u8>>, Failure> {
+        let output = self.spawn(args, Call::default())?;
+        if output.status.code() == Some(1) {
+            return Ok(None);
+        }
+        succeeded(args, output).map(Some)
     }
 
     /// Runs a `git <args>` that prints one path.
-    fn path<const N: usize>(&self, args: [&str; N]) -> Result<PathBuf, Failure> {
+    fn path(&self, args: &[&str]) -> Result<PathBuf, Failure> {
         let stdout = self.run(args)?;
         // One line; a path may hold any other byte.
         let path = stdout.strip_suffix(b"\n").unwrap_or(&stdout);
@@ -116,7 +211,7 @@ impl Git {
 
     /// The top directory of the work tree the directory is in.
     pub(crate) fn toplevel(&self) -> Result<PathBuf, Failure> {
-        self.path(["rev-parse", "--show-toplevel"])
+        self.path(&["rev-parse", "--show-toplevel"])
     }
 
     /// The git directory of the repository the directory's work tree was
@@ -130,14 +225,348 @@ impl Git {
     /// tree", and `git worktree list` gives the git directory, not the work
     /// tree, as the first one of a submodule.
     pub(crate) fn added_to(&self) -> Result<Option<PathBuf>, Failure> {
-        let own = self.path(["rev-parse", "--path-format=absolute", "--git-dir"])?;
-        let shared = self.path(["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+        let own = self.path(&["rev-parse", "--path-format=absolute", "--git-dir"])?;
+        let shared = self.path(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
         Ok((own != shared).then_some(shared))
+    }
+
+    /// The ref `HEAD` points at; `None` for a detached `HEAD`.
+    pub(crate) fn head_ref(&self) -> Result<Option<String>, Failure> {
+        Ok(self
+            .ask(&["symbolic-ref", "-q", "HEAD"])?
+            .map(|stdout| String::from_utf8_lossy(&stdout).trim_end().to_owned()))
+    }
+
+    /// Whether the remote `origin` is configured.
+    pub(crate) fn has_origin(&self) -> Result<bool, Failure> {
+        Ok(self
+            .ask(&["config", "--get", "remote.origin.url"])?
+            .is_some())
+    }
+
+    /// The commit a ref names; `None` when there is none.
+    pub(crate) fn commit(&self, name: &str) -> Result<Option<Oid>, Failure> {
+        let name = format!("{name}^{{commit}}");
+        self.ask(&["rev-parse", "-q", "--verify", "--end-of-options", &name])?
+            .map(|stdout| Oid::parse(&stdout))
+            .transpose()
+    }
+
+    /// Whether `ancestor` is `descendant` or one of its ancestors.
+    pub(crate) fn is_ancestor(&self, ancestor: &Oid, descendant: &Oid) -> Result<bool, Failure> {
+        Ok(self
+            .ask(&[
+                "merge-base",
+                "--is-ancestor",
+                ancestor.as_str(),
+                descendant.as_str(),
+            ])?
+            .is_some())
+    }
+
+    /// `origin`'s `main` into `refs/remotes/origin/main`, forced: what the
+    /// remote holds is the truth, whatever was fetched before.
+    pub(crate) fn fetch(&self) -> Result<(), Failure> {
+        self.run_with(
+            &[
+                "fetch",
+                "-q",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            Call {
+                network: true,
+                ..Call::default()
+            },
+        )
+        .map(drop)
+    }
+
+    /// Pushes a commit to `origin`'s `main`, as a fast-forward only.
+    pub(crate) fn push(&self, commit: &Oid) -> Result<(), Failure> {
+        let refspec = format!("{commit}:refs/heads/main");
+        self.run_with(
+            &[
+                "push",
+                "-q",
+                "--no-signed",
+                "--no-follow-tags",
+                "--no-recurse-submodules",
+                "origin",
+                &refspec,
+            ],
+            Call {
+                network: true,
+                ..Call::default()
+            },
+        )
+        .map(drop)
+    }
+
+    /// Moves the checked-out branch to `commit`, which has it as an
+    /// ancestor. git refuses rather than overwrite a file changed in the
+    /// work tree.
+    pub(crate) fn fast_forward(&self, commit: &Oid) -> Result<(), Failure> {
+        self.run(&[
+            "merge",
+            "-q",
+            "--ff-only",
+            "--no-autostash",
+            "--no-verify-signatures",
+            commit.as_str(),
+        ])
+        .map(drop)
+    }
+
+    /// The paths that differ between `HEAD`, the index and the work tree,
+    /// untracked files one by one, relative to the top. A path that is not
+    /// UTF-8 is left out: no board path is.
+    pub(crate) fn changed_paths(&self) -> Result<Vec<String>, Failure> {
+        let stdout = self.run(&[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--ignore-submodules=none",
+        ])?;
+        Ok(stdout
+            .split(|b| *b == 0)
+            .filter_map(|entry| entry.get(3..))
+            .filter_map(|path| str::from_utf8(path).ok())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// The blobs below `dir` in a commit's tree, as `(id, path)`, paths
+    /// relative to the top.
+    pub(crate) fn files(&self, commit: &Oid, dir: &str) -> Result<Vec<(Oid, String)>, Failure> {
+        let dir = format!("{dir}/");
+        let stdout = self.run(&[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            commit.as_str(),
+            "--",
+            &dir,
+        ])?;
+        let mut files = Vec::new();
+        for entry in stdout.split(|b| *b == 0).filter(|entry| !entry.is_empty()) {
+            // `<mode> SP <type> SP <id> TAB <path>`
+            let malformed = || Failure::Said("git ls-tree printed an unexpected line".to_owned());
+            let tab = entry
+                .iter()
+                .position(|b| *b == b'\t')
+                .ok_or_else(malformed)?;
+            let mut fields = entry[..tab].split(|b| *b == b' ');
+            let (Some(mode), Some(kind), Some(id)) = (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(malformed());
+            };
+            // A symlink or a submodule holds no board file.
+            if kind != b"blob" || mode == b"120000" {
+                continue;
+            }
+            if let Ok(path) = str::from_utf8(&entry[tab + 1..]) {
+                files.push((Oid::parse(id)?, path.to_owned()));
+            }
+        }
+        Ok(files)
+    }
+
+    /// The contents of blobs, in the order asked, in one call.
+    pub(crate) fn blobs(&self, ids: &[Oid]) -> Result<Vec<Vec<u8>>, Failure> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input: String = ids.iter().map(|id| format!("{id}\n")).collect();
+        let stdout = self.run_with(
+            &["cat-file", "--batch"],
+            Call {
+                input: Some(input.as_bytes()),
+                ..Call::default()
+            },
+        )?;
+        // Per blob: `<id> SP blob SP <size> LF <contents> LF`.
+        let malformed = || Failure::Said("git cat-file printed an unexpected answer".to_owned());
+        let mut rest = &stdout[..];
+        let mut blobs = Vec::with_capacity(ids.len());
+        for _ in ids {
+            let end = rest
+                .iter()
+                .position(|b| *b == b'\n')
+                .ok_or_else(malformed)?;
+            let head = str::from_utf8(&rest[..end]).map_err(|_| malformed())?;
+            let size: usize = match head.split(' ').collect::<Vec<_>>()[..] {
+                [_, "blob", size] => size.parse().map_err(|_| malformed())?,
+                _ => return Err(Failure::Said(format!("git cat-file: {head}"))),
+            };
+            let contents = rest.get(end + 1..end + 1 + size).ok_or_else(malformed)?;
+            blobs.push(contents.to_vec());
+            rest = rest.get(end + 1 + size + 1..).ok_or_else(malformed)?;
+        }
+        Ok(blobs)
+    }
+
+    /// The patches of every commit reachable from `commit` that touched
+    /// `path`, as zero-context hunks, following the file across renames and
+    /// through every side branch.
+    ///
+    /// `--follow` keeps the commits before a rename of the project's
+    /// directory. Plain `git log -- <path>` simplifies history: an id added
+    /// and removed again on a merged side branch is not in it. `--follow`
+    /// turns that off too (git 2.56); `--full-history` says it on its own,
+    /// so it does not hang on `--follow`.
+    ///
+    /// `--follow` alone misses the path's own older history when a rename
+    /// recreates it: at that commit it goes on with the source path only. A
+    /// project directory removed and its name used again by renaming another
+    /// onto it would free the old file's ids. So the path's log without
+    /// `--follow` is read too, and the two are given one after the other.
+    ///
+    /// The lines are parsed, so what the user's configuration or attributes
+    /// could change in them is turned off: colour, a textconv driver, a
+    /// signature check printed in the log, and a file taken for binary
+    /// (`-diff`, `binary` or a NUL byte), whose patch would hold no lines.
+    /// An external diff needs `--ext-diff` in `git log`, which no
+    /// configuration sets.
+    pub(crate) fn file_history(&self, commit: &Oid, path: &str) -> Result<Vec<u8>, Failure> {
+        let log = |follow: &[&str]| {
+            self.run(
+                &[
+                    &["log"],
+                    follow,
+                    &[
+                        "--full-history",
+                        "--format=",
+                        "-p",
+                        "-U0",
+                        "--no-color",
+                        "--text",
+                        "--no-textconv",
+                        "--no-show-signature",
+                        commit.as_str(),
+                        "--",
+                        path,
+                    ],
+                ]
+                .concat(),
+            )
+        };
+        let mut patches = log(&["--follow"])?;
+        patches.extend(log(&[])?);
+        Ok(patches)
+    }
+
+    /// Stores a blob and gives its id. The bytes go in as they are: no
+    /// line-ending or other filter applies.
+    pub(crate) fn hash_object(&self, bytes: &[u8]) -> Result<Oid, Failure> {
+        let stdout = self.run_with(
+            &["hash-object", "-w", "--no-filters", "--stdin"],
+            Call {
+                input: Some(bytes),
+                ..Call::default()
+            },
+        )?;
+        Oid::parse(&stdout)
+    }
+
+    /// Fills the index file `index` with a commit's tree.
+    pub(crate) fn read_tree(&self, index: &Path, commit: &Oid) -> Result<(), Failure> {
+        self.run_with(
+            &["read-tree", commit.as_str()],
+            Call {
+                index: Some(index),
+                ..Call::default()
+            },
+        )
+        .map(drop)
+    }
+
+    /// Sets files of the index file `index` to blobs, as regular files.
+    pub(crate) fn update_index(
+        &self,
+        index: &Path,
+        files: &[(String, Oid)],
+    ) -> Result<(), Failure> {
+        let input: Vec<u8> = files
+            .iter()
+            .flat_map(|(path, id)| format!("100644 {id}\t{path}\0").into_bytes())
+            .collect();
+        self.run_with(
+            &["update-index", "-z", "--index-info"],
+            Call {
+                input: Some(&input),
+                index: Some(index),
+                ..Call::default()
+            },
+        )
+        .map(drop)
+    }
+
+    /// Writes the index file `index` as a tree.
+    pub(crate) fn write_tree(&self, index: &Path) -> Result<Oid, Failure> {
+        let stdout = self.run_with(
+            &["write-tree"],
+            Call {
+                index: Some(index),
+                ..Call::default()
+            },
+        )?;
+        Oid::parse(&stdout)
+    }
+
+    /// A commit of a tree on one parent; no ref moves.
+    pub(crate) fn commit_tree(
+        &self,
+        tree: &Oid,
+        parent: &Oid,
+        message: &str,
+    ) -> Result<Oid, Failure> {
+        let stdout = self.run(&[
+            "commit-tree",
+            tree.as_str(),
+            "-p",
+            parent.as_str(),
+            "-m",
+            message,
+        ])?;
+        Oid::parse(&stdout)
     }
 
     #[cfg(test)]
     fn local_env_vars(&self) -> Result<Vec<u8>, Failure> {
-        self.run(["rev-parse", "--local-env-vars"])
+        self.run(&["rev-parse", "--local-env-vars"])
+    }
+}
+
+/// The stdout of a git that succeeded, else the line of what it said that
+/// tells why: a push names the remote first and the reason on its ` ! `
+/// line, everything else leads with the reason.
+fn succeeded(args: &[&str], output: Output) -> Result<Vec<u8>, Failure> {
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = output;
+    if status.success() {
+        Ok(stdout)
+    } else {
+        let said = String::from_utf8_lossy(&stderr);
+        let first_line = said
+            .lines()
+            .find(|line| line.starts_with(" ! "))
+            .or_else(|| said.lines().next())
+            .unwrap_or_default()
+            .trim();
+        Err(Failure::Said(if first_line.is_empty() {
+            format!("git {} failed ({status})", args.join(" "))
+        } else {
+            first_line.to_owned()
+        }))
     }
 }
 

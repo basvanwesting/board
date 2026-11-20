@@ -12,9 +12,21 @@
 //! user sets and the product has no seam for them. Every process starts
 //! with a cleared environment, so nothing of the developer's git
 //! configuration, home or board gets in.
+//!
+//! Faults are made the way git makes them, with hooks, and nothing is timed:
+//!
+//! - a remote that refuses pushes: a `pre-receive` hook that counts down;
+//! - something happening while a write pushes: a one-shot `pre-push` hook in
+//!   the machine's clone (it deletes itself first, so a retry runs without
+//!   it);
+//! - a remote that is gone: `origin` pointing at a path with nothing there.
+
+#![allow(dead_code, reason = "each test crate uses a part of the harness")]
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -114,23 +126,183 @@ impl World {
 
     /// Runs git for the setup of a test; it has to succeed.
     fn git<S: AsRef<OsStr>>(&self, dir: &Path, args: impl IntoIterator<Item = S>) {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the harness builds repositories around the product, not through it"
-        )]
-        let mut command = Command::new("git");
-        self.surroundings(&mut command, &self.root);
-        let output = command
-            .current_dir(dir)
-            .args(args)
-            .output()
-            .expect("run git");
+        let output = self.git_output(dir, args);
         assert!(
             output.status.success(),
             "git failed in {}: {}",
             dir.display(),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// Runs git and gives what it did, failed or not.
+    fn git_output<S: AsRef<OsStr>>(&self, dir: &Path, args: impl IntoIterator<Item = S>) -> Output {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the harness builds repositories around the product, not through it"
+        )]
+        let mut command = Command::new("git");
+        self.surroundings(&mut command, &self.root);
+        command
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("run git")
+    }
+
+    /// The temp dir: room for the files a test's hooks write.
+    pub fn dir(&self) -> &Path {
+        &self.root
+    }
+
+    /// The bare repository both clones push to.
+    pub fn remote(&self) -> PathBuf {
+        self.root.join("remote.git")
+    }
+
+    /// The commit the remote's `main` is on.
+    pub fn remote_main(&self) -> String {
+        rev(&self.git_output(&self.remote(), ["rev-parse", "main"]))
+    }
+
+    /// A file of the remote's `main`; `None` when it has none.
+    pub fn remote_file(&self, file: &str) -> Option<Vec<u8>> {
+        let output = self.git_output(
+            &self.remote(),
+            ["cat-file", "blob", &format!("main:{file}")],
+        );
+        output.status.success().then_some(output.stdout)
+    }
+
+    /// The subjects of the remote's commits, newest first.
+    pub fn remote_log(&self) -> Vec<String> {
+        let output = self.git_output(&self.remote(), ["log", "--format=%s", "main"]);
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// How many pushes the remote still refuses.
+    pub fn rejects_left(&self) -> u32 {
+        match fs::read_to_string(self.root.join("rejects")) {
+            Ok(count) => count.trim().parse().expect("a count"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("read the counter: {error}"),
+        }
+    }
+
+    /// From now on the remote refuses the next `pushes` pushes, whoever
+    /// makes them.
+    pub fn reject_pushes(&self, pushes: u32) {
+        let counter = self.root.join("rejects");
+        fs::write(&counter, format!("{pushes}\n")).expect("write the counter");
+        install_hook(
+            &self.remote().join("hooks").join("pre-receive"),
+            &format!(
+                "n=$(cat {counter})\n\
+                 if [ \"$n\" -gt 0 ]; then\n\
+                 \techo $((n - 1)) > {counter}\n\
+                 \techo 'refused by the test' >&2\n\
+                 \texit 1\n\
+                 fi\n",
+                counter = quote(&counter.to_string_lossy())
+            ),
+        );
+    }
+}
+
+/// The commit id git printed.
+fn rev(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+/// Writes an executable `sh` script.
+fn install_hook(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}")).expect("write a hook");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make a hook executable");
+}
+
+/// A word for `sh`, as it is.
+pub fn quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// `pre-push` bodies. A `pre-push` hook reads `<local ref> <local sha>
+/// <remote ref> <remote sha>` lines; its parent is the `git push` that
+/// `board` started, its grandparent `board`.
+pub mod pre_push {
+    /// The push reaches the remote, and the answer is lost: the hook pushes
+    /// the commit itself and then fails the push it was asked about.
+    pub const LOST_ACK: &str = "\
+read -r _ sha _ _
+git push -q --no-verify origin \"$sha:refs/heads/main\" >/dev/null 2>&1
+exit 1
+";
+
+    /// `board` dies before its push leaves.
+    pub const KILL_BEFORE_PUSH: &str = "\
+kill -KILL $(ps -o ppid= -p $PPID)
+exit 1
+";
+
+    /// `board` dies right after its push reached the remote, before it hears
+    /// of it.
+    pub const KILL_AFTER_PUSH: &str = "\
+read -r _ sha _ _
+git push -q --no-verify origin \"$sha:refs/heads/main\" >/dev/null 2>&1
+kill -KILL $(ps -o ppid= -p $PPID)
+exit 1
+";
+
+    /// Where [`late_landing`] keeps the first push's commit, in the dir it
+    /// is given, until the second push.
+    pub const LATE_LANDING_FILE: &str = "late-landing";
+
+    /// For [`super::Machine::hook`]. The first push fails without reaching
+    /// the remote; the second pushes the first's commit before it goes on,
+    /// so the first lands late, after the fetch the second was built on, and
+    /// the second is refused. The hook is gone after that.
+    ///
+    /// Between them the clone's committer changes: two runs of a command on
+    /// one base in one second would otherwise make one commit, as git
+    /// counts time in seconds.
+    pub fn late_landing(dir: &std::path::Path) -> String {
+        let saved = super::quote(&dir.join(LATE_LANDING_FILE).to_string_lossy());
+        format!(
+            "read -r _ sha _ _\n\
+             if [ -f {saved} ]; then\n\
+             \tgit push -q --no-verify origin \"$(cat {saved}):refs/heads/main\" >/dev/null 2>&1\n\
+             \trm -f \"$0\" {saved}\n\
+             \texit 0\n\
+             fi\n\
+             echo \"$sha\" >{saved}\n\
+             git config user.email \"late-$sha@example.org\"\n\
+             exit 1\n"
+        )
+    }
+
+    /// Runs `script` (a [`super::Machine::script`]) while the push waits,
+    /// with its stdout, stderr and exit code in `<dir>/window.{out,err,code}`;
+    /// the push then goes on.
+    pub fn window(script: &str, dir: &std::path::Path) -> String {
+        let file = |name: &str| super::quote(&dir.join(name).to_string_lossy());
+        format!(
+            "{script} </dev/null >{out} 2>{err}\necho $? >{code}\nexit 0\n",
+            out = file("window.out"),
+            err = file("window.err"),
+            code = file("window.code"),
+        )
     }
 }
 
@@ -196,6 +368,81 @@ impl Machine<'_> {
     /// Runs `board <args>` in another directory.
     pub fn board_in(&self, directory: &Path, args: &[&str]) -> Ran {
         run(self.command().current_dir(directory).args(args))
+    }
+
+    /// Runs `board <args>`, which a hook is expected to kill.
+    pub fn board_killed(&self, args: &[&str]) {
+        let output = self.command().args(args).output().expect("run board");
+        assert_eq!(output.status.signal(), Some(9), "{output:?}");
+    }
+
+    /// `board <args>` on this machine, as a line of `sh`: what a hook on
+    /// another machine runs.
+    pub fn script(&self, args: &[&str]) -> String {
+        let args: Vec<String> = args.iter().map(|arg| quote(arg)).collect();
+        format!(
+            "(cd {proj} && HOME={home} {board} {args})",
+            proj = quote(&self.proj().to_string_lossy()),
+            home = quote(&self.home().to_string_lossy()),
+            board = quote(env!("CARGO_BIN_EXE_board")),
+            args = args.join(" ")
+        )
+    }
+
+    /// Installs a hook in the board-data clone that runs once: it deletes
+    /// itself before `body` runs.
+    pub fn hook_once(&self, name: &str, body: &str) {
+        install_hook(
+            &self.data().join(".git").join("hooks").join(name),
+            &format!("rm -f \"$0\"\n{body}"),
+        );
+    }
+
+    /// Installs a hook in the board-data clone; it stays until it removes
+    /// itself or [`Machine::unhook`].
+    pub fn hook(&self, name: &str, body: &str) {
+        install_hook(&self.data().join(".git").join("hooks").join(name), body);
+    }
+
+    /// Removes a hook from the board-data clone, run or not.
+    pub fn unhook(&self, name: &str) {
+        let path = self.data().join(".git").join("hooks").join(name);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove a hook: {error}"),
+        }
+    }
+
+    /// A file of the board-data clone as it is on disk; `None` when it is not
+    /// there.
+    pub fn file(&self, file: &str) -> Option<Vec<u8>> {
+        match fs::read(self.data().join(file)) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read {file}: {error}"),
+        }
+    }
+
+    /// The commit `main` of the board-data clone is on.
+    pub fn main(&self) -> String {
+        rev(&self.world.git_output(&self.data(), ["rev-parse", "main"]))
+    }
+
+    /// What `git status --porcelain` says of the board-data clone.
+    pub fn status(&self) -> String {
+        let output = self
+            .world
+            .git_output(&self.data(), ["status", "--porcelain", "-uall"]);
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// Commits everything in the board-data clone by hand and pushes it.
+    pub fn commit_and_push(&self, message: &str) {
+        self.git(&self.data(), ["add", "-A"]);
+        self.git(&self.data(), ["commit", "-q", "-m", message]);
+        self.git(&self.data(), ["push", "-q", "origin", "main"]);
     }
 }
 

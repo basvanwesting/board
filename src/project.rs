@@ -1,6 +1,7 @@
 //! Which project a command is about, where its files sit in the board-data
 //! repo, and the files as read.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -10,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::brief::{BadStatus, Brief, Status};
 use crate::error::Error;
-use crate::git::{self, Git};
+use crate::git::{self, Git, Oid};
 use crate::id::{BriefId, ListKind};
 use crate::list::ListFile;
 
@@ -387,6 +388,8 @@ pub struct Project {
     /// paths relative to the board-data root. The tool does not sync them;
     /// lint says so.
     pub(crate) misnamed: Vec<String>,
+    /// The files an edit went through since the load: what a write commits.
+    pub(crate) changed: BTreeSet<BoardPath>,
 }
 
 impl Project {
@@ -399,6 +402,7 @@ impl Project {
             backlog: ListFile::parse(ListKind::Backlog, b""),
             briefs: Vec::new(),
             misnamed: Vec::new(),
+            changed: BTreeSet::new(),
         }
     }
 
@@ -417,6 +421,38 @@ impl Project {
         &self.briefs
     }
 
+    /// A list to edit; the edit is committed by the write it runs in.
+    pub(crate) fn list_mut(&mut self, kind: ListKind) -> &mut ListFile {
+        self.changed.insert(BoardPath::List {
+            project: self.name.clone(),
+            kind,
+        });
+        match kind {
+            ListKind::Chores => &mut self.chores,
+            ListKind::Backlog => &mut self.backlog,
+        }
+    }
+
+    /// The bytes a board path of this project has now; `None` for a file the
+    /// project does not have.
+    pub(crate) fn bytes(&self, path: &BoardPath) -> Option<Vec<u8>> {
+        match path {
+            BoardPath::List { project, kind } if *project == self.name => {
+                Some(self.list(*kind).to_bytes())
+            }
+            BoardPath::Brief {
+                project,
+                name,
+                filed,
+            } if *project == self.name => self
+                .briefs
+                .iter()
+                .find(|file| file.name == *name && file.filed == *filed)
+                .map(|file| file.brief.to_bytes()),
+            BoardPath::List { .. } | BoardPath::Brief { .. } => None,
+        }
+    }
+
     /// Reads the project from the files of the board-data clone at `root`.
     ///
     /// The files only: no git, no lock, no network. A read then shows what
@@ -427,11 +463,7 @@ impl Project {
         let mut project = Project::empty(name.clone());
         for kind in ListKind::ALL {
             if let Some(bytes) = read_if_there(&dir.join(kind.file_name()))? {
-                let file = ListFile::parse(kind, &bytes);
-                match kind {
-                    ListKind::Chores => project.chores = file,
-                    ListKind::Backlog => project.backlog = file,
-                }
+                project.set_list(kind, &bytes);
             }
         }
         let mut files = Vec::new();
@@ -449,25 +481,86 @@ impl Project {
                     let file = root.join(&relative);
                     let bytes =
                         fs::read(&file).map_err(|source| Error::io("read", &file, source))?;
-                    project.briefs.push(BriefFile {
-                        name: brief_name,
-                        filed,
-                        brief: Brief::parse(&bytes),
-                    });
+                    project.add_brief(brief_name, filed, &bytes);
                 }
                 Some(BoardPath::List { .. }) | None => {
-                    let shown = relative.to_string_lossy();
-                    if shown.ends_with(".md") {
-                        project.misnamed.push(shown.into_owned());
-                    }
+                    project.not_a_brief(&relative.to_string_lossy());
                 }
             }
         }
-        project.briefs.sort_by(|a, b| {
+        Ok(project.sorted())
+    }
+
+    /// Reads the project from a commit of the board-data clone at `root`:
+    /// what a write starts from, so that it applies to what the remote has
+    /// and never to a file half saved in an editor.
+    pub(crate) fn load_commit(
+        root: &Path,
+        name: &ProjectName,
+        commit: &Oid,
+    ) -> Result<Project, Error> {
+        let git = Git::at(root);
+        let unreadable = |failure: git::Failure| {
+            Error::Git(format!("cannot read {name} at {commit}: {failure}"))
+        };
+        let mut project = Project::empty(name.clone());
+        let briefs_dir = format!("{name}/briefs/");
+        let mut wanted = Vec::new();
+        let mut ids = Vec::new();
+        for (id, path) in git.files(commit, name.as_str()).map_err(unreadable)? {
+            match BoardPath::parse(&path) {
+                Some(board_path) => {
+                    wanted.push(board_path);
+                    ids.push(id);
+                }
+                None if path.starts_with(&briefs_dir) => project.not_a_brief(&path),
+                None => {}
+            }
+        }
+        let blobs = git.blobs(&ids).map_err(unreadable)?;
+        for (path, bytes) in wanted.into_iter().zip(blobs) {
+            match path {
+                BoardPath::List { kind, .. } => project.set_list(kind, &bytes),
+                BoardPath::Brief {
+                    name: brief_name,
+                    filed,
+                    ..
+                } => project.add_brief(brief_name, filed, &bytes),
+            }
+        }
+        Ok(project.sorted())
+    }
+
+    fn set_list(&mut self, kind: ListKind, bytes: &[u8]) {
+        let file = ListFile::parse(kind, bytes);
+        match kind {
+            ListKind::Chores => self.chores = file,
+            ListKind::Backlog => self.backlog = file,
+        }
+    }
+
+    fn add_brief(&mut self, name: BriefName, filed: bool, bytes: &[u8]) {
+        self.briefs.push(BriefFile {
+            name,
+            filed,
+            brief: Brief::parse(bytes),
+        });
+    }
+
+    /// A file below `briefs/` that the one path grammar does not take as a
+    /// brief: lint names it when it looks like one, an `.md`.
+    fn not_a_brief(&mut self, relative: &str) {
+        if relative.ends_with(".md") {
+            self.misnamed.push(relative.to_owned());
+        }
+    }
+
+    fn sorted(mut self) -> Project {
+        self.briefs.sort_by(|a, b| {
             (a.name.number(), a.filed, &a.name).cmp(&(b.name.number(), b.filed, &b.name))
         });
-        project.misnamed.sort();
-        Ok(project)
+        self.misnamed.sort();
+        self
     }
 }
 

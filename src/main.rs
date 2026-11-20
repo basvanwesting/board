@@ -1,7 +1,10 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use board::{Board, BriefRow, Env, Error, Exit, ItemId, ListKind, ListRow, Snapshot, Status};
+use board::{
+    BacklogId, Board, BriefRow, ChoreId, Env, Error, Exit, ItemId, Line, ListKind, ListRow,
+    NewChore, Snapshot, Status,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// A file-based board for a planner/worker pair of coding agents and their
@@ -33,6 +36,49 @@ enum Command {
     },
     /// Check the board's files: `ok`, or a line per finding
     Lint,
+    /// Add a chore or a backlog item; prints its new id
+    Add {
+        #[command(subcommand)]
+        item: AddItem,
+    },
+    /// Delete chores that are done
+    Done {
+        /// Like c12
+        #[arg(required = true)]
+        ids: Vec<ChoreId>,
+    },
+    /// Delete backlog items that will not be done
+    Drop {
+        /// Like b41
+        #[arg(required = true)]
+        ids: Vec<BacklogId>,
+    },
+    /// Bring the board-data clone and the remote to the same commit
+    Sync,
+}
+
+#[derive(Subcommand)]
+enum AddItem {
+    /// An action of the user's, with how to see that it is done
+    Chore {
+        text: Line,
+        /// The `## group` heading it goes under; made when missing
+        #[arg(long)]
+        group: Line,
+        /// How to see that it is done
+        #[arg(long)]
+        check: Line,
+        /// The item it came from, like 128
+        #[arg(long, value_name = "ID")]
+        from: Option<ItemId>,
+    },
+    /// An item for later, below the others
+    Backlog {
+        text: Line,
+        /// The item it came from, like 128
+        #[arg(long, value_name = "ID")]
+        from: Option<ItemId>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -121,11 +167,43 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::Ls { kind, status }) => Run::Ls(Selection::new(kind, status)?),
         Some(Command::Show { id }) => Run::Show(id),
         Some(Command::Lint) => Run::Lint,
+        Some(Command::Add {
+            item:
+                AddItem::Chore {
+                    text,
+                    group,
+                    check,
+                    from,
+                },
+        }) => Run::AddChore(NewChore {
+            text,
+            group,
+            check,
+            from,
+        }),
+        Some(Command::Add {
+            item: AddItem::Backlog { text, from },
+        }) => Run::AddBacklog(text, from),
+        Some(Command::Done { ids }) => Run::Done(ids),
+        Some(Command::Drop { ids }) => Run::Drop(ids),
+        Some(Command::Sync) => Run::Sync,
     };
-    let board = Board::open(Env::from_process(cli.board)?)?;
+    // A note is written as it comes, before the command goes on: `waiting
+    // for lock` has to show while the command waits.
+    let notes = Box::new(|note: board::Note| complain(&note.to_string()));
+    let board = Board::open(Env::from_process(cli.board)?, notes)?;
+    let line = |text: String| Ok((format!("{text}\n").into_bytes(), Exit::Ok));
     match command {
         Run::Ls(selection) => Ok((ls(&board.snapshot()?, &selection), Exit::Ok)),
         Run::Show(id) => Ok((board.show(id)?, Exit::Ok)),
+        Run::AddChore(new) => line(board.add_chore(&new)?.to_string()),
+        Run::AddBacklog(text, from) => line(board.add_backlog(&text, from)?.to_string()),
+        Run::Done(ids) => line(board.done(&ids)?),
+        Run::Drop(ids) => line(board.drop_items(&ids)?),
+        Run::Sync => {
+            board.sync()?;
+            line("synced".to_owned())
+        }
         Run::Lint => {
             let findings = board.lint()?;
             if findings.is_empty() {
@@ -146,6 +224,11 @@ enum Run {
     Ls(Selection),
     Show(ItemId),
     Lint,
+    AddChore(NewChore),
+    AddBacklog(Line, Option<ItemId>),
+    Done(Vec<ChoreId>),
+    Drop(Vec<BacklogId>),
+    Sync,
 }
 
 fn ls(snapshot: &Snapshot, selection: &Selection) -> Vec<u8> {
