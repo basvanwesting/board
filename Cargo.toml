@@ -1,0 +1,10 @@
+[package]
+name = "board"
+version = "0.1.0"
+edition = "2024"
+description = "A file-based board for a planner/worker pair of coding agents and their user"
+license = "MIT"
+publish = false
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
