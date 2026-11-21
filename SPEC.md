@@ -49,6 +49,7 @@ board file <id> [--no-commits]  reported brief: verify its commits in the projec
 board add chore "<text>" --group <g> --check "<c>" [--from <id>]
 board add backlog "<text>" [--from <id>]
 board done <c-id>…             board drop <b-id>…
+board move <c-id|b-id> --before <id> | --after <id>   same list; a chore lands in the group of the item it is put next to
 board sync                     board lint
 ```
 
@@ -69,18 +70,37 @@ The tool is the only thing that runs git in the board-data repo. It pushes: the 
 - The next list ID and the next brief number are one past the highest ever used in git history (the list file's lines, the files ever added under the project's `briefs/`), not only among what is there now: a deleted line or a hand-deleted brief would otherwise free its number, and `file` would count the old brief's `Brief:` commits. History is the counter, so a shallow clone is refused. Rejected: a counter file, which a hand edit makes stale.
 - `chores.md` and `backlog.md` are merged by the tool itself, keyed by ID: adds from two machines both survive, a deleted ID stays deleted, a moved line is not duplicated. Hand-typed duplicate IDs keep both lines (lint reports them): renumbering one would guess which line `closes b41` meant. No `merge=union` and no `.gitattributes`: a plain union brings a deleted line back when the other machine edited or moved it.
 - A brief changed on two machines is never merged as text: the remote version stays, the local one is saved beside it as an untracked `<brief>.local`, and `lint` reports that copy after every write in its project until it is deleted. Rejected: stopping the sync, which blocks every project on that machine with git by hand as the only way out. See Open points.
-- Reads never touch the network. The TUI fetches in the background about once a minute and shows unpushed commits and the last sync in its header.
+- Reads never touch the network. The TUI fetches in the background about once a minute and shows unpushed commits, commits the remote is ahead and the last fetch in its status line; the fetch takes the write lock and is skipped when a command holds it, so every git process in the clone still runs under the lock. It only fetches: committing and pushing on a timer would publish a half-finished hand edit, and the owner wants commits on meaningful transitions only (2026-11-21).
 - Shell out to the `git` binary (the machines' credential helper already handles https); no libgit2.
 
 ## TUI
 
-`board` on a terminal. One column that fits a narrow pane; sections: briefs (started and blocked first, then reported, then queued), chores by group, backlog in order. Header: project, sync state, the brief in flight and for how long.
+`board` on a terminal, laid out like LazyGit (owner, 2026-11-21): panels inside one terminal pane, built for a wide one (about 200 columns; no narrow layout, nobody uses one).
 
-- Keys, vim-flavoured: `j`/`k`, `gg`/`G`, `ctrl-d`/`ctrl-u`, `/` filter, `1` `2` `3` jump to a section, Enter opens the item (a brief with its report), `y` yanks the ID, `Y` the line, `d` done (chore), `x` drop (backlog), `J`/`K` move an item, `e` opens it in `$EDITOR`, `r` sync, `?` help, `q` quit. `d` and `x` ask once.
-- Esc closes a detail or clears a filter and does nothing else: the owner hits Esc by reflex.
-- No mouse capture, so the terminal's own selection and copy keep working. Yank through OSC 52, falling back to `wl-copy` / `pbcopy`.
-- Redraw when a file under the board changes (the worker's `next` and `report` show at once).
-- Every TUI action goes through the same code path as the CLI command.
+```
+┌─1 Briefs  Open · Filed──────────────┐┌─128 some-slug ────────────────────────────┐
+│▶128 started   some-slug        42m  ││ id: 128                                   │
+│ 127 reported  other-slug            ││ status: started                           │
+├─2 Chores────────────────────────────┤│                                           │
+│ ## deploy                           ││ # Title                                   │
+│ c12 Rotate the key. Check: …  (126) ││ ## Task                                   │
+├─3 Backlog───────────────────────────┤│ …                                         │
+│ b41 …                    (from 126) ││ ## Report                                 │
+└─────────────────────────────────────┘└───────────────────────────────────────────┘
+ shop · fetched 1m ago · 2 unpushed · 128 started 42m         d done  e edit  ? help
+```
+
+- Left, about 45% of the width and at most 90 columns: three stacked panels, each with its own cursor; the focused one takes the spare height. Briefs (tabs Open and Filed; open ones started and blocked first, then reported, queued, draft), chores by group, backlog in order. A line too long for its panel is cut there and whole in the preview.
+- Right: the preview follows the cursor: a brief with its report, or the wrapped line of a chore or backlog item. Plain text, headings highlighted; no markdown renderer, which is much machinery for a pane briefs are read in.
+- Bottom line: project, sync state, the brief in flight and for how long, then key hints. Confirmations, sync notes and errors show here too.
+- The TUI edits no text: `e` suspends it and runs `$EDITOR` on the brief, or on the list file at the item's line, and syncs on return (which commits the edit). Its only writes are whole-item actions.
+- Keys, vim-flavoured: `j`/`k`, `gg`/`G`, `ctrl-d`/`ctrl-u`, `/` filter (the focused panel), `1` `2` `3` or `h`/`l`/Tab focus a panel, `[`/`]` switch the Briefs tab, Enter focuses the preview for scrolling, `y` yanks the ID, `Y` the line, `d` done (chore), `x` drop (backlog), `J`/`K` move an item, `e` editor, `r` sync, `?` help, `q` quit. `d` and `x` ask once. Briefs have no actions: queue and file are the planner's.
+- Esc leaves the preview, closes help, answers no to a confirmation or clears a filter, and does nothing else: the owner hits Esc by reflex.
+- Every action is a CLI command, so an agent can do what the user does, and the TUI calls the same function the command does (in process, not a second `board`). `J`/`K` is `board move`: the row moves on screen at once and is marked pending, and one `move` is sent when the moving ends (the first key that is not `J`/`K`, `r`, or quit), so a run of presses is one commit and no press waits for a push. Rejected: a commit per press (a push each, unusable) and an idle timer (a commit on no transition). A pending move whose item or neighbour is gone after a reload is dropped with a note.
+- A command runs on a worker thread, one at a time, so navigation never waits for the network.
+- No mouse capture, so the terminal's own selection and copy keep working. Yank through OSC 52, and through `wl-copy` / `pbcopy` when present.
+- Redraw when a file under the board changes (the worker's `next` and `report` show at once); the cursor stays on its item, not its row.
+- Tests: the state is a pure function of events (key, file change, command result) giving the new state and the commands to run. Trace-test it with random event sequences; after every step: the cursor is on a row that exists and on the same item across a reload, Esc and navigation never start a command, `d`/`x` never run unconfirmed, a pending move is sent exactly once or dropped with a note. Rendering is tested against ratatui's in-memory screen.
 
 ## Consolidating the old planner folders: not this tool's job
 
@@ -102,7 +122,7 @@ The owner's rules (global CLAUDE.md) apply: guarantees over prose, commit when g
 ## Build order
 
 1. CLI (everything under Commands and Sync). The planner skill switches to it when this is done; each project's agents then consolidate their old folders onto the board.
-2. TUI.
+2. TUI, in three commits: `board move`; the read-only TUI (panels, preview, navigation, filter, tabs, help, file watcher, background fetch and status line); the actions (`d`, `x`, `J`/`K`, `e`, `r`, yank).
 3. Later, only if asked: chore checks the tool can run itself (a command per chore, run on demand, never automatically); herdr pane metadata.
 
 Stack: Rust, `clap`, `ratatui` + `crossterm`, a file watcher (`notify`), property tests (`proptest`). Install with `cargo install --path .` on each machine.
