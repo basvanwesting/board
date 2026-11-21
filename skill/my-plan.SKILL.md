@@ -31,9 +31,9 @@ The user has the board open in a pane of their own and refers to items by ID. Re
 ## Loop
 
 1. Design with the user. A brief is written only once the user approves the design.
-2. `board new brief <slug>` gives the file (status draft, `base:` = HEAD now); write it from the template below; `board queue <id>` (`--closes b41,b52` for the backlog items it resolves; it refuses a brief with an empty section).
+2. `board new brief <slug>` gives the file (status draft, `base:` = HEAD now); write it from the template below; `board queue <id> --closes b41,b52` (the flag names the backlog items it resolves, left out if none; it refuses a brief with an empty section).
 3. Wake the worker with one line by `SendMessage`, no `notify_when_idle`: `Queue has work: run "board next" and follow the brief's Worker protocol.` The worker takes the briefs in order by itself and checks each one's premises at its start, so nothing else is sent per brief.
-4. No done message arrives. At every pause, before writing the next brief, and when the user asks for the board: `board ls briefs --status reported`. For each, read the report (`board show <id>`), add its out-of-scope findings (`board add backlog … --from <id>`) and what the worker could not do (`board add chore … --check … --from <id>`), then `board file <id>`: it verifies the commits in the repository, not the report, and closes the backlog items the brief resolves.
+4. No done message arrives. At every pause, before writing the next brief, and when the user asks for the board: `board ls briefs --status reported`. For each, read the report (`board show <id>`), add its out-of-scope findings (`board add backlog … --from <id>`) and what the worker could not do (`board add chore … --group … --check … --from <id>`), then `board file <id>`: it verifies the commits in the repository, not the report, and closes the backlog items the brief resolves.
 5. `blocked: <id>` is the one message the worker sends; the question is in the brief (`board show <id>`). Answer if the approved design covers it, otherwise ask the user at once (below). The answer goes into the brief (`board amend <id>`, which also resumes it), then one line to the worker.
 6. A brief that stays `started` with no commits: ask the worker what happened. Silence is not done.
 
@@ -50,7 +50,7 @@ The conversation with the user is a design conversation, and nothing from the wo
 
 An amendment must not contain a `## ` line outside a code fence (use `###`): it would split the brief's section, and `board` refuses it. The worker's block question has the same rule (Worker protocol below).
 
-`board new brief` writes the header (id, status, base); the body is:
+`board new brief <slug>` writes the header (id, status, base); the body is:
 
 ```markdown
 # <title>

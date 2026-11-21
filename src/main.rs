@@ -389,3 +389,193 @@ fn list_lines(rows: &[ListRow]) -> Vec<u8> {
     }
     lines
 }
+
+/// SPEC.md: every command the planner skill names must exist as it names it.
+/// Each `board` invocation in the skill's code is parsed by the definition
+/// above, nothing is run: a renamed command or flag breaks this test, not the
+/// first agent that follows the skill.
+#[cfg(test)]
+mod skill {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    const SKILL: &str = include_str!("../skill/my-plan.SKILL.md");
+
+    /// The code in a markdown text: inline spans, and the lines of a fenced
+    /// block. A `markdown` fence (the brief template) is prose again.
+    fn code(text: &str) -> Vec<&str> {
+        let mut code = Vec::new();
+        // Some(is markdown) inside a fence.
+        let mut fence = None;
+        for line in text.lines() {
+            if let Some(info) = line.trim_start().strip_prefix("```") {
+                fence = match fence {
+                    None => Some(matches!(info.trim(), "markdown" | "md")),
+                    Some(_) => None,
+                };
+                continue;
+            }
+            match fence {
+                Some(false) => code.push(line.trim()),
+                None | Some(true) => code.extend(line.split('`').skip(1).step_by(2)),
+            }
+        }
+        code
+    }
+
+    /// A piece of code that runs `board`: all of it, after a `$ ` prompt, or
+    /// a quoted part (`run "board next" and …`).
+    fn invocations(text: &str) -> Vec<String> {
+        let runs_board = |code: &str| code == "board" || code.starts_with("board ");
+        let mut found = Vec::new();
+        for code in code(text) {
+            let whole = code.strip_prefix("$ ").unwrap_or(code);
+            if runs_board(whole) {
+                found.push(whole.to_owned());
+            }
+            found.extend(
+                code.split('"')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|quoted| runs_board(quoted))
+                    .map(str::to_owned),
+            );
+        }
+        found
+    }
+
+    /// The words a shell would pass: split at blanks, double quotes removed.
+    fn words(invocation: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut quoted = false;
+        for c in invocation.chars() {
+            match c {
+                '"' => {
+                    quoted = !quoted;
+                    word.get_or_insert_with(String::new);
+                }
+                c if c.is_whitespace() && !quoted => words.extend(word.take()),
+                c => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        words.extend(word);
+        words
+    }
+
+    /// What a word of the skill may stand for. A placeholder is any value
+    /// valid in its slot, so `<id>` tries every kind of id: `board done
+    /// <id>` takes a chore, `board file <id>` a brief.
+    fn samples(word: &str) -> Vec<&str> {
+        match word {
+            "<id>" => vec!["128", "c12", "b41"],
+            "<slug>" => vec!["fix-login"],
+            "<question>" | "…" => vec!["Which table holds the orders?"],
+            placeholder if placeholder.starts_with('<') && placeholder.ends_with('>') => {
+                panic!("no sample value for {placeholder}: add one here")
+            }
+            literal => vec![literal],
+        }
+    }
+
+    /// clap's error for an invocation no choice of sample values parses.
+    fn parse(invocation: &str) -> Result<(), String> {
+        let words = words(invocation);
+        let mut argvs: Vec<Vec<&str>> = vec![Vec::new()];
+        for word in &words {
+            let samples = samples(word);
+            argvs = argvs
+                .iter()
+                .flat_map(|argv| {
+                    samples
+                        .iter()
+                        .map(|sample| [argv.as_slice(), &[*sample]].concat())
+                })
+                .collect();
+        }
+        let mut error = String::new();
+        for argv in argvs {
+            match Cli::command().try_get_matches_from(argv) {
+                Ok(_) => return Ok(()),
+                // `--help` and the like: not an error, main prints it.
+                Err(help) if !help.use_stderr() => return Ok(()),
+                Err(wrong) => error = wrong.render().to_string(),
+            }
+        }
+        Err(error)
+    }
+
+    /// Code that starts with a flag: no invocation carries it, so `parse`
+    /// never sees it. The skill writes each flag inside its `board` command.
+    fn bare_flags(text: &str) -> Vec<&str> {
+        code(text)
+            .into_iter()
+            .filter(|code| code.starts_with("--"))
+            .collect()
+    }
+
+    /// What the check refuses, with why: invocations that do not parse, and
+    /// flags it cannot check.
+    fn failing(text: &str) -> Vec<(String, String)> {
+        invocations(text)
+            .into_iter()
+            .filter_map(|invocation| parse(&invocation).err().map(|error| (invocation, error)))
+            .chain(bare_flags(text).into_iter().map(|flag| {
+                let why = "unchecked: write it inside its `board` command".to_owned();
+                (flag.to_owned(), why)
+            }))
+            .collect()
+    }
+
+    /// The code `failing` refuses, without the reasons.
+    fn failing_code(text: &str) -> Vec<String> {
+        failing(text).into_iter().map(|(code, _)| code).collect()
+    }
+
+    #[test]
+    fn every_board_command_the_skill_names_parses() {
+        let found = invocations(SKILL);
+        // Counted by reading the skill: 26 code spans run `board`, one of
+        // them inside quotes. Fewer found means the reading lost some.
+        assert!(found.len() >= 26, "found only {}: {found:#?}", found.len());
+        let wrong: Vec<String> = failing(SKILL)
+            .into_iter()
+            .map(|(code, why)| format!("{code}\n{why}"))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_misnamed_command_in_the_skill_fails_the_check() {
+        for (from, to, wrong) in [
+            (
+                "`board ls briefs --status reported`",
+                "`board list briefs --status reported`",
+                "board list briefs --status reported",
+            ),
+            ("run \"board next\"", "run \"board nxt\"", "board nxt"),
+            (
+                "`board queue <id> --closes b41,b52`",
+                "`board queue <id> --close b41,b52`",
+                "board queue <id> --close b41,b52",
+            ),
+            (
+                "`board queue <id> --closes b41,b52`",
+                "`board queue <id>` (`--closes b41,b52`)",
+                "--closes b41,b52",
+            ),
+            (
+                "`board done <id>`",
+                "`board done <id> <slug>`",
+                "board done <id> <slug>",
+            ),
+        ] {
+            let text = SKILL.replacen(from, to, 1);
+            assert!(text != SKILL, "the skill no longer has {from}");
+            assert_eq!(failing_code(&text), [wrong]);
+        }
+        let text = format!("{SKILL}\n```sh\n$ board sycn\n```\n");
+        assert_eq!(failing_code(&text), ["board sycn"]);
+    }
+}
