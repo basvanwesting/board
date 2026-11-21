@@ -24,7 +24,9 @@
 //!   more claimed briefs as `next` printed paths; the line `block`, `amend`
 //!   or `report` wrote is in its brief, and one they refused is in none; a
 //!   brief `file` printed is in `done/` there, without the items it says it
-//!   closed;
+//!   closed; an item `move` moved is directly before or after its target
+//!   where the move was written, and a refused move named an id not there;
+//!   a move never needs the remote (no exit 3);
 //! - convergence, at `Quiesce` and at the end: after `sync` on A, B and A,
 //!   both clones are on the remote's commit with no board file changed,
 //!   every token added and not closed is there once, and every line written
@@ -81,6 +83,14 @@ enum Op {
     Done(Index),
     /// A backlog item of the clone or the remote, picked when the step runs.
     Drop(Index),
+    /// An item of the clone or the remote put before or after another of
+    /// its list, both picked when the step runs.
+    Move {
+        backlog: bool,
+        item: Index,
+        target: Index,
+        after: bool,
+    },
     NewBrief,
     /// A draft of the clone or the remote, picked when the step runs.
     /// `write`: its sections are written by hand first when the clone's file
@@ -195,6 +205,8 @@ fn op() -> impl Strategy<Value = Op> {
         3 => Just(Op::AddBacklog),
         2 => any::<Index>().prop_map(Op::Done),
         2 => any::<Index>().prop_map(Op::Drop),
+        3 => (any::<bool>(), any::<Index>(), any::<Index>(), any::<bool>())
+            .prop_map(|(backlog, item, target, after)| Op::Move { backlog, item, target, after }),
         2 => Just(Op::NewBrief),
         3 => (any::<Index>(), prop::bool::weighted(0.8), prop::option::of(any::<Index>()))
             .prop_map(|(pick, write, closes)| Op::Queue { pick, write, closes }),
@@ -410,6 +422,8 @@ struct Run {
 enum Subject {
     Add(String),
     Close(Id),
+    /// The item, whether it goes after the target, and the target.
+    Move(Id, bool, Id),
     /// The slug, a token.
     NewBrief(String),
     Queue(u32),
@@ -433,6 +447,7 @@ impl Subject {
             Subject::Report(number, token) => Some((*number, token, "report")),
             Subject::Add(_)
             | Subject::Close(_)
+            | Subject::Move(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::Next
@@ -447,6 +462,7 @@ impl Subject {
             Subject::Block(..)
             | Subject::Add(_)
             | Subject::Close(_)
+            | Subject::Move(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::Next
@@ -496,6 +512,8 @@ struct Depth {
     briefs_reported: u32,
     briefs_filed: u32,
     closed_by_file: u32,
+    items_moved: u32,
+    moves_not_pushed: u32,
 }
 
 impl Depth {
@@ -525,6 +543,8 @@ impl Depth {
         self.briefs_reported += other.briefs_reported;
         self.briefs_filed += other.briefs_filed;
         self.closed_by_file += other.closed_by_file;
+        self.items_moved += other.items_moved;
+        self.moves_not_pushed += other.moves_not_pushed;
     }
 }
 
@@ -770,6 +790,40 @@ impl<'w> Oracle<'w> {
             Op::Drop(index) => {
                 let id = pick(self, 'b', index);
                 (owned(&["drop", &format!("b{}", id.1)]), Subject::Close(id))
+            }
+            Op::Move {
+                backlog,
+                item,
+                target,
+                after,
+            } => {
+                let prefix = if *backlog { 'b' } else { 'c' };
+                let item = pick(self, prefix, item);
+                // Another item, never the same one: that is a usage error,
+                // which the example tests have. Nothing else to pick: an id
+                // no item has, for a refusal.
+                let others: BTreeSet<u32> = self
+                    .ids_in(who.slot(), prefix)
+                    .into_iter()
+                    .chain(self.ids_in(2, prefix))
+                    .filter(|n| *n != item.1)
+                    .collect();
+                let others: Vec<u32> = others.into_iter().collect();
+                let target = if others.is_empty() {
+                    (prefix, 999_998)
+                } else {
+                    (prefix, *target.get(&others))
+                };
+                let side = if *after { "--after" } else { "--before" };
+                (
+                    owned(&[
+                        "move",
+                        &format!("{prefix}{}", item.1),
+                        side,
+                        &format!("{prefix}{}", target.1),
+                    ]),
+                    Subject::Move(item, *after, target),
+                )
             }
             Op::NewBrief => {
                 let slug = self.token();
@@ -1167,11 +1221,39 @@ impl<'w> Oracle<'w> {
         self.check_everywhere()
     }
 
+    /// For `move` when the clone and the remote have fewer than two items
+    /// of its list, as mostly they do: the adds that bring two there, each
+    /// judged as a command of its own. A second chore goes into the other
+    /// group, so that a move crosses one.
+    fn prepare_list(&mut self, who: Who, backlog: bool) -> Result<(), TestCaseError> {
+        let prefix = if backlog { 'b' } else { 'c' };
+        for _ in 0..2 {
+            let ids: BTreeSet<u32> = self
+                .ids_in(who.slot(), prefix)
+                .into_iter()
+                .chain(self.ids_in(2, prefix))
+                .collect();
+            if ids.len() >= 2 {
+                break;
+            }
+            let add = if backlog {
+                Op::AddBacklog
+            } else {
+                Op::AddChore {
+                    group: ids.is_empty(),
+                }
+            };
+            self.command(who, &add, None)?;
+        }
+        Ok(())
+    }
+
     /// For `block`, `amend`, `report` and `file` when neither the clone nor
     /// the remote has a brief they take: the commands that bring one there,
     /// as the planner and the worker would have run them, each judged as a
     /// command of its own. Left to chance, a trace seldom gets a brief from
-    /// new to started, let alone reported, before it ends.
+    /// new to started, let alone reported, before it ends. `move` has
+    /// [`Oracle::prepare_list`].
     fn prepare(&mut self, who: Who, op: &Op) -> Result<(), TestCaseError> {
         let wanted: &[&str] = match op {
             Op::Block(_) | Op::Report(_) => &["started"],
@@ -1184,6 +1266,7 @@ impl<'w> Oracle<'w> {
             | Op::NewBrief
             | Op::Queue { .. }
             | Op::Next => return Ok(()),
+            Op::Move { backlog, .. } => return self.prepare_list(who, *backlog),
         };
         // At most new, queue, next and report; fewer when one is refused.
         for _ in 0..4 {
@@ -1486,7 +1569,10 @@ impl<'w> Oracle<'w> {
                 prop_assert!(
                     matches!(
                         subject,
-                        Subject::Close(_) | Subject::Queue(_) | Subject::File(..)
+                        Subject::Close(_)
+                            | Subject::Move(..)
+                            | Subject::Queue(_)
+                            | Subject::File(..)
                     ) || subject.brief_line().is_some(),
                     "{run:?}"
                 );
@@ -1574,6 +1660,9 @@ impl<'w> Oracle<'w> {
                     }
                     Some(_) | None => self.maybe_closed.extend(token),
                 }
+            }
+            Subject::Move(item, after, target) => {
+                self.judge_move(who, run, pushed, (*item, *after, *target), (fault, window))?;
             }
             Subject::NewBrief(slug) => {
                 let name_end = format!("-{slug}.md");
@@ -1691,6 +1780,104 @@ impl<'w> Oracle<'w> {
             Subject::File(number, closes) => {
                 self.judge_file(who, run, pushed, *number, closes)?;
             }
+        }
+        Ok(())
+    }
+
+    /// The ids of the item lines of a place's list, in file order; `None`
+    /// for an item without one.
+    fn order(&self, place: usize, prefix: char) -> Vec<Option<Id>> {
+        let (path, _) = FILES.iter().find(|(_, p)| *p == prefix).expect("a list");
+        let bytes = match place {
+            0 => self.world.a().file(path),
+            1 => self.world.b().file(path),
+            _ => self.world.remote_file(path),
+        };
+        // Line by line, so that a heading or a blank line is a line too:
+        // the moved item has to be next to its target, nothing between.
+        String::from_utf8(bytes.unwrap_or_default())
+            .unwrap()
+            .lines()
+            .map(|line| match parse(prefix, line.as_bytes()).first() {
+                Some(Line::Item { id, .. }) => *id,
+                Some(Line::Text { .. }) | None => None,
+            })
+            .collect()
+    }
+
+    /// A `move` run: what it printed, and the item next to its target in
+    /// the place it wrote to (directly: the trace writes no indented lines),
+    /// which puts a chore into the target's group; refused only for an id
+    /// that is not there.
+    fn judge_move(
+        &mut self,
+        who: Who,
+        run: &Run,
+        pushed: bool,
+        (item, after, target): (Id, bool, Id),
+        (fault, window): (Option<&Fault>, bool),
+    ) -> Result<(), TestCaseError> {
+        let side = if after { "after" } else { "before" };
+        match run.code {
+            Some(0) => {
+                prop_assert_eq!(
+                    &run.stdout,
+                    &format!(
+                        "moved {}{} {side} {}{}\n",
+                        item.0, item.1, target.0, target.1
+                    )
+                );
+                self.depth.items_moved += 1;
+                if !pushed {
+                    self.depth.moves_not_pushed += 1;
+                }
+                // Where the move was the last change: the remote when
+                // pushed, else the clone. Not for a run in a window, which
+                // the step's own command comes after, nor where a file saved
+                // during a push that failed was merged in after the move.
+                let saved_after = !pushed && matches!(fault, Some(Fault::WindowEdit(_)));
+                if !window && !saved_after {
+                    let place = if pushed { 2 } else { who.slot() };
+                    let order = self.order(place, item.0);
+                    let at = |id: Id| order.iter().position(|line| *line == Some(id));
+                    let next_to = match (at(item), at(target)) {
+                        (Some(i), Some(t)) if after => i == t + 1,
+                        (Some(i), Some(t)) => i + 1 == t,
+                        _ => false,
+                    };
+                    prop_assert!(
+                        next_to,
+                        "{:?} is not {} {:?} in place {}: {:?} after {:?}",
+                        item,
+                        side,
+                        target,
+                        place,
+                        order,
+                        run
+                    );
+                }
+            }
+            Some(1) => {
+                let last = run.stderr.lines().last().unwrap_or_default();
+                prop_assert!(
+                    last.starts_with(&format!("board: move {}{}: ", item.0, item.1))
+                        && (last.ends_with("no such chore")
+                            || last.ends_with("no such backlog item")),
+                    "{:?}",
+                    run
+                );
+                let here = self.ids_in(who.slot(), item.0);
+                prop_assert!(
+                    !here.contains(&item.1) || !here.contains(&target.1),
+                    "move refused with {:?} and {:?} in {:?}: {:?}",
+                    item,
+                    target,
+                    who,
+                    run
+                );
+            }
+            // Killed: moved or not; a move closes nothing.
+            Some(_) | None => {}
         }
         Ok(())
     }
@@ -2204,6 +2391,10 @@ fn the_traces_get_deep() {
     assert!(depth.briefs_reported > 0, "{depth:?}");
     assert!(depth.briefs_filed > 0, "{depth:?}");
     assert!(depth.closed_by_file > 0, "{depth:?}");
+    // An offline move needs two items on a clone that is offline, which the
+    // fixed seed does not bring about: `a_move_made_offline_meets_the_remote_s`
+    // has it.
+    assert!(depth.items_moved > 0, "{depth:?}");
     assert!(
         depth.succeeded * 10 >= depth.commands * 6,
         "fewer than 60% of the commands succeeded: {depth:?}"
@@ -2334,4 +2525,46 @@ fn next_after_a_queue_whose_brief_was_saved_during_the_push() {
         },
     ]);
     assert!(depth.briefs_queued > 0, "{depth:?}");
+}
+
+/// `move` on a clone that is offline, both lists, a chore into the other
+/// group; meanwhile the other clone adds an item and moves the same chore.
+/// The moves wait on the clone and meet the remote's changes at the sync.
+#[test]
+fn a_move_made_offline_meets_the_remote_s() {
+    let cmd = |who, op| Step::Cmd {
+        who,
+        op,
+        fault: None,
+    };
+    let moving = |backlog, after| Op::Move {
+        backlog,
+        item: first(),
+        target: first(),
+        after,
+    };
+    let depth = run_example(&[
+        cmd(Who::A, Op::AddBacklog),
+        cmd(Who::A, Op::AddBacklog),
+        cmd(Who::A, Op::AddChore { group: true }),
+        cmd(Who::A, Op::AddChore { group: false }),
+        Step::Sync { who: Who::B },
+        Step::Net {
+            who: Who::A,
+            online: false,
+        },
+        // b1 after b2; c1 after c2, out of Home into Work.
+        cmd(Who::A, moving(true, true)),
+        cmd(Who::A, moving(false, true)),
+        cmd(Who::B, Op::AddBacklog),
+        // c1 before c2: into Work as well, above it.
+        cmd(Who::B, moving(false, false)),
+        Step::Net {
+            who: Who::A,
+            online: true,
+        },
+    ]);
+    assert!(depth.moves_not_pushed >= 2, "{depth:?}");
+    assert!(depth.items_moved >= 3, "{depth:?}");
+    assert!(depth.merged_by_line > 0, "{depth:?}");
 }

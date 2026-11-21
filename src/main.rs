@@ -5,9 +5,9 @@ use std::process::ExitCode;
 
 use board::{
     BacklogId, Board, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit, ItemId,
-    Line, ListKind, ListRow, NewChore, Slug, Snapshot, Status, Text,
+    Line, ListId, ListKind, ListRow, Move, NewChore, Side, Slug, Snapshot, Status, Text,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// A file-based board for a planner/worker pair of coding agents and their
 /// user. Without a command: the board.
@@ -97,6 +97,14 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<BacklogId>,
     },
+    /// Put a chore or a backlog item before or after another item of its
+    /// list; a chore goes into the group of that item
+    Move {
+        /// Like c12 or b41
+        id: ListId,
+        #[command(flatten)]
+        place: Place,
+    },
     /// Bring the board-data clone and the remote to the same commit
     Sync,
 }
@@ -132,6 +140,31 @@ enum AddItem {
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
     },
+}
+
+/// Where `move` puts the item: exactly one of the two.
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct Place {
+    /// Directly above this item
+    #[arg(long, value_name = "ID")]
+    before: Option<ListId>,
+    /// Directly below this item and the indented lines under it
+    #[arg(long, value_name = "ID")]
+    after: Option<ListId>,
+}
+
+impl Place {
+    /// Two ids that make no move are wrong whatever the files hold, so they
+    /// are a usage error like `done b41`, before the board is read.
+    fn of(self, item: ListId) -> Result<Move, Error> {
+        let (side, target) = match (self.before, self.after) {
+            (Some(target), None) => (Side::Before, target),
+            (None, Some(target)) => (Side::After, target),
+            _ => unreachable!("clap takes exactly one of --before and --after"),
+        };
+        Move::new(item, side, target).map_err(|why| Error::Usage(format!("move {item}: {why}")))
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -255,6 +288,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         }) => Run::AddBacklog(text, from),
         Some(Command::Done { ids }) => Run::Done(ids),
         Some(Command::Drop { ids }) => Run::Drop(ids),
+        Some(Command::Move { id, place }) => Run::Move(place.of(id)?),
         Some(Command::Sync) => Run::Sync,
     };
     // A note is written as it comes, before the command goes on: `waiting
@@ -288,6 +322,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Run::AddBacklog(text, from) => line(board.add_backlog(&text, from)?.to_string()),
         Run::Done(ids) => line(board.done(&ids)?),
         Run::Drop(ids) => line(board.drop_items(&ids)?),
+        Run::Move(wanted) => line(board.move_item(&wanted)?),
         Run::Sync => {
             board.sync()?;
             line("synced".to_owned())
@@ -323,6 +358,7 @@ enum Run {
     AddBacklog(Line, Option<ItemId>),
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
+    Move(Move),
     Sync,
 }
 

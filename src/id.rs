@@ -187,11 +187,60 @@ impl FromStr for ItemId {
     }
 }
 
+/// A chore's or a backlog item's id, where a command takes either but no
+/// brief (`move`: briefs have no order of their own, the board ranks them by
+/// status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ListId {
+    Chore(ChoreId),
+    Backlog(BacklogId),
+}
+
+impl ListId {
+    pub const fn kind(self) -> ListKind {
+        match self {
+            ListId::Chore(_) => ListKind::Chores,
+            ListId::Backlog(_) => ListKind::Backlog,
+        }
+    }
+
+    pub const fn get(self) -> u32 {
+        match self {
+            ListId::Chore(id) => id.get(),
+            ListId::Backlog(id) => id.get(),
+        }
+    }
+}
+
+impl fmt::Display for ListId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ListId::Chore(id) => id.fmt(f),
+            ListId::Backlog(id) => id.fmt(f),
+        }
+    }
+}
+
+impl FromStr for ListId {
+    type Err = InvalidId;
+
+    fn from_str(s: &str) -> Result<ListId, InvalidId> {
+        if let Ok(id) = s.parse() {
+            Ok(ListId::Chore(id))
+        } else if let Ok(id) = s.parse() {
+            Ok(ListId::Backlog(id))
+        } else {
+            Err(InvalidId::new(s, Wanted::ListItem))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wanted {
     Brief,
     Chore,
     Backlog,
+    ListItem,
     Item,
 }
 
@@ -217,6 +266,7 @@ impl fmt::Display for InvalidId {
             Wanted::Brief => "a brief number like 128",
             Wanted::Chore => "a chore id like c12",
             Wanted::Backlog => "a backlog id like b41",
+            Wanted::ListItem => "a chore or backlog id like c12 or b41",
             Wanted::Item => "an id like 128, c12 or b41",
         };
         write!(f, "`{}` is not {wanted}", self.word)
@@ -286,6 +336,25 @@ mod tests {
             "c012".parse::<ItemId>().unwrap_err().to_string(),
             "`c012` is not an id like 128, c12 or b41"
         );
+        assert_eq!(
+            "128".parse::<ListId>().unwrap_err().to_string(),
+            "`128` is not a chore or backlog id like c12 or b41"
+        );
+    }
+
+    #[test]
+    fn a_list_id_is_a_chore_or_a_backlog_id() {
+        let c12 = "c12".parse::<ListId>().unwrap();
+        let b41 = "b41".parse::<ListId>().unwrap();
+        assert_eq!((c12.kind(), c12.get()), (ListKind::Chores, 12));
+        assert_eq!((b41.kind(), b41.get()), (ListKind::Backlog, 41));
+        assert_eq!(
+            (c12.to_string(), b41.to_string()),
+            ("c12".into(), "b41".into())
+        );
+        for not_one in ["", "12", "c0", "c012", "x1"] {
+            assert!(not_one.parse::<ListId>().is_err(), "{not_one}");
+        }
     }
 
     #[test]
@@ -307,6 +376,15 @@ mod tests {
         #[test]
         fn an_id_reads_back_as_printed(id in any_item_id()) {
             prop_assert_eq!(id.to_string().parse(), Ok(id));
+            match id {
+                ItemId::Brief(_) => prop_assert!(id.to_string().parse::<ListId>().is_err()),
+                ItemId::Chore(chore) => {
+                    prop_assert_eq!(id.to_string().parse(), Ok(ListId::Chore(chore)));
+                }
+                ItemId::Backlog(backlog) => {
+                    prop_assert_eq!(id.to_string().parse(), Ok(ListId::Backlog(backlog)));
+                }
+            }
         }
 
         /// One spelling per list id, so a search for the printed id finds

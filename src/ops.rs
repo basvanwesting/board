@@ -13,7 +13,7 @@ use crate::brief::{
 use crate::error::Error;
 use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
-use crate::list::{FindError, Line, NoCheck, RemoveError};
+use crate::list::{FindError, Line, Move, MoveError, NoCheck, RemoveError};
 use crate::project::{BoardPath, BriefFile, BriefName, Project, Slug};
 
 /// The sections a brief needs text in before it is queued: what the worker
@@ -431,6 +431,30 @@ pub(crate) fn drop_items(project: &mut Project, ids: &[BacklogId]) -> Result<Str
     remove(project, ListKind::Backlog, &numbers, ("drop", "dropped"))
 }
 
+/// Moves an item next to another of its list; gives what `move` prints, as
+/// `moved c12 before c3`.
+///
+/// An item already where it is asked to be changes no file, so the write
+/// makes no commit and the output is the same: what was asked is so.
+pub(crate) fn move_item(project: &mut Project, wanted: &Move) -> Result<String, Error> {
+    let kind = wanted.kind();
+    let refused = |why: String| Error::Refused(format!("move {}: {why}", wanted.item()));
+    let mut list = project.list(kind).clone();
+    list.move_item(wanted).map_err(|error| match error {
+        MoveError::Item(why) => refused(not_one(kind, wanted.item().get(), why)),
+        MoveError::Target(why) => refused(format!(
+            "{} {}: {}",
+            wanted.side(),
+            wanted.target(),
+            not_one(kind, wanted.target().get(), why)
+        )),
+    })?;
+    if list != *project.list(kind) {
+        *project.list_mut(kind) = list;
+    }
+    Ok(format!("moved {wanted}"))
+}
+
 /// `(command, past)`: the command names a refusal, the past tense what was
 /// done.
 fn remove(
@@ -576,6 +600,81 @@ mod tests {
         );
         assert_eq!(shop.backlog.to_bytes(), b"- b7 Dark mode\n");
         assert_eq!(changed(&shop), ["shop/chores.md", "shop/backlog.md"]);
+    }
+
+    fn moving(item: &str, side: crate::list::Side, target: &str) -> Move {
+        Move::new(item.parse().unwrap(), side, target.parse().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn move_puts_a_chore_into_the_group_of_the_item_it_goes_next_to() {
+        use crate::list::Side::{After, Before};
+        let chores = "## Home\n- c1 a. Check: x\n- c2 b. Check: x\n## Work\n- c3 c. Check: x\n";
+        let mut shop = project(chores, "");
+        assert_eq!(
+            move_item(&mut shop, &moving("c1", After, "c3")).unwrap(),
+            "moved c1 after c3"
+        );
+        assert_eq!(
+            shop.chores.to_bytes(),
+            b"## Home\n- c2 b. Check: x\n## Work\n- c3 c. Check: x\n- c1 a. Check: x\n"
+        );
+        assert_eq!(changed(&shop), ["shop/chores.md"]);
+
+        let mut shop = project(chores, "");
+        move_item(&mut shop, &moving("c3", Before, "c2")).unwrap();
+        assert_eq!(
+            shop.chores.to_bytes(),
+            b"## Home\n- c1 a. Check: x\n- c3 c. Check: x\n- c2 b. Check: x\n## Work\n"
+        );
+    }
+
+    #[test]
+    fn a_move_to_where_the_item_is_changes_no_file() {
+        use crate::list::Side::{After, Before};
+        let mut shop = project("", "- b1 a\n- b2 b\n");
+        assert_eq!(
+            move_item(&mut shop, &moving("b2", After, "b1")).unwrap(),
+            "moved b2 after b1"
+        );
+        move_item(&mut shop, &moving("b1", Before, "b2")).unwrap();
+        assert_eq!(shop.backlog.to_bytes(), b"- b1 a\n- b2 b\n");
+        assert_eq!(changed(&shop), Vec::<String>::new());
+    }
+
+    #[test]
+    fn move_refuses_an_id_that_names_no_single_item() {
+        use crate::list::Side::{After, Before};
+        let backlog_bytes = "- b1 a\n- b2 b\n- b2 again\n";
+        let mut shop = project("", backlog_bytes);
+        let mut refused_move = |item: &str, side, target: &str| {
+            refusal(move_item(&mut shop, &moving(item, side, target)))
+        };
+        assert_eq!(
+            refused_move("b9", Before, "b1"),
+            "move b9: no such backlog item"
+        );
+        assert_eq!(
+            refused_move("b1", After, "b9"),
+            "move b1: after b9: no such backlog item"
+        );
+        assert_eq!(
+            refused_move("b2", Before, "b1"),
+            "move b2: b2 is on 2 lines; fix the duplicate first"
+        );
+        assert_eq!(
+            refused_move("b1", Before, "b2"),
+            "move b1: before b2: b2 is on 2 lines; fix the duplicate first"
+        );
+        assert_eq!(
+            refusal(move_item(
+                &mut project("- c1 a. Check: x\n", ""),
+                &moving("c1", Before, "c2")
+            )),
+            "move c1: before c2: no such chore"
+        );
+        assert_eq!(shop.backlog.to_bytes(), backlog_bytes.as_bytes());
+        assert_eq!(changed(&shop), Vec::<String>::new());
     }
 
     // ---- briefs ----

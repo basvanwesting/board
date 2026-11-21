@@ -105,6 +105,137 @@ fn done_and_drop_delete_lines_all_or_nothing() {
 }
 
 #[test]
+fn move_puts_an_item_next_to_another_in_one_commit() {
+    let world = World::new();
+    let a = world.a();
+    for item in ["one", "two", "three"] {
+        a.board(&["add", "backlog", item]).ok();
+    }
+    for (chore, group) in [("x", "Home"), ("y", "Home"), ("z", "Work")] {
+        a.board(&["add", "chore", chore, "--group", group, "--check", "seen"])
+            .ok();
+    }
+    assert_eq!(
+        a.board(&["move", "b3", "--before", "b1"]).ok(),
+        "moved b3 before b1\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b3 three\n- b1 one\n- b2 two\n"
+    );
+    // A chore goes into the group of the item it is put next to.
+    assert_eq!(
+        a.board(&["move", "c1", "--after", "c3"]).ok(),
+        "moved c1 after c3\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "## Home\n- c2 y. Check: seen\n\n## Work\n- c3 z. Check: seen\n- c1 x. Check: seen\n"
+    );
+    assert_eq!(world.remote_log()[..2], ["proj: move c1", "proj: move b3"]);
+    in_step(&world, &a);
+
+    // Where it is already: said so, and no commit.
+    let log = world.remote_log();
+    assert_eq!(
+        a.board(&["move", "b1", "--after", "b3"]).ok(),
+        "moved b1 after b3\n"
+    );
+    assert_eq!(world.remote_log(), log);
+    in_step(&world, &a);
+}
+
+#[test]
+fn move_refuses_ids_that_name_no_single_item() {
+    let world = World::new();
+    let a = world.a();
+    a.write("proj/backlog.md", "- b1 one\n- b2 two\n- b5 x\n- b5 y\n");
+    a.commit_and_push("by hand");
+    let log = world.remote_log();
+    assert_eq!(
+        a.board(&["move", "b9", "--before", "b1"]).failed(1),
+        "board: lint: proj/backlog.md:4: duplicate id b5, first on line 3; delete the id on one \
+         of the lines and that line gets a new one\n\
+         board: move b9: no such backlog item\n"
+    );
+    let target = a.board(&["move", "b1", "--after", "b9"]).failed(1);
+    assert!(
+        target.ends_with("board: move b1: after b9: no such backlog item\n"),
+        "{target}"
+    );
+    let twice = a.board(&["move", "b1", "--before", "b5"]).failed(1);
+    assert!(
+        twice.ends_with("board: move b1: before b5: b5 is on 2 lines; fix the duplicate first\n"),
+        "{twice}"
+    );
+    assert_eq!(world.remote_log(), log);
+}
+
+/// Wrong whatever the files hold: told before the board is read.
+#[test]
+fn a_move_the_command_line_rules_out_is_a_usage_error() {
+    let world = World::new();
+    let a = world.a();
+    assert_eq!(
+        a.board(&["move", "c1", "--before", "b1"]).failed(2),
+        "board: move c1: c1 is a chore and b1 a backlog item; an item moves within its own list\n"
+    );
+    assert_eq!(
+        a.board(&["move", "b1", "--after", "b1"]).failed(2),
+        "board: move b1: b1 cannot go next to itself\n"
+    );
+    let brief = a.board(&["move", "128", "--before", "b1"]).failed(2);
+    assert!(
+        brief.starts_with(
+            "board: invalid value '128' for '<ID>': `128` is not a chore or backlog id like c12 or b41"
+        ),
+        "{brief}"
+    );
+    for args in [
+        &["move", "b1"][..],
+        &["move", "b1", "--before", "b2", "--after", "b3"],
+        &["move", "--before", "b2"],
+        &["move", "b1", "--after", "c012"],
+    ] {
+        let said = a.board(args).failed(2);
+        assert!(said.starts_with("board: "), "{args:?}: {said}");
+    }
+    assert_eq!(world.remote_log(), ["start"]);
+}
+
+/// A move allocates no id: offline it is committed on the clone, and the
+/// next write that reaches the remote pushes it.
+#[test]
+fn offline_a_move_waits_on_the_clone() {
+    let world = World::new();
+    let a = world.a();
+    for item in ["one", "two"] {
+        a.board(&["add", "backlog", item]).ok();
+    }
+    a.set_online(false);
+    let ran = a.board(&["move", "b2", "--before", "b1"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice()),
+        (0, &b"moved b2 before b1\n"[..])
+    );
+    assert!(
+        ran.stderr
+            .starts_with("board: not pushed: 1 commit (fatal: "),
+        "{ran:?}"
+    );
+    assert_eq!(text(a.file("proj/backlog.md")), "- b2 two\n- b1 one\n");
+    assert_eq!(world.remote_log()[0], "proj: add b2");
+    a.set_online(true);
+    a.board(&["sync"]).ok();
+    assert_eq!(world.remote_log()[0], "proj: move b2");
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b2 two\n- b1 one\n"
+    );
+    in_step(&world, &a);
+}
+
+#[test]
 fn an_id_on_two_lines_is_refused() {
     let world = World::new();
     let a = world.a();

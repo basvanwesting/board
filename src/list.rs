@@ -1,4 +1,5 @@
-//! `chores.md` and `backlog.md`: a lossless parse and the three edits.
+//! `chores.md` and `backlog.md`: a lossless parse and the edits of the
+//! commands (add, remove, move, assign ids).
 //!
 //! ```text
 //! line    = heading | item | text
@@ -12,7 +13,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
-use crate::id::{BacklogId, ChoreId, ItemId, ListKind};
+use crate::id::{BacklogId, ChoreId, ItemId, ListId, ListKind};
 use crate::raw;
 
 /// What one line of a list file is. `content` is the line without its
@@ -79,7 +80,7 @@ fn without_source(check: &[u8]) -> &[u8] {
 }
 
 /// A line continues the item above it when it is indented and not blank.
-fn is_continuation(content: &[u8]) -> bool {
+pub(crate) fn is_continuation(content: &[u8]) -> bool {
     matches!(content.first(), Some(b' ' | b'\t')) && !raw::is_blank(content)
 }
 
@@ -165,6 +166,101 @@ pub struct IdsExhausted;
 /// reads as the `--from` suffix, or it ends in `Check:`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoCheck;
+
+/// Which side of the other item `move` puts an item on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Before,
+    After,
+}
+
+impl fmt::Display for Side {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Side::Before => "before",
+            Side::After => "after",
+        })
+    }
+}
+
+/// What `move` is asked: an item, and the other item of its list it goes
+/// next to. Two items of one list, so no file can be asked to hold an item
+/// of the other and no item is put next to itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Move {
+    item: ListId,
+    side: Side,
+    target: ListId,
+}
+
+impl Move {
+    pub fn new(item: ListId, side: Side, target: ListId) -> Result<Move, BadMove> {
+        if item.kind() != target.kind() {
+            Err(BadMove::OtherList { item, target })
+        } else if item == target {
+            Err(BadMove::Itself(item))
+        } else {
+            Ok(Move { item, side, target })
+        }
+    }
+
+    pub fn kind(&self) -> ListKind {
+        self.item.kind()
+    }
+
+    pub fn item(&self) -> ListId {
+        self.item
+    }
+
+    pub fn side(&self) -> Side {
+        self.side
+    }
+
+    pub fn target(&self) -> ListId {
+        self.target
+    }
+}
+
+/// As `move` prints it: `c12 before c3`.
+impl fmt::Display for Move {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} {}", self.item, self.side, self.target)
+    }
+}
+
+/// Why two ids make no [`Move`], whatever the files hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadMove {
+    OtherList { item: ListId, target: ListId },
+    Itself(ListId),
+}
+
+impl fmt::Display for BadMove {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = |id: &ListId| match id.kind() {
+            ListKind::Chores => "a chore",
+            ListKind::Backlog => "a backlog item",
+        };
+        match self {
+            BadMove::OtherList { item, target } => write!(
+                f,
+                "{item} is {} and {target} {}; an item moves within its own list",
+                what(item),
+                what(target)
+            ),
+            BadMove::Itself(item) => write!(f, "{item} cannot go next to itself"),
+        }
+    }
+}
+
+impl std::error::Error for BadMove {}
+
+/// The id of a [`Move`] that does not name one item; nothing was moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveError {
+    Item(FindError),
+    Target(FindError),
+}
 
 /// A list file as its lines, each with its bytes as read.
 ///
@@ -395,6 +491,57 @@ impl ListFile {
         for index in indexes.into_iter().rev() {
             self.lines.remove(index);
         }
+        Ok(())
+    }
+
+    /// Puts the item directly before the target's line, or directly after
+    /// the target and the indented lines that continue it, so it never comes
+    /// between an item and its continuation. In a chores file it is then in
+    /// the target's group: no heading is between the two.
+    ///
+    /// The item's continuation lines go with it. `remove` leaves them, as
+    /// text the tool does not own and that is kept either way; left behind
+    /// by a move they would continue whichever item ends up above them, and
+    /// the move would change what that item says. The merge of a sync keeps
+    /// them under the item as well (`merge::reconcile`).
+    ///
+    /// Nothing else changes, except that a line without a terminator (the
+    /// file's last) gets one when a line comes after it. An item that is
+    /// where it is asked to be is left as it is.
+    ///
+    /// # Panics
+    ///
+    /// When the move is not of this file's list.
+    pub fn move_item(&mut self, wanted: &Move) -> Result<(), MoveError> {
+        assert_eq!(self.kind, wanted.kind(), "an item moves within its list");
+        let (from, _) = self.item(wanted.item.get()).map_err(MoveError::Item)?;
+        let (target, _) = self.item(wanted.target.get()).map_err(MoveError::Target)?;
+        let end = self.after_item(from);
+        let at = match wanted.side {
+            Side::Before => target,
+            Side::After => self.after_item(target),
+        };
+        // The target is an item, not a continuation, so `at` is never inside
+        // the block: at its edges the block is in place already.
+        if at == from || at == end {
+            return Ok(());
+        }
+        let terminator = raw::terminator_of(self.lines.first().map(Vec::as_slice));
+        let mut block: Vec<Vec<u8>> = self.lines.drain(from..end).collect();
+        let at = if at > from { at - block.len() } else { at };
+        // The block was at the end and is no longer: a line follows it.
+        if let Some(last) = block.last_mut()
+            && !last.ends_with(b"\n")
+        {
+            last.extend_from_slice(terminator);
+        }
+        if at == self.lines.len()
+            && let Some(last) = self.lines.last_mut()
+            && !last.ends_with(b"\n")
+        {
+            last.extend_from_slice(terminator);
+        }
+        self.lines.splice(at..at, block);
         Ok(())
     }
 
@@ -804,6 +951,111 @@ mod tests {
         assert_eq!(written(&file), "- c2 two\n- c2 two again\n");
     }
 
+    // ---- move ----
+
+    fn list_id(kind: ListKind, number: u32) -> ListId {
+        match kind {
+            ListKind::Chores => ListId::Chore(chore_id(number)),
+            ListKind::Backlog => ListId::Backlog(backlog_id(number)),
+        }
+    }
+
+    fn moving(kind: ListKind, item: u32, side: Side, target: u32) -> Move {
+        Move::new(list_id(kind, item), side, list_id(kind, target)).unwrap()
+    }
+
+    #[test]
+    fn two_ids_make_a_move_when_they_are_two_items_of_one_list() {
+        let (c1, c2, b1) = (list_id(CHORES, 1), list_id(CHORES, 2), list_id(BACKLOG, 1));
+        assert!(Move::new(c1, Side::Before, c2).is_ok());
+        let other = Move::new(c1, Side::After, b1).unwrap_err();
+        assert_eq!(
+            other,
+            BadMove::OtherList {
+                item: c1,
+                target: b1
+            }
+        );
+        assert_eq!(
+            other.to_string(),
+            "c1 is a chore and b1 a backlog item; an item moves within its own list"
+        );
+        let itself = Move::new(b1, Side::Before, b1).unwrap_err();
+        assert_eq!(itself.to_string(), "b1 cannot go next to itself");
+        assert_eq!(
+            moving(BACKLOG, 3, Side::After, 1).to_string(),
+            "b3 after b1"
+        );
+    }
+
+    #[test]
+    fn a_moved_item_takes_its_continuation_and_skips_the_target_s() {
+        let before = "## Home\n- c1 one\n  about one\n- c2 two\n  about two\n\tand more\n\nnotes\n";
+        let mut file = chores(before);
+        file.move_item(&moving(CHORES, 1, Side::After, 2)).unwrap();
+        assert_eq!(
+            written(&file),
+            "## Home\n- c2 two\n  about two\n\tand more\n- c1 one\n  about one\n\nnotes\n"
+        );
+        file.move_item(&moving(CHORES, 1, Side::Before, 2)).unwrap();
+        assert_eq!(written(&file), before);
+    }
+
+    #[test]
+    fn a_line_without_a_terminator_gets_one_when_a_line_follows_it() {
+        let mut file = backlog("- b1 one\r\n- b2 two\r\n- b3 three");
+        file.move_item(&moving(BACKLOG, 3, Side::Before, 1))
+            .unwrap();
+        assert_eq!(written(&file), "- b3 three\r\n- b1 one\r\n- b2 two\r\n");
+
+        let mut file = backlog("- b1 one\n- b2 two");
+        file.move_item(&moving(BACKLOG, 1, Side::After, 2)).unwrap();
+        assert_eq!(written(&file), "- b2 two\n- b1 one\n");
+    }
+
+    #[test]
+    fn an_item_where_it_is_asked_to_be_stays() {
+        let before = "- b1 one\n  more\n- b2 two\n- b3 three";
+        for wanted in [
+            moving(BACKLOG, 2, Side::After, 1),
+            moving(BACKLOG, 1, Side::Before, 2),
+            moving(BACKLOG, 3, Side::After, 2),
+        ] {
+            let mut file = backlog(before);
+            file.move_item(&wanted).unwrap();
+            assert_eq!(written(&file), before, "{wanted}");
+        }
+    }
+
+    #[test]
+    fn move_is_refused_for_an_id_on_no_line_or_on_two() {
+        let before = "- c1 a\n- c2 b\n- c2 c\n";
+        let mut file = chores(before);
+        assert_eq!(
+            file.move_item(&moving(CHORES, 9, Side::Before, 1)),
+            Err(MoveError::Item(FindError::Missing))
+        );
+        assert_eq!(
+            file.move_item(&moving(CHORES, 2, Side::Before, 1)),
+            Err(MoveError::Item(FindError::Duplicate(2)))
+        );
+        assert_eq!(
+            file.move_item(&moving(CHORES, 1, Side::After, 9)),
+            Err(MoveError::Target(FindError::Missing))
+        );
+        assert_eq!(
+            file.move_item(&moving(CHORES, 1, Side::After, 2)),
+            Err(MoveError::Target(FindError::Duplicate(2)))
+        );
+        assert_eq!(written(&file), before);
+    }
+
+    #[test]
+    #[should_panic(expected = "an item moves within its list")]
+    fn a_chore_is_not_moved_in_the_backlog() {
+        let _ = backlog("- b1 a\n- b2 b\n").move_item(&moving(CHORES, 1, Side::Before, 2));
+    }
+
     // ---- assign ids ----
 
     #[test]
@@ -869,13 +1121,27 @@ mod tests {
     /// A list file as bytes: mostly `\n`, sometimes `\r\n`, mixed now and
     /// then, with or without a terminator on the last line.
     fn file_bytes() -> impl Strategy<Value = Vec<u8>> {
+        file_of(content())
+    }
+
+    /// A list file for `move`: more indented lines below items, as the move
+    /// has to place an item's block whole and past the target's.
+    fn move_file_bytes() -> impl Strategy<Value = Vec<u8>> {
+        file_of(prop_oneof![
+            2 => content(),
+            1 => "[a-z]{1,6}".prop_map(|w| format!("  {w}")),
+        ])
+    }
+
+    /// Lines from `line`, joined as [`file_bytes`] says.
+    fn file_of(line: impl Strategy<Value = String>) -> impl Strategy<Value = Vec<u8>> {
         let terminator = prop_oneof![
             8 => Just(["\n", "\n"]),
             2 => Just(["\r\n", "\r\n"]),
             1 => Just(["\n", "\r\n"]),
         ];
         (
-            prop::collection::vec((content(), any::<bool>()), 0..12),
+            prop::collection::vec((line, any::<bool>()), 0..12),
             terminator,
             any::<bool>(),
         )
@@ -1133,6 +1399,91 @@ mod tests {
         Ok(())
     }
 
+    /// The heading above a line, by index; `None` above the first.
+    fn group_of(lines: &[Vec<u8>], at: usize) -> Option<usize> {
+        lines[..at].iter().rposition(|line| is_heading(line))
+    }
+
+    /// Move locality: the item's line and the indented lines below it are
+    /// taken out and put in whole at one place, directly before the target or
+    /// directly after the target and its indented lines, and every other line
+    /// keeps its bytes and its order. The only byte that changes is a
+    /// terminator, given to the one line that had none (the last) when it is
+    /// no longer last; the new terminator is the first line's.
+    fn check_move(
+        kind: ListKind,
+        bytes: &[u8],
+        (item, side, target): (u32, Side, u32),
+    ) -> Result<(), TestCaseError> {
+        let mut file = ListFile::parse(kind, bytes);
+        let old = raw_lines(bytes);
+        let why = |number: u32| match old
+            .iter()
+            .filter(|line| id_of(kind, line) == Some(number))
+            .count()
+        {
+            0 => Some(FindError::Missing),
+            1 => None,
+            lines => Some(FindError::Duplicate(lines)),
+        };
+        let result = file.move_item(&moving(kind, item, side, target));
+        let refusal = why(item)
+            .map(MoveError::Item)
+            .or_else(|| why(target).map(MoveError::Target));
+        if let Some(refusal) = refusal {
+            prop_assert_eq!(result, Err(refusal));
+            prop_assert_eq!(file.to_bytes(), bytes);
+            return Ok(());
+        }
+        prop_assert_eq!(result, Ok(()));
+        let new = raw_lines(&file.to_bytes());
+        prop_assert_eq!(new.len(), old.len());
+
+        let line_of = |lines: &[Vec<u8>], number: u32| {
+            lines
+                .iter()
+                .position(|line| id_of(kind, line) == Some(number))
+                .unwrap()
+        };
+        let from = line_of(&old, item);
+        let len = 1 + old[from + 1..]
+            .iter()
+            .take_while(|line| is_continuation(content_of(line)))
+            .count();
+        let at = line_of(&new, item);
+        // The old line each new line is: the block taken out and put in.
+        let mut order: Vec<usize> = (0..old.len()).collect();
+        let block: Vec<usize> = order.drain(from..from + len).collect();
+        order.splice(at..at, block);
+        let terminator = file_terminator(&old);
+        for (index, was) in order.iter().enumerate() {
+            let mut expected = old[*was].clone();
+            if !expected.ends_with(b"\n") && index + 1 < new.len() {
+                expected.extend_from_slice(terminator);
+            }
+            prop_assert_eq!(&new[index], &expected, "line {}", index + 1);
+        }
+
+        let next_to = line_of(&new, target);
+        match side {
+            Side::Before => prop_assert_eq!(at + len, next_to),
+            Side::After => {
+                prop_assert!(next_to < at);
+                prop_assert!(
+                    new[next_to + 1..at]
+                        .iter()
+                        .all(|line| is_continuation(content_of(line)))
+                );
+                prop_assert!(
+                    !new.get(at + len)
+                        .is_some_and(|line| is_continuation(content_of(line)))
+                );
+            }
+        }
+        prop_assert_eq!(group_of(&new, at), group_of(&new, next_to));
+        Ok(())
+    }
+
     fn check_assign_ids(kind: ListKind, bytes: &[u8], mark: u32) -> Result<(), TestCaseError> {
         let mut file = ListFile::parse(kind, bytes);
         let highest = file.max_id().max(mark);
@@ -1231,6 +1582,55 @@ mod tests {
             mark in 0..20u32,
         ) {
             check_assign_ids(kind, &bytes, mark)?;
+        }
+    }
+
+    proptest! {
+        // A line without a terminator moved, or moved after, needs the
+        // file's last line to be the item's or the target's: a few cases in
+        // a thousand. At 256 cases a broken terminator rule passed half the
+        // runs; at this count it fails every run of 20.
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        #[test]
+        fn move_puts_the_item_s_lines_next_to_the_target_and_touches_nothing_else(
+            kind in kind(),
+            bytes in move_file_bytes(),
+            picks in (
+                prop::option::weighted(0.75, any::<prop::sample::Index>()),
+                prop::option::weighted(0.75, any::<prop::sample::Index>()),
+                1..14u32,
+            ),
+            any_count in prop::bool::weighted(0.2),
+            before in any::<bool>(),
+        ) {
+            // Mostly two ids on one line each, the moves that go through;
+            // now and then ids on any number of lines, or one that no line
+            // has (13). `None` picks the last item, as often the file's last
+            // line: a line without a terminator, moved or moved after.
+            let ids: Vec<u32> = raw_lines(&bytes).iter().filter_map(|l| id_of(kind, l)).collect();
+            let once: Vec<u32> = ids
+                .iter()
+                .filter(|n| ids.iter().filter(|m| m == n).count() == 1)
+                .copied()
+                .collect();
+            let pool = if once.len() >= 2 && !any_count { &once } else { &ids };
+            let (item, target, other) = picks;
+            let pick = |index: Option<prop::sample::Index>| match (index, pool.last()) {
+                (_, None) => other,
+                (Some(index), Some(_)) => *index.get(pool),
+                (None, Some(last)) => *last,
+            };
+            let (item, target) = (pick(item), if other > 12 { other } else { pick(target) });
+            let side = if before { Side::Before } else { Side::After };
+            if item == target {
+                prop_assert_eq!(
+                    Move::new(list_id(kind, item), side, list_id(kind, target)),
+                    Err(BadMove::Itself(list_id(kind, item)))
+                );
+            } else {
+                check_move(kind, &bytes, (item, side, target))?;
+            }
         }
     }
 }

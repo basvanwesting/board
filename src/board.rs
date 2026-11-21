@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::git::{Failure, Git, Oid};
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
 use crate::lint::{Finding, lint};
-use crate::list::{Entry, Line, ListFile};
+use crate::list::{Entry, Line, ListFile, Move};
 use crate::ops::{self, Commits, Filed, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Note};
@@ -118,6 +118,16 @@ impl Board {
         self.command("drop", &|tx| {
             let dropped = ops::drop_items(&mut tx.project, ids)?;
             Ok((dropped.clone(), dropped))
+        })
+    }
+
+    /// Moves an item next to another of its list; gives what it did, as
+    /// `moved c12 before c3`. Allocates nothing, so it works offline like
+    /// `done`.
+    pub fn move_item(&self, wanted: &Move) -> Result<String, Error> {
+        self.command("move", &|tx| {
+            let moved = ops::move_item(&mut tx.project, wanted)?;
+            Ok((moved, format!("move {}", wanted.item())))
         })
     }
 
