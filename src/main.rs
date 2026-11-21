@@ -300,7 +300,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
     let line = |text: String| Ok((format!("{text}\n").into_bytes(), Exit::Ok));
     match command {
         Run::Tui => {
-            board::tui::run(&board)?;
+            board::tui::run(board)?;
             Ok((Vec::new(), Exit::Ok))
         }
         Run::Ls(selection) => Ok((ls(&board.snapshot()?, &selection), Exit::Ok)),
@@ -406,7 +406,7 @@ fn ls(snapshot: &Snapshot, selection: &Selection) -> Vec<u8> {
 }
 
 fn brief_lines<'a>(rows: impl Iterator<Item = &'a BriefRow>) -> Vec<u8> {
-    rows.map(|row| format!("{} {} {}\n", row.number, row.status_word(), row.slug))
+    rows.map(|row| row.ls_line() + "\n")
         .collect::<String>()
         .into_bytes()
 }

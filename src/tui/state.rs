@@ -3,20 +3,30 @@
 //! gives the next state and the commands for the runtime to run. No IO here,
 //! so a trace of random events can test all of it (`trace.rs`).
 //!
-//! The actions (`d`, `x`, `J`/`K`, `e`, `r`, yank) fit the same shape: a key
-//! gives a [`Command`] that runs the CLI's function on the worker, and its
-//! result comes back as an [`Event`].
+//! The actions fit the same shape: a key gives a [`Command`], and its
+//! result comes back as an [`Event`]. A write ([`Action`]) runs the CLI's
+//! function on the worker, one at a time, in the order sent; the state
+//! keeps what is out, so it shows a move that is out where it goes and
+//! knows when the last one is done.
 
-use super::data::{BriefItem, Data};
+use std::collections::VecDeque;
+use std::fmt;
+
+use super::data::{BriefItem, Data, ListEntry};
 use super::layout::{self, Areas};
-use crate::board::ListRow;
+use super::moves;
 use crate::brief::{Stamp, Status};
-use crate::id::{BriefId, ListKind};
+use crate::id::{BacklogId, BriefId, ChoreId, ListKind};
+use crate::list::{self, Move, Side};
+use crate::project::BoardPath;
 use crate::sync::{Counts, Fetched};
 
 /// Seconds between the starts of two background fetches ("about once a
 /// minute", SPEC.md, Sync).
 pub(crate) const FETCH_EVERY: u64 = 60;
+
+/// The most messages the bottom line keeps: what came since the last key.
+const MESSAGES: usize = 8;
 
 /// A key as the state knows it; the runtime maps the terminal's to these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +59,27 @@ pub(crate) enum Event {
     LoadFailed(String),
     /// The answer to [`Command::Fetch`].
     Fetched(Fetched),
+    /// The answer to [`Command::Run`]: what the command printed, or its
+    /// error.
+    Ran(Action, Result<String, String>),
+    /// What a write says along the way (`waiting for lock`, a lint
+    /// finding), or what went wrong outside the state (a yank).
+    Note(String),
+    /// The answer to [`Command::Edit`]: the editor has given the terminal
+    /// back.
+    Edited(Edited),
     /// The terminal gives no more keys, so nothing could quit the TUI.
     InputGone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Edited {
+    /// The editor ended without an error.
+    Closed,
+    /// The editor ran and ended with an error: it may have saved.
+    Failed(String),
+    /// No editor ran.
+    NotStarted(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +88,39 @@ pub(crate) enum Command {
     Load,
     /// The background fetch, on the worker thread.
     Fetch,
+    /// A write, on the worker thread after what is out there.
+    Run(Action),
+    /// `$EDITOR` on a file of the board, at a line (`+N`), with the
+    /// terminal given to it.
+    Edit {
+        path: BoardPath,
+        line: Option<usize>,
+    },
+    /// Onto the clipboard: OSC 52, and `wl-copy` or `pbcopy`.
+    Yank(String),
     Quit,
+}
+
+/// A write of the TUI: each is a CLI command, run by the function the
+/// command runs (SPEC.md, TUI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Action {
+    Done(ChoreId),
+    Drop(BacklogId),
+    Move(Move),
+    Sync,
+}
+
+/// As the command line says it.
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Action::Done(id) => write!(f, "done {id}"),
+            Action::Drop(id) => write!(f, "drop {id}"),
+            Action::Move(wanted) => write!(f, "move {wanted}"),
+            Action::Sync => f.write_str("sync"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +168,15 @@ impl Source {
             Source::Backlog => Panel::Backlog,
         }
     }
+
+    /// The list file the rows are of; `None` for briefs.
+    pub fn list(self) -> Option<ListKind> {
+        match self {
+            Source::Open | Source::Filed => None,
+            Source::Chores => Some(ListKind::Chores),
+            Source::Backlog => Some(ListKind::Backlog),
+        }
+    }
 }
 
 /// A row of a panel: an item, or a group heading the cursor passes over.
@@ -123,12 +193,12 @@ pub(crate) struct Row {
 }
 
 impl Row {
-    /// The id at the front of a list item's line.
-    pub fn id_word(&self) -> Option<&str> {
-        match self.key.as_ref()?.ident {
-            Ident::Id(_) => self.text.split_whitespace().next(),
-            Ident::Brief(..) | Ident::Text(_) => None,
-        }
+    /// A list item's id as the CLI spells it (`c12`), from the id the
+    /// parser read, not off the text: what `y` yanks, and the preview's
+    /// title.
+    pub fn id_word(&self, kind: ListKind) -> Option<String> {
+        let id = self.key.as_ref()?.id()?;
+        Some(format!("{}{id}", kind.prefix()))
     }
 }
 
@@ -143,6 +213,17 @@ impl Row {
 pub(crate) struct ItemKey {
     ident: Ident,
     nth: usize,
+}
+
+impl ItemKey {
+    /// The number of a list item's id; `None` for a brief and for an item
+    /// without an id.
+    pub fn id(&self) -> Option<u32> {
+        match self.ident {
+            Ident::Id(number) => Some(number),
+            Ident::Brief(..) | Ident::Text(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -186,6 +267,46 @@ pub(crate) struct SyncState {
     pub error: Option<String>,
 }
 
+/// A run of `J`/`K` presses on an item: its row stands at `place`, and no
+/// command is out yet. One `board move` is sent when the run ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Moving {
+    pub source: Source,
+    pub item: ItemKey,
+    /// Next to this item, which may change before the run ends; never
+    /// where the item stood when the run began (that run is over).
+    pub place: (Side, ItemKey),
+}
+
+/// `d` or `x`, asked on the bottom line: `y` runs the action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Question {
+    /// Done or drop of the item under the cursor when it was asked.
+    pub action: Action,
+    /// The item's line, so the question says what it is about.
+    pub text: String,
+}
+
+impl Question {
+    /// As the bottom line asks it: `done c12 Rotate the key…? y/n`, the id
+    /// once, as the line starts with it.
+    pub fn prompt(&self) -> String {
+        let verb = match self.action {
+            Action::Done(_) => "done",
+            Action::Drop(_) => "drop",
+            Action::Move(_) | Action::Sync => unreachable!("only d and x ask"),
+        };
+        format!("{verb} {}? y/n", self.text)
+    }
+}
+
+/// A line of the bottom line: a result or a note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Message {
+    pub text: String,
+    pub error: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct State {
     data: Data,
@@ -208,6 +329,19 @@ pub(crate) struct State {
     preview: Preview,
     sync: SyncState,
     load_error: Option<String>,
+    question: Option<Question>,
+    moving: Option<Moving>,
+    /// The writes out on the worker, oldest first: it runs them in this
+    /// order and answers each.
+    writes: VecDeque<Action>,
+    /// Quit was asked while writes were out: the TUI ends when they have.
+    quitting: bool,
+    /// `e` was pressed while writes were out: the editor opens on this
+    /// item once they are done and the files are read again, unless a key
+    /// but Esc came first.
+    edit_wanted: Option<(Source, ItemKey)>,
+    /// Since the last key.
+    messages: Vec<Message>,
 }
 
 impl State {
@@ -229,6 +363,12 @@ impl State {
             preview: Preview::default(),
             sync: SyncState::default(),
             load_error: None,
+            question: None,
+            moving: None,
+            writes: VecDeque::new(),
+            quitting: false,
+            edit_wanted: None,
+            messages: Vec::new(),
         };
         let mut commands = vec![Command::Load];
         // A fetch at once, not a minute on: until one answers, the status
@@ -253,9 +393,10 @@ impl State {
             }
             Event::FilesChanged => vec![Command::Load],
             Event::Loaded(data) => {
-                self.data = *data;
+                let before = std::mem::replace(&mut self.data, *data);
                 self.load_error = None;
-                Vec::new()
+                self.follow_ids(&before);
+                self.loaded()
             }
             Event::LoadFailed(why) => {
                 self.load_error = Some(why);
@@ -265,7 +406,19 @@ impl State {
                 self.fetched(fetched);
                 Vec::new()
             }
-            Event::InputGone => vec![Command::Quit],
+            Event::Ran(action, result) => self.ran(&action, result),
+            Event::Note(note) => {
+                self.say(note, false);
+                Vec::new()
+            }
+            Event::Edited(edited) => self.edited(edited),
+            Event::InputGone => {
+                if self.quitting {
+                    Vec::new()
+                } else {
+                    self.quit()
+                }
+            }
         };
         self.settle();
         (self, commands)
@@ -275,24 +428,66 @@ impl State {
         // Raw mode turns ctrl-c into a key; it quits from anywhere, as it
         // does everywhere else in a terminal.
         if key == Key::Ctrl('c') {
-            return vec![Command::Quit];
+            return self.quit();
+        }
+        if self.quitting {
+            // Waiting for the writes to end; a second quit does not wait.
+            return match key {
+                Key::Char('q') => self.quit(),
+                _ => Vec::new(),
+            };
+        }
+        // Esc does nothing but its one thing, so the message stays.
+        if key != Key::Esc {
+            self.messages.clear();
+            // An editor waited for opens only while the user still waits
+            // for it: one that opened later would take the keys typed for
+            // the TUI (a `d`, a `J`) as editing commands on the file. Esc
+            // keeps the wait, as it does everything else.
+            if self.edit_wanted.take().is_some() && key != Key::Char('e') {
+                self.say(
+                    "the editor is called off: a key came first; e asks again".to_owned(),
+                    false,
+                );
+            }
         }
         let pending_g = std::mem::take(&mut self.pending_g);
         if self.typing {
             self.type_filter(key);
             return Vec::new();
         }
+        // Asked once: `y` is yes, any other key no, Esc too.
+        if let Some(question) = self.question.take() {
+            return match key {
+                Key::Char('y') => self.run(question.action),
+                _ => Vec::new(),
+            };
+        }
         if self.help {
             match key {
                 Key::Esc | Key::Char('?') => self.help = false,
-                Key::Char('q') => return vec![Command::Quit],
+                Key::Char('q') => return self.quit(),
                 _ => {}
             }
             return Vec::new();
         }
+        // A run of `J`/`K` goes on; every other key ends it, and sends its
+        // move first, so a key's own command comes after. But Esc: it does
+        // nothing else (SPEC.md, TUI), so the move waits for the next key.
+        let mut commands = match key {
+            Key::Char('J' | 'K') | Key::Esc => Vec::new(),
+            _ if self.moving.is_some() => {
+                let sent = self.end_moving();
+                // A dropped run puts the row back: the cursor's place is
+                // where its item is now, for the key to move it from.
+                self.settle();
+                sent
+            }
+            _ => Vec::new(),
+        };
         let half = isize::try_from((self.page() / 2).max(1)).unwrap_or(isize::MAX);
         match key {
-            Key::Char('q') => return vec![Command::Quit],
+            Key::Char('q') => commands.extend(self.quit()),
             Key::Esc => self.escape(),
             Key::Char('?') => self.help = true,
             Key::Char('g') if pending_g => self.go_to(0),
@@ -324,14 +519,22 @@ impl State {
                 self.typing = true;
                 self.filters[self.focus as usize].get_or_insert_with(String::new);
             }
+            Key::Char('d') => self.ask(ListKind::Chores),
+            Key::Char('x') => self.ask(ListKind::Backlog),
+            Key::Char('J') => self.move_item(true),
+            Key::Char('K') => self.move_item(false),
+            Key::Char('e') => commands.extend(self.edit_key()),
+            Key::Char('r') => commands.extend(self.run(Action::Sync)),
+            Key::Char('y') => commands.extend(self.yank(false)),
+            Key::Char('Y') => commands.extend(self.yank(true)),
             _ => {}
         }
-        Vec::new()
+        commands
     }
 
-    /// Esc leaves the preview, closes help, or clears a filter, and does
-    /// nothing else: the owner hits it by reflex (SPEC.md, TUI). Help and a
-    /// filter being typed are handled before this.
+    /// Esc leaves the preview, closes help, answers no, or clears a filter,
+    /// and does nothing else: the owner hits it by reflex (SPEC.md, TUI).
+    /// Help, a question and a filter being typed are handled before this.
     fn escape(&mut self) {
         if self.in_preview {
             self.in_preview = false;
@@ -399,6 +602,357 @@ impl State {
             cursor.at = at.min(last);
             cursor.key = Some(items[cursor.at].clone());
         }
+    }
+
+    /// Quits, once the writes that are out have ended: a move or a done the
+    /// user saw on screen is then on the board, not cut off with the
+    /// process. Asked a second time while it waits, it quits at once: a
+    /// push can stall for as long as the connection does, and a write cut
+    /// off is one the next write catches up with (SPEC.md, Sync).
+    fn quit(&mut self) -> Vec<Command> {
+        if self.quitting {
+            return vec![Command::Quit];
+        }
+        let mut commands = self.end_moving();
+        self.question = None;
+        self.edit_wanted = None;
+        if self.writes.is_empty() {
+            commands.push(Command::Quit);
+        } else {
+            self.quitting = true;
+        }
+        commands
+    }
+
+    /// Sends a write to the worker.
+    fn run(&mut self, action: Action) -> Vec<Command> {
+        self.writes.push_back(action.clone());
+        vec![Command::Run(action)]
+    }
+
+    fn say(&mut self, text: String, error: bool) {
+        if self.messages.len() == MESSAGES {
+            self.messages.remove(0);
+        }
+        self.messages.push(Message { text, error });
+    }
+
+    /// The row under the focused panel's cursor.
+    fn cursor_item(&self) -> Option<(Source, Row)> {
+        let source = self.source();
+        let rows = self.rows(source);
+        let row = rows.get(cursor_row(self.cursor(source), &rows)?)?;
+        Some((source, row.clone()))
+    }
+
+    /// `d` (chores) or `x` (backlog): asks whether to, about the item under
+    /// the cursor.
+    fn ask(&mut self, kind: ListKind) {
+        let Some((source, row)) = self.cursor_item() else {
+            return;
+        };
+        if source.list() != Some(kind) {
+            let wrong = match kind {
+                ListKind::Chores => "d is done, for a chore",
+                ListKind::Backlog => "x is drop, for a backlog item",
+            };
+            self.say(wrong.to_owned(), true);
+            return;
+        }
+        let action = row
+            .key
+            .as_ref()
+            .and_then(ItemKey::id)
+            .and_then(|id| match kind {
+                ListKind::Chores => ChoreId::new(id).map(Action::Done),
+                ListKind::Backlog => BacklogId::new(id).map(Action::Drop),
+            });
+        match action {
+            Some(action) => {
+                self.question = Some(Question {
+                    action,
+                    text: row.text,
+                });
+            }
+            None => self.no_id(&row),
+        }
+    }
+
+    fn no_id(&mut self, row: &Row) {
+        self.say(
+            format!(
+                "no id yet, so no command can name it ({}); r gives it one",
+                row.text
+            ),
+            true,
+        );
+    }
+
+    /// `J` (`down`) or `K`: the item under the cursor one place on, at once
+    /// on screen; its move is sent when the run of presses ends.
+    ///
+    /// A run goes on while the cursor is on its item (the trace checks that
+    /// it is): every key that moves the cursor ends the run first.
+    fn move_item(&mut self, down: bool) {
+        let Some((source, row)) = self.cursor_item() else {
+            return;
+        };
+        let Some(kind) = source.list() else {
+            self.say(
+                "briefs have no order of their own: J/K move chores and backlog items".to_owned(),
+                true,
+            );
+            return;
+        };
+        if self.filtered(source) {
+            // The neighbours a filter hides are where the item would go.
+            self.say("clear the filter (Esc) to move an item".to_owned(), true);
+            return;
+        }
+        let item = row.key.clone().expect("the cursor is on an item");
+        let Some(id) = item.id() else {
+            self.no_id(&row);
+            return;
+        };
+        let base = self.base_rows(source);
+        if moves::unique(&base, id).is_none() {
+            self.say(
+                format!(
+                    "{} is on two lines, so no command can name it; lint says which",
+                    name_of(kind, &item)
+                ),
+                true,
+            );
+            return;
+        }
+        let Some(home) = moves::group_of(&base, &item) else {
+            return;
+        };
+        let Some(next) = moves::step(&self.arranged(source), &item, down, home) else {
+            return;
+        };
+        let keys = |rows: &[Row]| -> Vec<Option<ItemKey>> {
+            rows.iter().map(|row| row.key.clone()).collect()
+        };
+        self.moving = if keys(&next) == keys(&base) {
+            // Back where it was: there is nothing to send.
+            None
+        } else {
+            moves::place_of(&next, &item).map(|place| Moving {
+                source,
+                item,
+                place,
+            })
+        };
+    }
+
+    /// Ends a run of `J`/`K`: its one `board move`, or a note that it is
+    /// dropped when no command can say the place.
+    fn end_moving(&mut self) -> Vec<Command> {
+        let Some(moving) = &self.moving else {
+            return Vec::new();
+        };
+        let rows = self.arranged(moving.source);
+        let kind = moving.source.list().expect("a list item moves");
+        let item = moving.item.clone();
+        self.moving = None;
+        match moves::wanted(&rows, &item, kind) {
+            Some(wanted) => self.run(Action::Move(wanted)),
+            None => {
+                self.say(
+                    format!(
+                        "dropped the move of {}: neither item next to it has an id to name \
+                         the place by; r gives them one",
+                        name_of(kind, &item)
+                    ),
+                    true,
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// `e`: the editor on the item under the cursor, once the writes that
+    /// are out have ended.
+    ///
+    /// Decided here: it waits for them, because an editor opened beside a
+    /// write reads the file before the write changes it, and saving it
+    /// then would put back what the write took out (a done chore, a move).
+    fn edit_key(&mut self) -> Vec<Command> {
+        let Some((source, row)) = self.cursor_item() else {
+            self.say("nothing to edit here".to_owned(), true);
+            return Vec::new();
+        };
+        let key = row.key.expect("the cursor is on an item");
+        if self.writes.is_empty() {
+            return self.edit(source, &key);
+        }
+        self.edit_wanted = Some((source, key));
+        self.say(
+            "the editor opens once the writes are done; a key but Esc calls it off".to_owned(),
+            false,
+        );
+        Vec::new()
+    }
+
+    /// The editor on the brief's file, or on the list file at the item's
+    /// line.
+    fn edit(&mut self, source: Source, key: &ItemKey) -> Vec<Command> {
+        let row = self
+            .rows(source)
+            .into_iter()
+            .find(|row| row.key.as_ref() == Some(key));
+        let Some(row) = row else {
+            self.say("the item is gone: nothing to edit".to_owned(), true);
+            return Vec::new();
+        };
+        let (path, line) = match source.list() {
+            None => (self.brief(source, &row).path.clone(), None),
+            Some(kind) => (
+                BoardPath::List {
+                    project: self.data.project.clone(),
+                    kind,
+                },
+                Some(self.data.list(kind)[row.at].line),
+            ),
+        };
+        vec![Command::Edit { path, line }]
+    }
+
+    fn brief(&self, source: Source, row: &Row) -> &BriefItem {
+        match source {
+            Source::Open => &self.data.open[row.at],
+            Source::Filed => &self.data.filed[row.at],
+            Source::Chores | Source::Backlog => unreachable!("a brief's row"),
+        }
+    }
+
+    /// The editor gave the terminal back: whatever it saved is committed
+    /// by a sync (SPEC.md, TUI), unless none ran.
+    fn edited(&mut self, edited: Edited) -> Vec<Command> {
+        match edited {
+            Edited::Closed => self.run(Action::Sync),
+            Edited::Failed(why) => {
+                self.say(why, true);
+                self.run(Action::Sync)
+            }
+            Edited::NotStarted(why) => {
+                self.say(why, true);
+                Vec::new()
+            }
+        }
+    }
+
+    /// `y`: the item's id; `Y` (`line`): its line as `board ls` prints it.
+    fn yank(&mut self, line: bool) -> Vec<Command> {
+        let Some((source, row)) = self.cursor_item() else {
+            return Vec::new();
+        };
+        let text = match (source.list(), line) {
+            (None, false) => self.brief(source, &row).row.number.to_string(),
+            (None, true) => self.brief(source, &row).row.ls_line(),
+            (Some(_), true) => row.text.clone(),
+            (Some(kind), false) => match row.id_word(kind) {
+                Some(id) => id,
+                None => {
+                    self.no_id(&row);
+                    return Vec::new();
+                }
+            },
+        };
+        self.say(format!("yanked {text}"), false);
+        vec![Command::Yank(text)]
+    }
+
+    /// A write's answer. The worker answers in the order sent, so this is
+    /// the oldest write out of its kind; looked up all the same, so that a
+    /// move is shown where it goes for exactly as long as it is out.
+    fn ran(&mut self, action: &Action, result: Result<String, String>) -> Vec<Command> {
+        if let Some(at) = self.writes.iter().position(|out| out == action) {
+            self.writes.remove(at);
+        }
+        match result {
+            Ok(said) => self.say(said, false),
+            Err(why) => self.say(why, true),
+        }
+        // The write fetched and may have pushed: the counts on the status
+        // line are stale, so the next tick fetches.
+        self.sync.asked = None;
+        // Read now, not at the watcher's event, which may come after: the
+        // rows of a move that is no longer out would stand where they were
+        // until then.
+        let mut commands = vec![Command::Load];
+        if self.quitting && self.writes.is_empty() {
+            commands.push(Command::Quit);
+        }
+        commands
+    }
+
+    /// After a reload, before anything looks for what it holds: the items
+    /// a write gave an id keep their cursor, their preview, their place as
+    /// a run's neighbour and the edit waited for on them ([`follow`]).
+    fn follow_ids(&mut self, before: &Data) {
+        for source in [Source::Chores, Source::Backlog] {
+            let kind = source.list().expect("a list");
+            let rows = all_rows(&self.data, source);
+            let before = all_rows(before, source);
+            let keep = |key: &mut ItemKey| {
+                if let Some(found) = follow(kind, &rows, &before, key) {
+                    *key = found;
+                }
+            };
+            if let Some(key) = &mut self.cursors[source as usize].key {
+                keep(key);
+            }
+            if let Some((shown, key)) = &mut self.preview.shown
+                && *shown == source
+            {
+                keep(key);
+            }
+            if let Some(moving) = &mut self.moving
+                && moving.source == source
+            {
+                keep(&mut moving.place.1);
+            }
+            if let Some((wanted, key)) = &mut self.edit_wanted
+                && *wanted == source
+            {
+                keep(key);
+            }
+        }
+    }
+
+    /// After a reload: a run of `J`/`K` whose item or neighbour is gone is
+    /// dropped, as is one whose item's id is on two lines now (no command
+    /// could name it), and the editor waited for opens.
+    fn loaded(&mut self) -> Vec<Command> {
+        if let Some(moving) = &self.moving {
+            let kind = moving.source.list().expect("a list item moves");
+            let rows = self.base_rows(moving.source);
+            let has = |key: &ItemKey| rows.iter().any(|row| row.key.as_ref() == Some(key));
+            let why = match [&moving.item, &moving.place.1]
+                .into_iter()
+                .find(|key| !has(key))
+            {
+                Some(gone) => Some(format!("{} is gone", name_of(kind, gone))),
+                None => moving
+                    .item
+                    .id()
+                    .filter(|id| moves::unique(&rows, *id).is_none())
+                    .map(|_| "it is on two lines now".to_owned()),
+            };
+            if let Some(why) = why {
+                let item = name_of(kind, &moving.item);
+                self.moving = None;
+                self.say(format!("dropped the move of {item}: {why}"), true);
+            }
+        }
+        if self.writes.is_empty()
+            && let Some((source, key)) = self.edit_wanted.take()
+        {
+            return self.edit(source, &key);
+        }
+        Vec::new()
     }
 
     /// Starts a fetch when none is out and the last one was asked for a
@@ -500,10 +1054,46 @@ impl State {
         self.preview.scroll = self.preview.scroll.min(max);
     }
 
-    /// The rows of a list as drawn: the data's, less what the panel's
-    /// filter hides. A heading stays while an item under it does.
+    /// The rows of a list as they stand while the moves that are out run:
+    /// where the files will have them.
+    fn base_rows(&self, source: Source) -> Vec<Row> {
+        let mut rows = all_rows(&self.data, source);
+        if let Some(kind) = source.list() {
+            for action in &self.writes {
+                if let Action::Move(wanted) = action
+                    && wanted.kind() == kind
+                {
+                    moves::put_sent(&mut rows, wanted);
+                }
+            }
+        }
+        rows
+    }
+
+    /// The rows of a list as they stand on screen: the run of `J`/`K`
+    /// presses too.
+    fn arranged(&self, source: Source) -> Vec<Row> {
+        let mut rows = self.base_rows(source);
+        if let Some(moving) = &self.moving
+            && moving.source == source
+        {
+            let (side, next_to) = &moving.place;
+            moves::put(&mut rows, &moving.item, *side, next_to);
+        }
+        rows
+    }
+
+    /// Whether the panel's filter hides rows: one is set and not empty.
+    fn filtered(&self, source: Source) -> bool {
+        self.filters[source.panel() as usize]
+            .as_deref()
+            .is_some_and(|filter| !filter.is_empty())
+    }
+
+    /// The rows of a list as drawn: arranged, less what the panel's filter
+    /// hides. A heading stays while an item under it does.
     pub fn rows(&self, source: Source) -> Vec<Row> {
-        let all = all_rows(&self.data, source);
+        let all = self.arranged(source);
         let Some(filter) = self.filters[source.panel() as usize]
             .as_deref()
             .filter(|filter| !filter.is_empty())
@@ -580,6 +1170,25 @@ impl State {
         self.cursor(source).offset
     }
 
+    /// Whether the row stands where a move puts it before a file has it:
+    /// moved by `J`/`K`, or its move is out.
+    pub fn pending(&self, source: Source, row: &Row) -> bool {
+        let Some(key) = &row.key else {
+            return false;
+        };
+        let moving = self
+            .moving
+            .as_ref()
+            .is_some_and(|moving| moving.source == source && moving.item == *key);
+        let sent = source.list().is_some_and(|kind| {
+            self.writes.iter().any(|action| {
+                matches!(action, Action::Move(wanted)
+                    if wanted.kind() == kind && key.id() == Some(wanted.item().get()))
+            })
+        });
+        moving || sent
+    }
+
     /// What the preview shows: the focused panel's item under its cursor.
     pub fn preview_content(&self) -> Option<layout::Preview> {
         let source = self.source();
@@ -639,6 +1248,82 @@ impl State {
     pub fn load_error(&self) -> Option<&str> {
         self.load_error.as_deref()
     }
+
+    pub fn question(&self) -> Option<&Question> {
+        self.question.as_ref()
+    }
+
+    pub fn moving(&self) -> Option<&Moving> {
+        self.moving.as_ref()
+    }
+
+    pub fn writes(&self) -> &VecDeque<Action> {
+        &self.writes
+    }
+
+    pub fn quitting(&self) -> bool {
+        self.quitting
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+}
+
+/// How a note names a list item: its id, else its text.
+fn name_of(kind: ListKind, key: &ItemKey) -> String {
+    match &key.ident {
+        Ident::Id(number) => format!("{}{number}", kind.prefix()),
+        Ident::Text(text) => text.clone(),
+        Ident::Brief(number, _) => number.to_string(),
+    }
+}
+
+/// Where `key`'s item is among `rows`, a list's rows after a reload, in
+/// file order: its own row, or, for an item typed by hand that a write has
+/// given an id since, the row with that id. `None` when it is gone.
+///
+/// The key of such an item is its text, and the id changes the text: the
+/// sync that commits a hand-typed line (the one after `e`, say) would
+/// otherwise make it look gone to whatever holds on to it, though it is
+/// still there. A given id is spelled as [`list::with_id`] spells it, the
+/// one spelling the merge relies on too, and is one that `before` (the
+/// rows before the reload) did not have: `b1 X` that was there all along
+/// is not the `X` typed by hand. The `nth` line of one text, with a given
+/// id or without, is the `nth` it was: a sync gives every item without an
+/// id one at once, in file order.
+fn follow(kind: ListKind, rows: &[Row], before: &[Row], key: &ItemKey) -> Option<ItemKey> {
+    if rows.iter().any(|row| row.key.as_ref() == Some(key)) {
+        return Some(key.clone());
+    }
+    let Ident::Text(text) = &key.ident else {
+        return None;
+    };
+    let given = |id: u32| {
+        !before
+            .iter()
+            .any(|row| row.key.as_ref().and_then(ItemKey::id) == Some(id))
+    };
+    let line = format!("- {text}");
+    rows.iter()
+        .filter_map(|row| {
+            let found = row.key.as_ref()?;
+            let spells = match found.ident {
+                Ident::Text(ref other) => other == text,
+                Ident::Id(id) => {
+                    given(id)
+                        && list::with_id(kind, line.as_bytes(), id)
+                            == format!("- {}", row.text).as_bytes()
+                }
+                Ident::Brief(..) => false,
+            };
+            spells.then_some(found)
+        })
+        .nth(key.nth)
+        // A line still without an id is another item: this one would have
+        // its own key still.
+        .filter(|found| found.id().is_some())
+        .cloned()
 }
 
 fn cursor_row(cursor: &Cursor, rows: &[Row]) -> Option<usize> {
@@ -646,13 +1331,13 @@ fn cursor_row(cursor: &Cursor, rows: &[Row]) -> Option<usize> {
     rows.iter().position(|row| row.key.as_ref() == Some(key))
 }
 
-/// Every row of a list, before a filter.
+/// Every row of a list as the data has it, before a move or a filter.
 fn all_rows(data: &Data, source: Source) -> Vec<Row> {
     let mut rows = match source {
         Source::Open => brief_rows(&data.open),
         Source::Filed => brief_rows(&data.filed),
-        Source::Chores => list_rows(ListKind::Chores, &data.chores),
-        Source::Backlog => list_rows(ListKind::Backlog, &data.backlog),
+        Source::Chores => list_rows(ListKind::Chores, data),
+        Source::Backlog => list_rows(ListKind::Backlog, data),
     };
     // Numbered per ident in list order, so a second row with one id keeps
     // its key while the rows around it change.
@@ -696,21 +1381,18 @@ fn brief_rows(briefs: &[BriefItem]) -> Vec<Row> {
         .collect()
 }
 
-fn list_rows(kind: ListKind, rows: &[ListRow]) -> Vec<Row> {
-    rows.iter()
+fn list_rows(kind: ListKind, data: &Data) -> Vec<Row> {
+    data.list(kind)
+        .iter()
         .enumerate()
-        .map(|(at, row)| match row {
-            ListRow::Group(name) => Row {
+        .map(|(at, line)| match &line.entry {
+            ListEntry::Group(name) => Row {
                 text: format!("## {}", String::from_utf8_lossy(name)),
                 key: None,
                 at,
                 since: None,
             },
-            ListRow::Item(text) => {
-                let id = text
-                    .split(|b| b.is_ascii_whitespace())
-                    .next()
-                    .and_then(|word| kind.parse_id(word));
+            ListEntry::Item { id, text } => {
                 let text = String::from_utf8_lossy(text).into_owned();
                 Row {
                     key: Some(ItemKey {

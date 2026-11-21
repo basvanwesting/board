@@ -21,13 +21,14 @@ pub struct Board {
     cwd: PathBuf,
     project: ProjectName,
     /// Where a write says what happens along the way. A note is passed on
-    /// as it comes: `waiting for lock` has to show before the wait.
-    notes: Box<dyn Fn(Note)>,
+    /// as it comes: `waiting for lock` has to show before the wait. `Send`:
+    /// the TUI's writes run on a thread of their own.
+    notes: Box<dyn Fn(Note) + Send>,
 }
 
 impl Board {
     /// Finds the project and the board-data clone; reads nothing yet.
-    pub fn open(env: Env, notes: Box<dyn Fn(Note)>) -> Result<Board, Error> {
+    pub fn open(env: Env, notes: Box<dyn Fn(Note) + Send>) -> Result<Board, Error> {
         let project = resolve(&env)?;
         // A project without a directory is an empty board, so a root that
         // is not there would read as one too: every list empty, lint `ok`,
@@ -50,6 +51,12 @@ impl Board {
 
     pub fn project(&self) -> &ProjectName {
         &self.project
+    }
+
+    /// The board with its notes said elsewhere: the TUI's go to its bottom
+    /// line, as stderr is its screen.
+    pub(crate) fn with_notes(self, notes: Box<dyn Fn(Note) + Send>) -> Board {
+        Board { notes, ..self }
     }
 
     /// The board-data clone, absolute.
@@ -404,6 +411,12 @@ impl BriefRow {
     pub fn status_word(&self) -> &'static str {
         self.status.map_or("unknown", Status::as_str)
     }
+
+    /// The row as `board ls` prints it, without the newline; the TUI's `Y`
+    /// yanks the same.
+    pub fn ls_line(&self) -> String {
+        format!("{} {} {}", self.number, self.status_word(), self.slug)
+    }
 }
 
 /// A line of a list that the board shows: free text between the items is
@@ -510,8 +523,7 @@ mod tests {
     }
 
     fn shown<'a>(rows: impl Iterator<Item = &'a BriefRow>) -> Vec<String> {
-        rows.map(|row| format!("{} {} {}", row.number, row.status_word(), row.slug))
-            .collect()
+        rows.map(BriefRow::ls_line).collect()
     }
 
     #[test]

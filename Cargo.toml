@@ -28,6 +28,11 @@ tempfile = { version = "3", default-features = false }
 name = "fetch"
 harness = false
 
+# The same, for the TUI's runtime, its editor and its clipboard helper.
+[[test]]
+name = "tui"
+harness = false
+
 [lints.clippy]
 # `println!` and `eprintln!` panic when the reader has gone (`board ls | head -1`).
 # Output goes through a checked write in main.rs.

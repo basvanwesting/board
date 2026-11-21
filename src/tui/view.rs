@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use super::layout::{self, inner_height};
 use super::state::{Panel, Source, State, Tab};
 
-const HELP: [(&str, &str); 12] = [
+const HELP: [(&str, &str); 19] = [
     ("j k", "down, up"),
     ("gg G", "first, last"),
     ("ctrl-d ctrl-u", "half a page down, up"),
@@ -19,10 +19,23 @@ const HELP: [(&str, &str); 12] = [
     ("[ ]", "Open, Filed briefs"),
     ("Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
-    ("Esc", "leave the preview, close help, clear the filter"),
+    ("d", "done: delete the chore, asked first (y/n)"),
+    ("x", "drop: delete the backlog item, asked first (y/n)"),
+    (
+        "J K",
+        "move the item down, up; sent at the next key but Esc",
+    ),
+    ("e", "edit the brief, or the list at the item, in $EDITOR"),
+    ("r", "sync: commit hand edits, fetch, push"),
+    ("y Y", "yank the id, the line"),
+    (
+        "Esc",
+        "leave the preview, close help, answer no, clear the filter",
+    ),
     ("?", "help"),
-    ("q", "quit"),
+    ("q", "quit, once the writes are done; q again: now"),
     ("", "The board redraws when its files change."),
+    ("", "A write runs in the background, one at a time."),
 ];
 
 pub(crate) fn draw(frame: &mut Frame, state: &State) {
@@ -109,13 +122,17 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
                     text.push_str(&" ".repeat(width.saturating_sub(used).max(2)));
                     text.push_str(&age);
                 }
-                let style = if row.key.is_none() {
+                let mut style = if row.key.is_none() {
                     Style::new().add_modifier(Modifier::BOLD)
                 } else if cursor == Some(at) && focused {
                     Style::new().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::new()
                 };
+                // Where a move puts it, before the file has it.
+                if state.pending(source, row) {
+                    style = style.fg(Color::Yellow).add_modifier(Modifier::ITALIC);
+                }
                 Line::styled(text, style)
             })
             .collect()
@@ -188,14 +205,59 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     if let Some(why) = state.load_error() {
         left.extend([dot(), Span::styled(format!("cannot read: {why}"), error)]);
     }
+    let writes = state.writes();
+    if let Some(running) = writes.front() {
+        let more = match writes.len() {
+            1 => String::new(),
+            n => format!(" (+{})", n - 1),
+        };
+        left.extend([dot(), Span::raw(format!("{running}…{more}"))]);
+    }
+    if state.quitting() {
+        left.extend([
+            dot(),
+            Span::styled("quitting once the writes are done; q: now", error),
+        ]);
+    }
+    for message in state.messages() {
+        let style = if message.error {
+            error
+        } else {
+            Style::new().fg(Color::Yellow)
+        };
+        left.extend([dot(), Span::styled(message.text.clone(), style)]);
+    }
+    if let Some(question) = state.question() {
+        // The question goes where the hints were, so it is not cut for
+        // what the line says before it.
+        let ask = Line::styled(
+            format!(" {} ", question.prompt()),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        );
+        let width = ask.width().min(usize::from(area.width));
+        let [left_area, ask_area] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(u16::try_from(width).unwrap_or(u16::MAX)),
+        ])
+        .areas(area);
+        frame.render_widget(Paragraph::new(Line::from(left)), left_area);
+        frame.render_widget(Paragraph::new(ask), ask_area);
+        return;
+    }
     let hints = if state.typing() {
         "Enter keep  Esc clear "
     } else if state.help() {
         "Esc close  q quit "
+    } else if state.moving().is_some() {
+        "J/K move  any key but Esc sends it "
     } else if state.in_preview() {
         "j/k scroll  h back  ? help "
     } else {
-        "/ filter  Enter preview  ? help  q quit "
+        match state.focus() {
+            Panel::Briefs => "e edit  y yank  / filter  ? help ",
+            Panel::Chores => "d done  J/K move  e edit  ? help ",
+            Panel::Backlog => "x drop  J/K move  e edit  ? help ",
+        }
     };
     let left = Line::from(left);
     // What the line says comes before the hints: an error is not cut for
@@ -245,12 +307,13 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::super::data::{BriefItem, Data};
-    use super::super::state::{Command, Event, Key};
+    use super::super::data::{BriefItem, Data, ListLine};
+    use super::super::state::{Action, Command, Event, Key};
     use super::*;
     use crate::board::{BriefRow, ListRow};
     use crate::brief::{Stamp, Status};
     use crate::id::BriefId;
+    use crate::id::{ChoreId, ListKind};
     use crate::project::ProjectName;
     use crate::sync::{Counts, Fetched};
 
@@ -263,15 +326,16 @@ mod tests {
         started: Option<u64>,
         body: &str,
     ) -> BriefItem {
-        BriefItem {
-            row: BriefRow {
+        BriefItem::sample(
+            &ProjectName::parse("shop").unwrap(),
+            BriefRow {
                 number: BriefId::new(number),
                 status: Some(status),
                 slug: slug.to_owned(),
             },
-            started: started.map(|at| Stamp::from_unix(at).unwrap()),
-            text: format!("id: {number}\nstatus: {status}\n\n{body}").into_bytes(),
-        }
+            started.map(|at| Stamp::from_unix(at).unwrap()),
+            format!("id: {number}\nstatus: {status}\n\n{body}").into_bytes(),
+        )
     }
 
     fn data() -> Data {
@@ -288,11 +352,17 @@ mod tests {
                 brief(127, Status::Reported, "other-slug", None, "# Other\n"),
             ],
             filed: vec![brief(100, Status::Filed, "old", None, "# Old\n")],
-            chores: vec![
-                ListRow::Group(b"deploy".to_vec()),
-                ListRow::Item(b"c12 Rotate the key. Check: the old one fails  (126)".to_vec()),
-            ],
-            backlog: vec![ListRow::Item(b"b41 Cache the prices  (from 126)".to_vec())],
+            chores: ListLine::numbered(
+                ListKind::Chores,
+                vec![
+                    ListRow::Group(b"deploy".to_vec()),
+                    ListRow::Item(b"c12 Rotate the key. Check: the old one fails  (126)".to_vec()),
+                ],
+            ),
+            backlog: ListLine::numbered(
+                ListKind::Backlog,
+                vec![ListRow::Item(b"b41 Cache the prices  (from 126)".to_vec())],
+            ),
         }
     }
 
@@ -357,7 +427,7 @@ mod tests {
                 "┌3 Backlog──────────────────────────────────┐│                                                     │",
                 "│▶b41 Cache the prices  (from 126)          ││                                                     │",
                 "└───────────────────────────────────────────┘└─────────────────────────────────────────────────────┘",
-                " shop · fetched 1m ago · 2 unpushed · 128 started 42m       / filter  Enter preview  ? help  q quit",
+                " shop · fetched 1m ago · 2 unpushed · 128 started 42m              e edit  y yank  / filter  ? help",
             ]
         );
     }
@@ -453,6 +523,59 @@ mod tests {
             screen(&state)[11],
             " shop · fetched 1m ago · 3 behind · 128 started 42m · fetch failed: could not resolve host"
         );
+    }
+
+    #[test]
+    fn d_asks_on_the_bottom_line_and_the_write_says_there_how_it_went() {
+        let asked = press(state(160, 12), "2d");
+        let line = &screen(&asked)[11];
+        assert!(line.starts_with(" shop · fetched 1m ago"), "{line}");
+        assert!(
+            line.ends_with(" done c12 Rotate the key. Check: the old one fails  (126)? y/n"),
+            "{line}"
+        );
+        let (running, commands) = asked.step(Event::Key(Key::Char('y')));
+        let done = Action::Done(ChoreId::new(12).unwrap());
+        assert_eq!(commands, [Command::Run(done.clone())]);
+        assert!(screen(&running)[11].contains(" · done c12… "));
+        let (ran, _) = running.step(Event::Ran(done, Err("done c12: no chore c12".to_owned())));
+        let line = &screen(&ran)[11];
+        assert!(line.contains(" · done c12: no chore c12"), "{line}");
+        assert!(!line.contains('…'), "{line}");
+    }
+
+    #[test]
+    fn a_moved_row_shows_where_it_goes_and_that_it_is_pending() {
+        let mut two = data();
+        two.backlog = ListLine::numbered(
+            ListKind::Backlog,
+            vec![
+                ListRow::Item(b"b41 Cache the prices".to_vec()),
+                ListRow::Item(b"b42 Drop the old api".to_vec()),
+            ],
+        );
+        let (state, _) = state(100, 14).step(Event::Loaded(Box::new(two)));
+        let moved = press(state, "3J");
+        let size = moved.areas().status;
+        let mut terminal = Terminal::new(TestBackend::new(size.width, size.y + 1)).unwrap();
+        terminal.draw(|frame| draw(frame, &moved)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |id: &str| {
+            (0..size.y)
+                .find(|y| {
+                    (0..size.width)
+                        .map(|x| buffer[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains(id)
+                })
+                .unwrap()
+        };
+        // In the panel: the cursor's row, and the other one's.
+        let (moved_row, other_row) = (row("│▶b41"), row("│ b42"));
+        assert_eq!(moved_row, other_row + 1);
+        assert_eq!(buffer[(2, moved_row)].fg, Color::Yellow);
+        assert_eq!(buffer[(2, other_row)].fg, Color::Reset);
+        assert!(screen(&moved)[13].ends_with("J/K move  any key but Esc sends it"));
     }
 
     #[test]

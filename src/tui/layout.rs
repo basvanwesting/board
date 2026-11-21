@@ -132,7 +132,10 @@ pub(crate) fn preview(data: &Data, source: Source, row: &Row) -> Preview {
             text: Text::from(lines),
         };
     }
-    let title = row.id_word().unwrap_or_default().to_owned();
+    let title = source
+        .list()
+        .and_then(|kind| row.id_word(kind))
+        .unwrap_or_default();
     Preview {
         title,
         text: Text::raw(row.text.replace('\t', "    ")),
