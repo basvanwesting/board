@@ -45,7 +45,7 @@ board next                     worker: claim the brief queued longest (status st
 board block <id> "<question>"  status blocked, question appended under ## Questions
 board amend <id>               stdin appended under ## Amendments; a blocked brief resumes
 board report <id>              stdin becomes ## Report; status reported
-board file <id>                verify the brief's commits in the project repo, move to done/, delete the backlog lines it closes
+board file <id> [--no-commits]  reported brief: verify its commits in the project repo, delete the backlog lines it closes, move to done/
 board add chore "<text>" --group <g> --check "<c>" [--from <id>]
 board add backlog "<text>" [--from <id>]
 board done <c-id>…             board drop <b-id>…
@@ -56,7 +56,7 @@ board sync                     board lint
 - Required brief sections (for `queue`): Task, Design, Premises, Out of scope, Verification, Not doable by the worker, Worker protocol. The template text is the planner skill's, not the tool's: agent rules stay under the owner's review, a data repo or a binary is the wrong home. The skill's draft is this project's to keep true: `skill/my-plan.SKILL.md` (the planner skill as it will read once the CLI exists; every command it names must exist as it names it). It is installed by the owner, who copies it into the chezmoi source (`dot_claude/skills/my-plan/SKILL.md`) after approving it; this project never writes there.
 - No roles or auth: which session runs which command is the skill's convention. But `report` and `block` touch only status and their own section, never the planner's text.
 - `amend` takes a queued, started or blocked brief: a draft is still the planner's to edit, and a reported brief is done, so what is decided after the report belongs to the next brief; there is no way back from reported (owner, 2026-11-20). A question or an amendment with a `## ` line outside a code fence is refused (use `###`): it would split the brief's section. So is one that opens a fence and leaves it open, which would turn the sections after it into quoted text. A report may hold anything: it is the last section.
-- `file` verifies commits by the trailer `Brief: <id>` in the project repo (`git log --grep`), reachable from HEAD: the worker puts it on every commit of a brief. Decided by the owner, 2026-11-20, over SHAs noted in the report: a rebase changes every SHA and keeps the message. A brief without any such commit is not filed (`--no-commits` for a brief that changed nothing in the repo).
+- `file` verifies commits by the trailer `Brief: <id>` on a line of its own, in the repository the command runs in (also with `--board`), reachable from HEAD: the worker puts it on every commit of a brief. Decided by the owner, 2026-11-20, over SHAs noted in the report: a rebase changes every SHA and keeps the message. A brief without any such commit is not filed (`--no-commits` for a brief that changed nothing in the repo). Filing is one commit: the backlog lines `closes:` names are deleted, the brief is stamped filed and moved to `briefs/done/`; it prints `filed 128 (3 commits) closed b41`. An item already gone (dropped since the brief was queued) is skipped, as the item is closed either way; one on two lines is refused, as deleting both would guess.
 
 ## Sync
 

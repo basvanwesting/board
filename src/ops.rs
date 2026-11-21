@@ -3,7 +3,13 @@
 //! without either. The write loop in `sync.rs` loads the project, runs one of
 //! these and commits what it changed.
 
-use crate::brief::{BadStatus, Brief, EntryText, Stamp, Status, Text, Transition, TransitionError};
+use std::fmt;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+
+use crate::brief::{
+    BadStatus, Brief, EntryText, NotABacklogId, Stamp, Status, Text, Transition, TransitionError,
+};
 use crate::error::Error;
 use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
@@ -210,6 +216,133 @@ pub(crate) fn report(
     file.transition(Transition::Report, now)
         .map_err(|error| refused(not_moved(&error, Status::Started)))?;
     Ok(format!("reported {number}"))
+}
+
+/// What `file` knows of a brief's commits in the project repository,
+/// counted before the write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Commits {
+    /// `--no-commits`: the brief changed nothing in the repository.
+    Skipped,
+    /// The commits reachable from `HEAD` of `repository` that carry the
+    /// brief's trailer.
+    Counted { count: usize, repository: PathBuf },
+    /// The command runs at `at`, in no repository: git's reason. Told only
+    /// after the brief's status, by `file`.
+    NoRepository { at: PathBuf, said: String },
+}
+
+/// What `file` did; prints as `filed 128 (3 commits) closed b41 b52`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filed {
+    pub number: BriefId,
+    /// `None` for a brief filed with `--no-commits`. Never zero: a brief
+    /// without a commit is not filed.
+    pub commits: Option<NonZeroUsize>,
+    /// The backlog items whose lines were deleted.
+    pub closed: Vec<BacklogId>,
+}
+
+impl fmt::Display for Filed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "filed {} (", self.number)?;
+        match self.commits {
+            None => f.write_str("no commits")?,
+            Some(n) if n.get() == 1 => f.write_str("1 commit")?,
+            Some(n) => write!(f, "{n} commits")?,
+        }
+        f.write_str(")")?;
+        if !self.closed.is_empty() {
+            let ids: Vec<String> = self.closed.iter().map(BacklogId::to_string).collect();
+            write!(f, " closed {}", ids.join(" "))?;
+        }
+        Ok(())
+    }
+}
+
+/// Files a reported brief: deletes the backlog lines its `closes:` names,
+/// stamps it filed and moves it to `briefs/done/`, all in one commit.
+///
+/// The commits are checked after the status, so a brief that is not
+/// reported says so rather than that it has no commits.
+///
+/// An item `closes:` names that is gone already (dropped meanwhile, or
+/// deleted by hand) is skipped: the brief is what is filed, and the item is
+/// closed either way. One on two lines is refused, as everywhere: deleting
+/// both would guess which one the planner meant.
+pub(crate) fn file(
+    project: &mut Project,
+    number: BriefId,
+    commits: &Commits,
+    now: Stamp,
+) -> Result<Filed, Error> {
+    let refused = |why: String| Error::Refused(format!("file {number}: {why}"));
+    let file = project
+        .find_brief(number)
+        .map_err(|why| refused(no_brief(number, why)))?;
+    match file.status() {
+        Ok(Status::Reported) => {}
+        Ok(status) => return Err(refused(format!("it is {status}, not reported"))),
+        Err(bad) => return Err(refused(bad_status(&bad))),
+    }
+    let commits = match commits {
+        Commits::Skipped => None,
+        Commits::Counted { count, repository } => {
+            Some(NonZeroUsize::new(*count).ok_or_else(|| {
+                refused(format!(
+                    "no commit reachable from HEAD in {} has the trailer `Brief: {number}`; \
+                     the worker puts it on every commit of the brief \
+                     (--no-commits files a brief that changed nothing there)",
+                    repository.display()
+                ))
+            })?)
+        }
+        Commits::NoRepository { at, said } => {
+            return Err(Error::Usage(format!(
+                "file {number}: no repository at {} to count the brief's commits in ({said}); \
+                 run it in the project's checkout, or file with --no-commits",
+                at.display()
+            )));
+        }
+    };
+    let closes = file.brief.closes().map_err(|NotABacklogId(word)| {
+        refused(format!(
+            "its `closes:` names `{}`, which is no backlog id; fix the header first",
+            word.escape_debug()
+        ))
+    })?;
+    let mut closed = Vec::new();
+    for id in closes {
+        match project.list(ListKind::Backlog).find(id.get()) {
+            Ok(_) => closed.push(id),
+            Err(FindError::Missing) => {}
+            Err(why @ FindError::Duplicate(_)) => {
+                return Err(refused(format!(
+                    "closes {id}: {}",
+                    not_one(ListKind::Backlog, id.get(), why)
+                )));
+            }
+        }
+    }
+    // Only a list that loses a line is touched: a brief that closes nothing
+    // must not write a backlog file the project does not have.
+    if !closed.is_empty() {
+        let numbers: Vec<u32> = closed.iter().map(|id| id.get()).collect();
+        project
+            .list_mut(ListKind::Backlog)
+            .remove(&numbers)
+            .expect("each id is on one line, checked above");
+    }
+    let file = project
+        .brief_mut(number)
+        .map_err(|why| refused(no_brief(number, why)))?;
+    file.transition(Transition::File, now)
+        .map_err(|error| refused(not_moved(&error, Status::Reported)))?;
+    Ok(Filed {
+        number,
+        commits,
+        closed,
+    })
 }
 
 /// The brief to edit, when it is started; else why not. Nothing is changed
@@ -802,6 +935,138 @@ mod tests {
             let _ = report(&mut shop, id, &text, at(T));
         }
         assert_eq!(changed(&shop), Vec::<String>::new());
+    }
+
+    fn counted(count: usize) -> Commits {
+        Commits::Counted {
+            count,
+            repository: PathBuf::from("/w/shop"),
+        }
+    }
+
+    fn paths(project: &Project) -> Vec<String> {
+        project
+            .changed_paths()
+            .iter()
+            .map(BoardPath::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn file_closes_the_backlog_items_and_moves_the_brief_to_done() {
+        let reported = "id: 1\nstatus: reported\ncloses: b41, b9, b52\n\n# T\n";
+        let mut shop = with_briefs(
+            &[("briefs/1-a.md", reported)],
+            "- b41 a\n  more on a\n- b52 b\n- b60 c\n",
+        );
+        let filed = file(&mut shop, BriefId::new(1), &counted(3), at(T)).unwrap();
+        // b9 was dropped since the brief was queued: skipped.
+        assert_eq!(filed.to_string(), "filed 1 (3 commits) closed b41 b52");
+        assert_eq!(shop.backlog.to_bytes(), b"  more on a\n- b60 c\n");
+        assert_eq!(
+            paths(&shop),
+            [
+                "shop/backlog.md",
+                "shop/briefs/1-a.md",
+                "shop/briefs/done/1-a.md"
+            ]
+        );
+        assert_eq!(
+            shop.bytes(&BoardPath::parse("shop/briefs/1-a.md").unwrap()),
+            None
+        );
+        assert_eq!(
+            text_of(&shop, "briefs/done/1-a.md"),
+            format!("id: 1\nstatus: filed\ncloses: b41, b9, b52\nfiled: {T}\n\n# T\n")
+        );
+        assert_eq!(
+            shop.find_brief(BriefId::new(1)).unwrap().status(),
+            Ok(Status::Filed)
+        );
+    }
+
+    #[test]
+    fn file_without_closes_leaves_the_backlog_alone() {
+        let mut shop = with_briefs(&[("briefs/1-a.md", "status: reported\n")], "");
+        let filed = file(&mut shop, BriefId::new(1), &Commits::Skipped, at(T)).unwrap();
+        assert_eq!(filed.to_string(), "filed 1 (no commits)");
+        assert_eq!(
+            paths(&shop),
+            ["shop/briefs/1-a.md", "shop/briefs/done/1-a.md"]
+        );
+
+        let mut shop = with_briefs(&[("briefs/2-a.md", "status: reported\n")], "");
+        let filed = file(&mut shop, BriefId::new(2), &counted(1), at(T)).unwrap();
+        assert_eq!(filed.to_string(), "filed 2 (1 commit)");
+    }
+
+    #[test]
+    fn file_refuses_what_it_cannot_file_and_changes_nothing() {
+        let files = [
+            ("briefs/1-a.md", "status: started\n"),
+            ("briefs/2-a.md", "status: reported\n"),
+            ("briefs/3-a.md", "status: reported\ncloses: b4l\n"),
+            ("briefs/4-a.md", "status: reported\ncloses: b1, b2\n"),
+            ("briefs/done/5-a.md", "status: filed\n"),
+            ("briefs/6-a.md", "status: reported\n"),
+            ("briefs/done/6-b.md", ""),
+            ("briefs/7-a.md", "# no header\n"),
+        ];
+        let backlog = "- b1 x\n- b2 y\n- b2 z\n";
+        let refusals: Vec<String> = [
+            (1, counted(2)),
+            (2, counted(0)),
+            (3, counted(1)),
+            (4, Commits::Skipped),
+            (5, counted(1)),
+            (6, counted(1)),
+            (7, counted(1)),
+            (8, counted(1)),
+        ]
+        .into_iter()
+        .map(|(number, commits)| {
+            let mut shop = with_briefs(&files, backlog);
+            let result = file(&mut shop, BriefId::new(number), &commits, at(T));
+            assert_eq!(paths(&shop), Vec::<String>::new(), "{number}");
+            refused(result)
+        })
+        .collect();
+        assert_eq!(
+            refusals,
+            [
+                "file 1: it is started, not reported",
+                "file 2: no commit reachable from HEAD in /w/shop has the trailer `Brief: 2`; \
+                 the worker puts it on every commit of the brief (--no-commits files a brief \
+                 that changed nothing there)",
+                "file 3: its `closes:` names `b4l`, which is no backlog id; fix the header first",
+                "file 4: closes b2: b2 is on 2 lines; fix the duplicate first",
+                "file 5: it is filed, not reported",
+                "file 6: 6 is on 2 files; fix the duplicate first",
+                "file 7: it has no `status:` line",
+                "file 8: no such brief",
+            ]
+        );
+
+        // No repository to count in: told after the status, as usage.
+        let nowhere = || Commits::NoRepository {
+            at: PathBuf::from("/w"),
+            said: "not a git repository".to_owned(),
+        };
+        let mut shop = with_briefs(&files, backlog);
+        assert_eq!(
+            refused(file(&mut shop, BriefId::new(1), &nowhere(), at(T))),
+            "file 1: it is started, not reported"
+        );
+        match file(&mut shop, BriefId::new(2), &nowhere(), at(T)) {
+            Err(Error::Usage(why)) => assert_eq!(
+                why,
+                "file 2: no repository at /w to count the brief's commits in \
+                 (not a git repository); run it in the project's checkout, or file with \
+                 --no-commits"
+            ),
+            other => panic!("not a usage error: {other:?}"),
+        }
+        assert_eq!(paths(&shop), Vec::<String>::new());
     }
 
     #[test]

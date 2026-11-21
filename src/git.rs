@@ -693,6 +693,22 @@ impl Git {
             .map_err(|_| Failure::Said("git rev-list --count printed no number".to_owned()))
     }
 
+    /// How many commits reachable from `HEAD` have a message line that
+    /// matches `pattern`, an extended regular expression.
+    ///
+    /// `-E` pins the dialect whatever the user's `grep.patternType` says:
+    /// with `fixed`, `git log --grep` without `-E` matches literally (git
+    /// 2.56; `rev-list` reads no `grep.*` setting). `rev-list` for
+    /// `--count`: one number, not lines to count.
+    pub(crate) fn count_matching_head(&self, pattern: &str) -> Result<usize, Failure> {
+        let grep = format!("--grep={pattern}");
+        let stdout = self.run(&["rev-list", "--count", "-E", &grep, "HEAD"])?;
+        String::from_utf8_lossy(&stdout)
+            .trim()
+            .parse()
+            .map_err(|_| Failure::Said("git rev-list --count printed no number".to_owned()))
+    }
+
     /// The three blobs' lines merged, with both sides of a conflict kept,
     /// ours first: the line order of a list merge.
     pub(crate) fn union(&self, ours: &Oid, base: &Oid, theirs: &Oid) -> Result<Vec<u8>, Failure> {

@@ -22,7 +22,9 @@
 //!   and nothing refused or never pushed is anywhere; a brief `new brief`
 //!   printed is on the remote under its number, and the remote has as many
 //!   more claimed briefs as `next` printed paths; the line `block`, `amend`
-//!   or `report` wrote is in its brief, and one they refused is in none;
+//!   or `report` wrote is in its brief, and one they refused is in none; a
+//!   brief `file` printed is in `done/` there, without the items it says it
+//!   closed;
 //! - convergence, at `Quiesce` and at the end: after `sync` on A, B and A,
 //!   both clones are on the remote's commit with no board file changed,
 //!   every token added and not closed is there once, and every line written
@@ -82,10 +84,12 @@ enum Op {
     NewBrief,
     /// A draft of the clone or the remote, picked when the step runs.
     /// `write`: its sections are written by hand first when the clone's file
-    /// has none, as the planner does before it queues.
+    /// has none, as the planner does before it queues. `closes`: a backlog
+    /// item of the clone or the remote it closes, when there is one.
     Queue {
         pick: Index,
         write: bool,
+        closes: Option<Index>,
     },
     Next,
     /// A started brief of the clone or the remote, picked when the step
@@ -97,6 +101,13 @@ enum Op {
     /// A started brief of the clone or the remote, picked when the step
     /// runs.
     Report(Index),
+    /// A reported brief of the clone or the remote, picked when the step
+    /// runs. `trailer`: a commit with its trailer is made in the project
+    /// first; else it is filed with `--no-commits`.
+    File {
+        pick: Index,
+        trailer: bool,
+    },
 }
 
 /// Which brief a hand edit writes into.
@@ -185,12 +196,14 @@ fn op() -> impl Strategy<Value = Op> {
         2 => any::<Index>().prop_map(Op::Done),
         2 => any::<Index>().prop_map(Op::Drop),
         2 => Just(Op::NewBrief),
-        3 => (any::<Index>(), prop::bool::weighted(0.8))
-            .prop_map(|(pick, write)| Op::Queue { pick, write }),
+        3 => (any::<Index>(), prop::bool::weighted(0.8), prop::option::of(any::<Index>()))
+            .prop_map(|(pick, write, closes)| Op::Queue { pick, write, closes }),
         2 => Just(Op::Next),
         2 => any::<Index>().prop_map(Op::Block),
         2 => any::<Index>().prop_map(Op::Amend),
         2 => any::<Index>().prop_map(Op::Report),
+        2 => (any::<Index>(), prop::bool::weighted(0.8))
+            .prop_map(|(pick, trailer)| Op::File { pick, trailer }),
     ]
 }
 
@@ -405,6 +418,9 @@ enum Subject {
     Block(u32, String),
     Amend(u32, String),
     Report(u32, String),
+    /// The brief, and the backlog ids its `closes:` named when the step
+    /// began.
+    File(u32, Vec<Id>),
 }
 
 impl Subject {
@@ -419,7 +435,8 @@ impl Subject {
             | Subject::Close(_)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
-            | Subject::Next => None,
+            | Subject::Next
+            | Subject::File(..) => None,
         }
     }
 
@@ -432,7 +449,8 @@ impl Subject {
             | Subject::Close(_)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
-            | Subject::Next => None,
+            | Subject::Next
+            | Subject::File(..) => None,
         }
     }
 }
@@ -476,6 +494,8 @@ struct Depth {
     briefs_blocked: u32,
     briefs_resumed: u32,
     briefs_reported: u32,
+    briefs_filed: u32,
+    closed_by_file: u32,
 }
 
 impl Depth {
@@ -503,6 +523,8 @@ impl Depth {
         self.briefs_blocked += other.briefs_blocked;
         self.briefs_resumed += other.briefs_resumed;
         self.briefs_reported += other.briefs_reported;
+        self.briefs_filed += other.briefs_filed;
+        self.closed_by_file += other.closed_by_file;
     }
 }
 
@@ -753,18 +775,55 @@ impl<'w> Oracle<'w> {
                 let slug = self.token();
                 (owned(&["new", "brief", &slug]), Subject::NewBrief(slug))
             }
-            Op::Queue { pick, .. } => {
+            Op::Queue {
+                pick: draft,
+                closes,
+                ..
+            } => {
                 // Nothing to pick: a brief that is not there, for a refusal.
                 let drafts = self.drafts(who);
                 let number = if drafts.is_empty() {
                     999_999
                 } else {
-                    *pick.get(&drafts)
+                    *draft.get(&drafts)
                 };
-                (
-                    owned(&["queue", &number.to_string()]),
-                    Subject::Queue(number),
-                )
+                let mut args = owned(&["queue", &number.to_string()]);
+                // An item the clone or the remote has; none when neither
+                // has one.
+                if let Some(index) = closes {
+                    let (_, item) = pick(self, 'b', index);
+                    if item != 999_999 {
+                        args.extend(["--closes".to_owned(), format!("b{item}")]);
+                    }
+                }
+                (args, Subject::Queue(number))
+            }
+            Op::File { pick, trailer } => {
+                let numbers = self.open_with(who, &["reported"]);
+                // Nothing to pick: a brief that is not there, for a refusal.
+                let number = if numbers.is_empty() {
+                    999_999
+                } else {
+                    *pick.get(&numbers)
+                };
+                let mut args = owned(&["file", &number.to_string()]);
+                if *trailer {
+                    // The worker's commit of the brief.
+                    let machine = self.machine(who);
+                    machine.git(
+                        &machine.proj(),
+                        [
+                            "commit",
+                            "-q",
+                            "--allow-empty",
+                            "-m",
+                            &format!("work\n\nBrief: {number}"),
+                        ],
+                    );
+                } else {
+                    args.push("--no-commits".to_owned());
+                }
+                (args, Subject::File(number, self.closes_of(who, number)))
             }
             Op::Next => (owned(&["next"]), Subject::Next),
             Op::Block(pick) | Op::Amend(pick) | Op::Report(pick) => {
@@ -798,6 +857,30 @@ impl<'w> Oracle<'w> {
                 (args, subject)
             }
         }
+    }
+
+    /// The backlog ids the `closes:` line of a brief names, in the clone's
+    /// file and the remote's.
+    fn closes_of(&self, who: Who, number: u32) -> Vec<Id> {
+        let ids: BTreeSet<Id> = [who.slot(), 2]
+            .into_iter()
+            .flat_map(|place| self.briefs(place))
+            .filter(|brief| brief.number == number)
+            .flat_map(|brief| {
+                let closes = brief
+                    .text
+                    .lines()
+                    .take_while(|line| !line.is_empty())
+                    .find_map(|line| line.strip_prefix("closes: "))
+                    .unwrap_or_default()
+                    .to_owned();
+                closes
+                    .split(", ")
+                    .filter_map(|word| id_of('b', word))
+                    .collect::<Vec<Id>>()
+            })
+            .collect();
+        ids.into_iter().collect()
     }
 
     /// The numbers of the open briefs of the clone and the remote that have
@@ -1084,15 +1167,16 @@ impl<'w> Oracle<'w> {
         self.check_everywhere()
     }
 
-    /// For `block`, `amend` and `report` when neither the clone nor the
-    /// remote has a brief they take: the commands that bring one there, as
-    /// the planner and the worker would have run them, each judged as a
+    /// For `block`, `amend`, `report` and `file` when neither the clone nor
+    /// the remote has a brief they take: the commands that bring one there,
+    /// as the planner and the worker would have run them, each judged as a
     /// command of its own. Left to chance, a trace seldom gets a brief from
-    /// new to started before it ends.
+    /// new to started, let alone reported, before it ends.
     fn prepare(&mut self, who: Who, op: &Op) -> Result<(), TestCaseError> {
         let wanted: &[&str] = match op {
             Op::Block(_) | Op::Report(_) => &["started"],
             Op::Amend(_) => &["queued", "started", "blocked"],
+            Op::File { .. } => &["reported"],
             Op::AddChore { .. }
             | Op::AddBacklog
             | Op::Done(_)
@@ -1101,17 +1185,21 @@ impl<'w> Oracle<'w> {
             | Op::Queue { .. }
             | Op::Next => return Ok(()),
         };
-        // At most new, queue and next; fewer when one is refused.
-        for _ in 0..3 {
+        // At most new, queue, next and report; fewer when one is refused.
+        for _ in 0..4 {
             if !self.open_with(who, wanted).is_empty() {
                 break;
             }
-            let before = if !self.open_with(who, &["queued"]).is_empty() {
+            let before = if !self.open_with(who, &["started"]).is_empty() {
+                Op::Report(first())
+            } else if !self.open_with(who, &["queued"]).is_empty() {
                 Op::Next
             } else if !self.drafts(who).is_empty() {
+                // Closing the first item there is, so that `file` closes one.
                 Op::Queue {
                     pick: first(),
                     write: true,
+                    closes: Some(first()),
                 }
             } else {
                 Op::NewBrief
@@ -1396,8 +1484,10 @@ impl<'w> Oracle<'w> {
             Some(1) => {
                 self.depth.refused += 1;
                 prop_assert!(
-                    matches!(subject, Subject::Close(_) | Subject::Queue(_))
-                        || subject.brief_line().is_some(),
+                    matches!(
+                        subject,
+                        Subject::Close(_) | Subject::Queue(_) | Subject::File(..)
+                    ) || subject.brief_line().is_some(),
                     "{run:?}"
                 );
             }
@@ -1597,6 +1687,106 @@ impl<'w> Oracle<'w> {
             | Subject::Amend(number, token)
             | Subject::Report(number, token) => {
                 self.judge_brief_line(who, subject, run, pushed, (*number, token))?;
+            }
+            Subject::File(number, closes) => {
+                self.judge_file(who, run, pushed, *number, closes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A `file` run: what it printed, the brief filed in the place it wrote
+    /// to, and the items it says it closed gone from there.
+    fn judge_file(
+        &mut self,
+        who: Who,
+        run: &Run,
+        pushed: bool,
+        number: u32,
+        closes: &[Id],
+    ) -> Result<(), TestCaseError> {
+        match run.code {
+            Some(0) => {
+                let rest = run
+                    .stdout
+                    .strip_suffix('\n')
+                    .and_then(|line| line.strip_prefix(&format!("filed {number} (")));
+                let Some((commits, closed)) = rest.and_then(|rest| rest.split_once(')')) else {
+                    return Err(TestCaseError::fail(format!("file printed {run:?}")));
+                };
+                prop_assert!(
+                    matches!(commits, "no commits" | "1 commit")
+                        || commits
+                            .strip_suffix(" commits")
+                            .is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n > 1)),
+                    "{:?}",
+                    run
+                );
+                let closed: Vec<Id> = match closed.strip_prefix(" closed ") {
+                    Some(ids) => ids.split(' ').filter_map(|id| id_of('b', id)).collect(),
+                    None => {
+                        prop_assert_eq!(closed, "", "{:?}", run);
+                        Vec::new()
+                    }
+                };
+                prop_assert!(
+                    closed.iter().all(|id| closes.contains(id)),
+                    "file closed {:?}, its brief names {:?}: {:?}",
+                    closed,
+                    closes,
+                    run
+                );
+                let place = if pushed { 2 } else { who.slot() };
+                let found: Vec<BriefSeen> = self
+                    .briefs(place)
+                    .into_iter()
+                    .filter(|brief| brief.number == number)
+                    .collect();
+                prop_assert!(
+                    matches!(&found[..], [brief] if brief.filed
+                        && brief.status.as_deref() == Some("filed")),
+                    "brief {} is not filed after {:?}: {:?}",
+                    number,
+                    run,
+                    found
+                );
+                let left = self.ids_in(place, 'b');
+                for id in &closed {
+                    prop_assert!(
+                        !left.contains(&id.1),
+                        "{:?} is still there after {:?}",
+                        id,
+                        run
+                    );
+                    self.closed.extend(self.owners.get(id).cloned());
+                }
+                // And none it names is left open unsaid: ids are never
+                // reused, so a named id still there is one `file` skipped.
+                for id in closes {
+                    prop_assert!(
+                        !left.contains(&id.1),
+                        "{:?}, named by brief {}, is still there after {:?}",
+                        id,
+                        number,
+                        run
+                    );
+                }
+                self.depth.briefs_filed += 1;
+                self.depth.closed_by_file += u32::try_from(closed.len()).unwrap();
+            }
+            Some(1) => {
+                let last = run.stderr.lines().last().unwrap_or_default();
+                prop_assert!(
+                    last.starts_with(&format!("board: file {number}: ")),
+                    "{:?}",
+                    run
+                );
+            }
+            // Killed: the items it closes are closed or not.
+            Some(_) | None => {
+                for id in closes {
+                    self.maybe_closed.extend(self.owners.get(id).cloned());
+                }
             }
         }
         Ok(())
@@ -1904,17 +2094,21 @@ impl<'w> Oracle<'w> {
                 .iter()
                 .any(|brief| brief.number == *number && has_line(&brief.text));
             // A copy is `<brief file name>.local[<n>]`, of the clone's file
-            // of that number, whatever the remote's is named.
+            // of that number, whatever the remote's is named, and where the
+            // clone had it: a brief the clone filed is in `done/`.
             let machine = self.machine(*who);
-            let dir = machine.data().join("proj/briefs");
-            let in_copy = fs::read_dir(&dir).into_iter().flatten().any(|entry| {
-                let entry = entry.unwrap();
-                let file_name = entry.file_name().to_string_lossy().into_owned();
-                file_name
-                    .split_once(".md.local")
-                    .and_then(|(brief, _)| brief_number(&format!("{brief}.md")))
-                    == Some(*number)
-                    && has_line(&fs::read_to_string(entry.path()).unwrap())
+            let in_copy = ["proj/briefs", "proj/briefs/done"].into_iter().any(|dir| {
+                let dir = machine.data().join(dir);
+                fs::read_dir(&dir).into_iter().flatten().any(|entry| {
+                    let entry = entry.unwrap();
+                    let file_name = entry.file_name().to_string_lossy().into_owned();
+                    entry.file_type().unwrap().is_file()
+                        && file_name
+                            .split_once(".md.local")
+                            .and_then(|(brief, _)| brief_number(&format!("{brief}.md")))
+                            == Some(*number)
+                        && has_line(&fs::read_to_string(entry.path()).unwrap())
+                })
             });
             prop_assert!(
                 in_brief || in_copy,
@@ -2008,6 +2202,8 @@ fn the_traces_get_deep() {
     assert!(depth.briefs_blocked > 0, "{depth:?}");
     assert!(depth.briefs_resumed > 0, "{depth:?}");
     assert!(depth.briefs_reported > 0, "{depth:?}");
+    assert!(depth.briefs_filed > 0, "{depth:?}");
+    assert!(depth.closed_by_file > 0, "{depth:?}");
     assert!(
         depth.succeeded * 10 >= depth.commands * 6,
         "fewer than 60% of the commands succeeded: {depth:?}"
@@ -2103,6 +2299,7 @@ fn next_runs_while_queue_pushes() {
                 op: Op::Queue {
                     pick: first(),
                     write,
+                    closes: None,
                 },
                 fault: Some(Fault::WindowOp(Op::Next)),
             },
@@ -2125,6 +2322,7 @@ fn next_after_a_queue_whose_brief_was_saved_during_the_push() {
             op: Op::Queue {
                 pick: first(),
                 write: false,
+                closes: None,
             },
             fault: Some(Fault::WindowEdit(Edit::Brief(BriefPick::First))),
         },

@@ -16,7 +16,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::id::{BacklogId, BriefId};
+use crate::id::{BacklogId, BriefId, ListKind};
 use crate::raw;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -297,6 +297,11 @@ pub enum TransitionError {
     NotFrom(Status),
 }
 
+/// A word of `closes:` that is no backlog id, as found (lossily when it is
+/// not UTF-8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotABacklogId(pub String);
+
 /// The key of a header line: `^[a-z]+:( |$)`.
 fn header_key(content: &[u8]) -> Option<&[u8]> {
     let colon = content.iter().position(|b| !b.is_ascii_lowercase())?;
@@ -568,6 +573,33 @@ impl Brief {
     pub(crate) fn set_closes(&mut self, ids: &[BacklogId]) {
         let ids: Vec<String> = ids.iter().map(BacklogId::to_string).collect();
         self.set("closes", &ids.join(", "));
+    }
+
+    /// The backlog items `closes:` names, each once, in its order; none
+    /// without the key. The words may be separated by commas, blanks or
+    /// both: the line is also written by hand.
+    ///
+    /// A word that is no backlog id is an error, not skipped: `file` deletes
+    /// what this names, and a typo (`b4l`) skipped would leave the item open
+    /// without a word.
+    pub(crate) fn closes(&self) -> Result<Vec<BacklogId>, NotABacklogId> {
+        let Some(value) = self.get("closes") else {
+            return Ok(Vec::new());
+        };
+        let mut ids: Vec<BacklogId> = Vec::new();
+        for word in value
+            .split(|b| *b == b',' || b.is_ascii_whitespace())
+            .filter(|word| !word.is_empty())
+        {
+            let id = ListKind::Backlog
+                .parse_id(word)
+                .and_then(BacklogId::new)
+                .ok_or_else(|| NotABacklogId(String::from_utf8_lossy(word).into_owned()))?;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// The `## ` sections of the body, in file order.
@@ -1229,6 +1261,41 @@ mod tests {
             utf8(&brief.to_bytes()),
             "id: 1\nstatus: draft\ncloses: b52\n\n# T\n"
         );
+    }
+
+    #[test]
+    fn closes_reads_what_is_written_and_what_a_hand_types() {
+        let ids = |text: &str| {
+            Brief::parse(text.as_bytes())
+                .closes()
+                .map(|ids| ids.into_iter().map(BacklogId::get).collect::<Vec<u32>>())
+        };
+        assert_eq!(ids("id: 1\n\n# T\n"), Ok(vec![]));
+        assert_eq!(ids("closes:\n"), Ok(vec![]));
+        assert_eq!(ids("closes: b41, b52\n"), Ok(vec![41, 52]));
+        assert_eq!(ids("closes: b52 b41,b52,, \r\n"), Ok(vec![52, 41]));
+        for (text, word) in [
+            ("closes: b41, b4l\n", "b4l"),
+            ("closes: c41\n", "c41"),
+            ("closes: b041\n", "b041"),
+            ("closes: b0\n", "b0"),
+            ("closes: 41\n", "41"),
+        ] {
+            assert_eq!(ids(text), Err(NotABacklogId(word.to_owned())), "{text}");
+        }
+    }
+
+    proptest! {
+        /// What `queue` writes is what `file` reads.
+        #[test]
+        fn closes_reads_back_what_set_closes_wrote(
+            numbers in prop::collection::btree_set(1u32.., 0..6),
+        ) {
+            let ids: Vec<BacklogId> = numbers.into_iter().filter_map(BacklogId::new).collect();
+            let mut brief = Brief::parse(b"id: 1\nstatus: draft\n\n# T\n");
+            brief.set_closes(&ids);
+            prop_assert_eq!(brief.closes(), Ok(ids));
+        }
     }
 
     // ---- sections ----

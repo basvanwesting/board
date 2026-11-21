@@ -4,3 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc 08773072d61ad9ee566e1aa9b5ab9b6de21c9af3edd0a48505a7d22f3f7eaeef # shrinks to [Cmd { who: A, op: AddBacklog, fault: Some(WindowOp(Drop(Index(10345090333)))) }, Cmd { who: A, op: File { pick: Index(190854505515160713), trailer: false }, fault: None }]

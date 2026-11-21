@@ -8,7 +8,7 @@ use crate::git::{Failure, Git, Oid};
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
 use crate::lint::{Finding, lint};
 use crate::list::{Entry, Line, ListFile};
-use crate::ops::{self, NewChore};
+use crate::ops::{self, Commits, Filed, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Note};
 
@@ -193,6 +193,61 @@ impl Board {
         })
     }
 
+    /// Files a reported brief: the backlog items it closes are deleted, and
+    /// it moves to `briefs/done/`, in one commit.
+    ///
+    /// The commits are counted before the write, in the repository the
+    /// command runs in: they are the worker's, not the board's, and a write
+    /// may run its command more than once.
+    pub fn file(&self, id: BriefId, check: CommitCheck) -> Result<Filed, Error> {
+        let commits = match check {
+            CommitCheck::Trailer => self.brief_commits(id)?,
+            CommitCheck::Skip => Commits::Skipped,
+        };
+        let now = now()?;
+        self.command("file", &|tx| {
+            let filed = ops::file(&mut tx.project, id, &commits, now)?;
+            Ok((filed, format!("filed {id}")))
+        })
+    }
+
+    /// The commits of the repository the command runs in that carry the
+    /// brief's trailer, `Brief: <id>` on a line of its own (trailing blanks
+    /// allowed), reachable from `HEAD`.
+    ///
+    /// By trailer, not by commit ids noted in the report: a rebase changes
+    /// every id and keeps the message (the owner's decision).
+    fn brief_commits(&self, number: BriefId) -> Result<Commits, Error> {
+        let repository = match Git::at(&self.cwd).toplevel() {
+            Ok(repository) => repository,
+            // Told by `ops::file` after the status: a brief that is not
+            // reported says so first.
+            Err(Failure::Said(said)) => {
+                return Ok(Commits::NoRepository {
+                    at: self.cwd.clone(),
+                    said,
+                });
+            }
+            Err(failure @ Failure::NotRun(_)) => return Err(Error::Git(failure.to_string())),
+        };
+        let git = Git::at(&repository);
+        let git_error = |failure: Failure| {
+            Error::Git(format!(
+                "file {number}: cannot count the commits in {}: {failure}",
+                repository.display()
+            ))
+        };
+        // A repository without a commit has none with the trailer; `HEAD`
+        // names nothing there, and rev-list would fail on it.
+        let count = match git.commit("HEAD").map_err(git_error)? {
+            None => 0,
+            Some(_) => git
+                .count_matching_head(&format!("^Brief: {number}[[:space:]]*$"))
+                .map_err(git_error)?,
+        };
+        Ok(Commits::Counted { count, repository })
+    }
+
     /// Where a board path is on this machine.
     fn path(&self, path: &BoardPath) -> PathBuf {
         self.root.join(path.to_string())
@@ -227,6 +282,15 @@ impl Board {
         let value = sync::write(&self.root, &self.project, what, &*self.notes, Some(apply))?;
         Ok(value.expect("a write that runs a command gives its value"))
     }
+}
+
+/// Whether `file` checks that the brief has commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitCheck {
+    /// At least one commit with the brief's trailer, or no filing.
+    Trailer,
+    /// `--no-commits`: the brief changed nothing in the repository.
+    Skip,
 }
 
 /// The time a write stamps, taken once, before the write: every round of it

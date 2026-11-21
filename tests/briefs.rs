@@ -1,5 +1,5 @@
 //! The brief commands through the binary: `new brief`, `queue`, `next`,
-//! `block`, `amend`, `report`, on two clones of one bare remote.
+//! `block`, `amend`, `report`, `file`, on two clones of one bare remote.
 
 mod common;
 
@@ -664,6 +664,236 @@ fn a_report_made_while_an_amendment_lands_keeps_the_amendment() {
     assert_eq!(
         world.remote_log()[..2],
         ["proj: reported 1", "proj: amended 1"]
+    );
+    in_step(&world, &a);
+}
+
+// ---- file ----
+
+/// A brief that is new, written, queued with `queue_args` after its number,
+/// claimed and reported.
+fn reported(machine: &Machine, number: u32, slug: &str, queue_args: &[&str]) {
+    new_brief(machine, slug);
+    write_sections(machine, &format!("proj/briefs/{number}-{slug}.md"));
+    let number = number.to_string();
+    machine
+        .board(&[&["queue", &number][..], queue_args].concat())
+        .ok();
+    machine.board(&["next"]).ok();
+    machine
+        .board_with_input(&["report", &number], b"Done.\n")
+        .ok();
+}
+
+/// A commit in the machine's project repository with this message.
+fn commit(machine: &Machine, message: &str) {
+    machine.git(
+        &machine.proj(),
+        ["commit", "-q", "--allow-empty", "-m", message],
+    );
+}
+
+#[test]
+fn file_counts_the_trailer_closes_the_backlog_and_moves_the_brief() {
+    let world = World::new();
+    let a = world.a();
+    for item in ["one", "two", "three"] {
+        a.board(&["add", "backlog", item]).ok();
+    }
+    reported(&a, 1, "x", &["--closes", "b1,b3"]);
+    // b3 goes before the brief is filed: skipped.
+    a.board(&["drop", "b3"]).ok();
+    // Counted: the trailer on a line of its own, trailing blanks allowed.
+    commit(&a, "Fix the login\n\nBrief: 1");
+    commit(&a, "Fix the logout\n\nCo-Authored-By: x\nBrief: 1  ");
+    // Not counted: another brief, or the words inside a line.
+    commit(&a, "Other\n\nBrief: 10");
+    commit(&a, "Other\n\nAs in Brief: 1");
+    commit(&a, "Other\n\nBrief: 1, 2");
+    // The user's grep settings do not change what is counted.
+    a.git(&a.proj(), ["config", "grep.patternType", "fixed"]);
+    let log = world.remote_log();
+
+    assert_eq!(
+        a.board(&["file", "1"]).ok(),
+        "filed 1 (2 commits) closed b1\n"
+    );
+    assert_eq!(world.remote_file("proj/briefs/1-x.md"), None);
+    let file = "proj/briefs/done/1-x.md";
+    assert_eq!(header(&world, file, "status").as_deref(), Some("filed"));
+    a_stamp(header(&world, file, "filed"));
+    assert!(text(world.remote_file(file)).ends_with("## Report\nDone.\n"));
+    assert_eq!(text(world.remote_file("proj/backlog.md")), "- b2 two\n");
+    // One commit.
+    assert_eq!(world.remote_log()[..2], ["proj: filed 1", &log[0][..]]);
+    in_step(&world, &a);
+    assert_eq!(a.file("proj/briefs/1-x.md"), None);
+    assert_eq!(a.board(&["ls", "briefs"]).ok(), "");
+    assert_eq!(
+        a.board(&["ls", "briefs", "--status", "filed"]).ok(),
+        "1 filed x\n"
+    );
+    assert!(a.board(&["show", "1"]).ok().contains("status: filed\n"));
+}
+
+#[test]
+fn file_refuses_what_is_not_a_reported_brief_with_commits() {
+    let world = World::new();
+    let a = world.a();
+    started(&a, 1, "x");
+    commit(&a, "Fix\n\nBrief: 1");
+    let log = world.remote_log();
+    // The status comes before the commits, also outside a repository.
+    for at in [a.proj(), a.home()] {
+        assert_eq!(
+            a.board_in(&at, &["--board", "proj", "file", "1"]).failed(1),
+            "board: file 1: it is started, not reported\n"
+        );
+        assert_eq!(
+            a.board_in(&at, &["--board", "proj", "file", "2"]).failed(1),
+            "board: file 2: no such brief\n"
+        );
+    }
+    a.board_with_input(&["report", "1"], b"r").ok();
+    let log_reported = world.remote_log();
+    assert_eq!(log_reported[1..], log[..]);
+
+    // A brief without commits is not filed, unless it says it has none. The
+    // commits are counted in the repository the command runs in, also with
+    // --board; one without any commit has none with the trailer.
+    let other = a.repository("Work/other");
+    a.git(&other, ["commit", "-q", "--allow-empty", "-m", "Unrelated"]);
+    let empty = a.repository("Work/empty");
+    for repository in [&other, &empty] {
+        let said = a
+            .board_in(repository, &["--board", "proj", "file", "1"])
+            .failed(1);
+        assert_eq!(
+            said,
+            format!(
+                "board: file 1: no commit reachable from HEAD in {} has the trailer `Brief: 1`; \
+                 the worker puts it on every commit of the brief (--no-commits files a brief \
+                 that changed nothing there)\n",
+                repository.display()
+            )
+        );
+    }
+    // Outside a repository there is nothing to count in.
+    let said = a
+        .board_in(&a.home(), &["--board", "proj", "file", "1"])
+        .failed(2);
+    assert!(
+        said.starts_with(&format!(
+            "board: file 1: no repository at {} to count the brief's commits in",
+            a.home().display()
+        )),
+        "{said}"
+    );
+    for args in [&["file", "b1"][..], &["file"], &["file", "1", "--commits"]] {
+        a.board(args).failed(2);
+    }
+    assert_eq!(world.remote_log(), log_reported);
+
+    assert_eq!(
+        a.board_in(&a.home(), &["--board", "proj", "file", "1", "--no-commits"])
+            .ok(),
+        "filed 1 (no commits)\n"
+    );
+    assert_eq!(
+        a.board(&["file", "1"]).failed(1),
+        "board: file 1: it is filed, not reported\n"
+    );
+    in_step(&world, &a);
+}
+
+/// Offline `file` is committed on the clone, and the next write that
+/// reaches the remote pushes it.
+#[test]
+fn file_offline_waits_on_the_clone() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "backlog", "one"]).ok();
+    reported(&a, 1, "x", &["--closes", "b1"]);
+    commit(&a, "Fix\n\nBrief: 1");
+    a.set_online(false);
+    let ran = a.board(&["file", "1"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice()),
+        (0, &b"filed 1 (1 commit) closed b1\n"[..])
+    );
+    assert!(
+        ran.stderr.starts_with("board: not pushed: 1 commit ("),
+        "{ran:?}"
+    );
+    assert_eq!(a.file("proj/briefs/1-x.md"), None);
+    assert!(a.file("proj/briefs/done/1-x.md").is_some());
+    assert!(world.remote_file("proj/briefs/1-x.md").is_some());
+
+    // Meanwhile the other clone adds an item: the two are merged, and the
+    // move to done/ is taken from the side that made it.
+    world.b().board(&["add", "backlog", "two"]).ok();
+    a.set_online(true);
+    let ran = a.board(&["sync"]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert!(
+        ran.stderr
+            .starts_with("board: merged 1 local commit (by line: proj/backlog.md)"),
+        "{ran:?}"
+    );
+    assert_eq!(world.remote_file("proj/briefs/1-x.md"), None);
+    assert!(world.remote_file("proj/briefs/done/1-x.md").is_some());
+    assert_eq!(text(world.remote_file("proj/backlog.md")), "- b2 two\n");
+    in_step(&world, &a);
+}
+
+/// The other clone drops an item the brief closes while `file` pushes:
+/// `file` is made again on what the remote has then, and skips the item.
+#[test]
+fn an_item_dropped_while_file_pushes_is_skipped() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    a.board(&["add", "backlog", "one"]).ok();
+    a.board(&["add", "backlog", "two"]).ok();
+    reported(&a, 1, "x", &["--closes", "b1,b2"]);
+    commit(&a, "Fix\n\nBrief: 1");
+    b.board(&["sync"]).ok();
+    a.hook_once(
+        "pre-push",
+        &pre_push::window(&b.script(&["drop", "b1"]), world.dir()),
+    );
+    let ran = a.board(&["file", "1"]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert!(ran.stderr.contains("board: retry 2/4"), "{ran:?}");
+    assert_eq!(ran.stdout, b"filed 1 (1 commit) closed b2\n");
+    let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
+    assert_eq!(window("window.code"), "0\n");
+    assert_eq!(window("window.out"), "dropped b1\n");
+    assert_eq!(text(world.remote_file("proj/backlog.md")), "");
+    assert!(world.remote_file("proj/briefs/done/1-x.md").is_some());
+    in_step(&world, &a);
+}
+
+/// The push of `file` reached the remote, but `board` heard that it failed:
+/// it is not made again, which would be refused as filed already.
+#[test]
+fn a_file_that_landed_unheard_is_not_made_twice() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "backlog", "one"]).ok();
+    reported(&a, 1, "x", &["--closes", "b1"]);
+    commit(&a, "Fix\n\nBrief: 1");
+    a.hook_once("pre-push", pre_push::LOST_ACK);
+    let ran = a.board(&["file", "1"]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert_eq!(ran.stdout, b"filed 1 (1 commit) closed b1\n");
+    assert!(!a.has_hook("pre-push"));
+    assert_eq!(
+        world
+            .remote_log()
+            .iter()
+            .filter(|subject| *subject == "proj: filed 1")
+            .count(),
+        1
     );
     in_step(&world, &a);
 }

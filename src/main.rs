@@ -4,8 +4,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use board::{
-    BacklogId, Board, BriefId, BriefRow, ChoreId, EmptyText, Env, Error, Exit, ItemId, Line,
-    ListKind, ListRow, NewChore, Slug, Snapshot, Status, Text,
+    BacklogId, Board, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit, ItemId,
+    Line, ListKind, ListRow, NewChore, Slug, Snapshot, Status, Text,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -69,6 +69,16 @@ enum Command {
     Report {
         /// Like 128
         id: BriefId,
+    },
+    /// File a reported brief: check its commits, delete the backlog items it
+    /// closes, move it to briefs/done/
+    File {
+        /// Like 128
+        id: BriefId,
+        /// The brief changed nothing in the repository: no commit with its
+        /// `Brief: <id>` trailer is asked for
+        #[arg(long)]
+        no_commits: bool,
     },
     /// Add a chore or a backlog item; prints its new id
     Add {
@@ -218,6 +228,14 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::Block { id, question }) => Run::Block(id, question),
         Some(Command::Amend { id }) => Run::Amend(id, stdin_text(&format!("amend {id}"))?),
         Some(Command::Report { id }) => Run::Report(id, stdin_text(&format!("report {id}"))?),
+        Some(Command::File { id, no_commits }) => Run::File(
+            id,
+            if no_commits {
+                CommitCheck::Skip
+            } else {
+                CommitCheck::Trailer
+            },
+        ),
         Some(Command::Add {
             item:
                 AddItem::Chore {
@@ -265,6 +283,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
             board.report(id, &text)?;
             line(format!("reported {id}"))
         }
+        Run::File(id, check) => line(board.file(id, check)?.to_string()),
         Run::AddChore(new) => line(board.add_chore(&new)?.to_string()),
         Run::AddBacklog(text, from) => line(board.add_backlog(&text, from)?.to_string()),
         Run::Done(ids) => line(board.done(&ids)?),
@@ -299,6 +318,7 @@ enum Run {
     Block(BriefId, Text),
     Amend(BriefId, Text),
     Report(BriefId, Text),
+    File(BriefId, CommitCheck),
     AddChore(NewChore),
     AddBacklog(Line, Option<ItemId>),
     Done(Vec<ChoreId>),

@@ -438,6 +438,11 @@ impl BriefFile {
     /// Makes the move from the brief's status on the board. Not the header's
     /// alone: a brief in `briefs/done/` is filed whatever its header says,
     /// and no move leaves filed.
+    ///
+    /// Filing moves the file to `briefs/done/` too, in the same step: a
+    /// header that says `filed` anywhere else is no status (see
+    /// [`BriefFile::status`]), so the two cannot be separate edits.
+    /// [`Project::changed_paths`] then commits the move.
     pub fn transition(
         &mut self,
         transition: Transition,
@@ -447,7 +452,11 @@ impl BriefFile {
         if transition.apply(from).is_none() {
             return Err(TransitionError::NotFrom(from));
         }
-        self.brief.transition(transition, now)
+        let to = self.brief.transition(transition, now)?;
+        if to == Status::Filed {
+            self.filed = true;
+        }
+        Ok(to)
     }
 
     pub fn path(&self, project: &ProjectName) -> BoardPath {
@@ -553,6 +562,26 @@ impl Project {
             ListKind::Chores => &mut self.chores,
             ListKind::Backlog => &mut self.backlog,
         }
+    }
+
+    /// The paths a write commits: every file an edit went through, and
+    /// where each brief among them is now. A brief filed since the load has
+    /// moved to `briefs/done/`: its old path is deleted, the new one
+    /// written. Asked here rather than recorded at the move, so no edit can
+    /// move a brief without its new path in the commit.
+    pub(crate) fn changed_paths(&self) -> BTreeSet<BoardPath> {
+        let mut paths = self.changed.clone();
+        for path in &self.changed {
+            if let BoardPath::Brief { name, .. } = path {
+                paths.extend(
+                    self.briefs
+                        .iter()
+                        .filter(|file| file.name == *name)
+                        .map(|file| file.path(&self.name)),
+                );
+            }
+        }
+        paths
     }
 
     /// The bytes a board path of this project has now; `None` for a file the

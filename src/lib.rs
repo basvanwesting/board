@@ -14,15 +14,15 @@ pub mod project;
 mod raw;
 mod sync;
 
-pub use board::{Board, BriefRow, ListRow, Snapshot};
+pub use board::{Board, BriefRow, CommitCheck, ListRow, Snapshot};
 pub use brief::{
-    BadStatus, Brief, EmptyText, EntryText, Section, SplitsSection, Stamp, Status, Text,
-    Transition, TransitionError,
+    BadStatus, Brief, EmptyText, EntryText, NotABacklogId, Section, SplitsSection, Stamp, Status,
+    Text, Transition, TransitionError,
 };
 pub use error::{Error, Exit};
 pub use id::{BacklogId, BriefId, ChoreId, InvalidId, ItemId, ListKind};
 pub use lint::{Finding, Problem, lint};
 pub use list::{Entry, FindError, IdsExhausted, Line, ListFile, NoCheck, RemoveError};
-pub use ops::NewChore;
+pub use ops::{Commits, Filed, NewChore};
 pub use project::{BoardPath, BriefFile, BriefName, Env, InvalidSlug, Project, ProjectName, Slug};
 pub use sync::Note;

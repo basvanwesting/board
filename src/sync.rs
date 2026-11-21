@@ -849,7 +849,7 @@ fn commit(
     message: &str,
 ) -> Result<Oid, Error> {
     let files = project
-        .changed
+        .changed_paths()
         .iter()
         .map(|path| {
             let entry = match project.bytes(path) {
