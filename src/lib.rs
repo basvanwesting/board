@@ -13,8 +13,9 @@ mod ops;
 pub mod project;
 mod raw;
 mod sync;
+pub mod tui;
 
-pub use board::{Board, BriefRow, CommitCheck, ListRow, Snapshot};
+pub use board::{Board, BriefRow, CommitCheck, Fetcher, ListRow, Snapshot};
 pub use brief::{
     BadStatus, Brief, EmptyText, EntryText, NotABacklogId, Section, SplitsSection, Stamp, Status,
     Text, Transition, TransitionError,
@@ -28,4 +29,4 @@ pub use list::{
 };
 pub use ops::{Commits, Filed, NewChore};
 pub use project::{BoardPath, BriefFile, BriefName, Env, InvalidSlug, Project, ProjectName, Slug};
-pub use sync::Note;
+pub use sync::{Counts, Fetched, Note};

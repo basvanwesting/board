@@ -8,10 +8,25 @@ publish = false
 
 [dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+# crossterm through ratatui's re-export (`ratatui::crossterm`), not as a
+# dependency of its own: the backend's crossterm is the one whose types the
+# terminal speaks, and it brings its default features either way.
+# `unstable-rendered-line-info`: `Paragraph::line_count`, so the preview's
+# scroll stops at the last line the same wrapping draws.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+# 8, not 9: 9.0.0 was released on 2026-11-21, younger than a day when this was
+# added. `macos_fsevent` is the one backend on macOS; Linux needs no feature.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = { version = "3", default-features = false }
+
+# Its own `main`, one thread: it sets the environment the library's git
+# inherits (see the file).
+[[test]]
+name = "fetch"
+harness = false
 
 [lints.clippy]
 # `println!` and `eprintln!` panic when the reader has gone (`board ls | head -1`).

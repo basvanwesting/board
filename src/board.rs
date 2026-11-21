@@ -1,6 +1,6 @@
 //! One project's board: a method per command.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::brief::{EntryText, Stamp, Status, Text};
 use crate::error::Error;
@@ -10,7 +10,7 @@ use crate::lint::{Finding, lint};
 use crate::list::{Entry, Line, ListFile, Move};
 use crate::ops::{self, Commits, Filed, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
-use crate::sync::{self, Note};
+use crate::sync::{self, Fetched, Note};
 
 pub struct Board {
     /// Absolute: a path the board prints is one an agent can open from
@@ -52,8 +52,20 @@ impl Board {
         &self.project
     }
 
-    fn load(&self) -> Result<Project, Error> {
+    /// The board-data clone, absolute.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn load(&self) -> Result<Project, Error> {
         Project::load(&self.root, &self.project)
+    }
+
+    /// The TUI's background fetch, to run on a thread of its own.
+    pub fn fetcher(&self) -> Fetcher {
+        Fetcher {
+            root: self.root.clone(),
+        }
     }
 
     /// The board as `ls` prints it.
@@ -294,6 +306,21 @@ impl Board {
     }
 }
 
+/// The TUI's background job, apart from the [`Board`] so a thread can own
+/// it.
+pub struct Fetcher {
+    root: PathBuf,
+}
+
+impl Fetcher {
+    /// Fetches the remote's `main` and counts the commits each side has,
+    /// when no write holds the clone's lock; [`Fetched::Busy`] when one
+    /// does. Commits and pushes nothing.
+    pub fn fetch(&self) -> Fetched {
+        sync::fetch_in_background(&self.root)
+    }
+}
+
 /// Whether `file` checks that the brief has commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitCheck {
@@ -348,7 +375,7 @@ pub struct BriefRow {
 }
 
 impl BriefRow {
-    fn of(file: &BriefFile) -> BriefRow {
+    pub(crate) fn of(file: &BriefFile) -> BriefRow {
         BriefRow {
             number: file.name.number(),
             status: file.status().ok(),
@@ -390,23 +417,35 @@ pub enum ListRow {
     Item(Vec<u8>),
 }
 
+/// The project's open briefs (`filed` false) or filed ones, in the order the
+/// board shows them: by [`BriefRow::rank`], then by number. One order for
+/// `ls` and the TUI. Filed ones go by number: a brief in `briefs/done/` is
+/// filed whatever its header says ([`BriefFile::status`]), so all rank alike.
+pub(crate) fn briefs_in_order(project: &Project, filed: bool) -> Vec<&BriefFile> {
+    let mut files: Vec<&BriefFile> = project
+        .briefs()
+        .iter()
+        .filter(|file| file.filed == filed)
+        .collect();
+    files.sort_by_cached_key(|file| {
+        let row = BriefRow::of(file);
+        (row.rank(), row.number)
+    });
+    files
+}
+
 impl Snapshot {
     pub fn of(project: &Project) -> Snapshot {
-        let rows = |filed: bool| {
-            project
-                .briefs()
-                .iter()
-                .filter(move |file| file.filed == filed)
+        let rows = |filed: bool| -> Vec<BriefRow> {
+            briefs_in_order(project, filed)
+                .into_iter()
                 .map(BriefRow::of)
+                .collect()
         };
-        let mut open: Vec<BriefRow> = rows(false).collect();
-        open.sort_by_key(|row| (row.rank(), row.number));
-        let mut filed: Vec<BriefRow> = rows(true).collect();
-        filed.sort_by_key(|row| row.number);
         Snapshot {
             project: project.name().clone(),
-            open,
-            filed,
+            open: rows(false),
+            filed: rows(true),
             chores: list_rows(project.list(ListKind::Chores)),
             backlog: list_rows(project.list(ListKind::Backlog)),
         }

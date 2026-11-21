@@ -4,8 +4,10 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -48,6 +50,11 @@ const CONFIG: [&str; 3] = [
 
 /// For fetch and push: a connection that stalls is given up instead of
 /// holding the board's lock for as long as TCP waits.
+///
+/// Over http only. ssh's own timeouts (`ConnectTimeout`,
+/// `ServerAliveInterval`) are left to the user's ssh config: the one way to
+/// pass them is a `core.sshCommand`, which takes the place of the user's
+/// own and of `GIT_SSH`, the ones that pick the key for the host.
 const NETWORK: [&str; 2] = ["http.lowSpeedLimit=1000", "http.lowSpeedTime=20"];
 
 /// Why a git call gave no result. The two are kept apart because callers
@@ -128,6 +135,9 @@ struct Call<'a> {
     index: Option<&'a Path>,
     /// A fetch or a push.
     network: bool,
+    /// The clone's lock, as git's stdin (without `input`), and no
+    /// terminal: see [`Git::fetch_holding`].
+    holding: Option<&'a File>,
 }
 
 /// git, run in one directory.
@@ -164,13 +174,16 @@ impl Git {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // What the command reads is not git's to consume.
-            .stdin(if call.input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
+            .stdin(match (call.input, call.holding) {
+                (Some(_), _) => Stdio::piped(),
+                (None, Some(lock)) => Stdio::from(lock.try_clone().map_err(Failure::NotRun)?),
+                (None, None) => Stdio::null(),
             });
         if let Some(index) = call.index {
             command.env("GIT_INDEX_FILE", index);
+        }
+        if call.holding.is_some() {
+            without_terminal(&mut command);
         }
         for setting in CONFIG {
             command.args(["-c", setting]);
@@ -285,6 +298,38 @@ impl Git {
     /// `origin`'s `main` into `refs/remotes/origin/main`, forced: what the
     /// remote holds is the truth, whatever was fetched before.
     pub(crate) fn fetch(&self) -> Result<(), Failure> {
+        self.fetch_with(Call {
+            network: true,
+            ..Call::default()
+        })
+    }
+
+    /// [`Git::fetch`] for the TUI: git holds the clone's `lock` until it
+    /// exits, even when this process exits first, and it cannot reach the
+    /// terminal.
+    ///
+    /// The lock file is git's stdin: a duplicate of the descriptor, so the
+    /// same open file and the same `flock`, which holds while any
+    /// descriptor of it is open. git fetch reads no stdin. For a fetch the
+    /// TUI does not wait for when it quits: its git still updates
+    /// `origin/main`, and a write started beside it would fail its own
+    /// fetch on git's ref lock and take the remote for out of reach.
+    ///
+    /// No terminal: `GIT_TERMINAL_PROMPT` stops only git's own questions;
+    /// ssh opens the terminal itself, for an unknown host key or a key's
+    /// passphrase, and under the TUI that is a question nobody sees, asked
+    /// in raw mode, with the lock held until it is answered. Without a
+    /// controlling terminal and with no askpass, ssh fails instead. Not
+    /// `BatchMode`: only a `core.sshCommand` passes it, see [`NETWORK`].
+    pub(crate) fn fetch_holding(&self, lock: &File) -> Result<(), Failure> {
+        self.fetch_with(Call {
+            network: true,
+            holding: Some(lock),
+            ..Call::default()
+        })
+    }
+
+    fn fetch_with(&self, call: Call) -> Result<(), Failure> {
         self.run_with(
             &[
                 "fetch",
@@ -294,10 +339,7 @@ impl Git {
                 "origin",
                 "+refs/heads/main:refs/remotes/origin/main",
             ],
-            Call {
-                network: true,
-                ..Call::default()
-            },
+            call,
         )
         .map(drop)
     }
@@ -772,6 +814,35 @@ impl Git {
     #[cfg(test)]
     fn local_env_vars(&self) -> Result<Vec<u8>, Failure> {
         self.run(&["rev-parse", "--local-env-vars"])
+    }
+}
+
+/// Starts the command in a session of its own, so that it and what it
+/// starts (ssh) have no controlling terminal, and tells ssh to ask no
+/// askpass program either: a question on the desktop every minute, for a
+/// fetch the TUI starts on a timer.
+///
+/// Only for a git nobody at the terminal waits for. A command in its own
+/// session no longer gets the terminal's ctrl-c, so a CLI push would go on
+/// after `board` was interrupted and had let go of the lock.
+fn without_terminal(command: &mut Command) {
+    unsafe extern "C" {
+        // POSIX; no arguments, no memory of the caller's.
+        safe fn setsid() -> std::ffi::c_int;
+    }
+    command.env("SSH_ASKPASS_REQUIRE", "never");
+    // SAFETY: runs in the forked child before exec, where only
+    // async-signal-safe calls are allowed; `setsid` is one, and nothing
+    // here allocates.
+    unsafe {
+        command.pre_exec(|| {
+            // Fails only for a process group leader, which a child just
+            // forked is not.
+            if setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 

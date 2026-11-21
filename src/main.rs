@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::ExitCode;
@@ -10,7 +10,7 @@ use board::{
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// A file-based board for a planner/worker pair of coding agents and their
-/// user. Without a command: the board.
+/// user. Without a command: the board, as a TUI on a terminal.
 #[derive(Parser)]
 #[command(name = "board", disable_help_subcommand = true)]
 struct Cli {
@@ -249,6 +249,8 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
     // What is wrong with the command line comes before what is wrong with
     // the machine.
     let command = match cli.command {
+        // The plain board when piped: what an agent or a script reads.
+        None if io::stdout().is_terminal() => Run::Tui,
         None => Run::Ls(Selection::Board),
         Some(Command::Ls { kind, status }) => Run::Ls(Selection::new(kind, status)?),
         Some(Command::Show { id }) => Run::Show(id),
@@ -297,6 +299,10 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
     let board = Board::open(Env::from_process(cli.board)?, notes)?;
     let line = |text: String| Ok((format!("{text}\n").into_bytes(), Exit::Ok));
     match command {
+        Run::Tui => {
+            board::tui::run(&board)?;
+            Ok((Vec::new(), Exit::Ok))
+        }
         Run::Ls(selection) => Ok((ls(&board.snapshot()?, &selection), Exit::Ok)),
         Run::Show(id) => Ok((board.show(id)?, Exit::Ok)),
         Run::NewBrief(slug) => Ok((path_line(&board.new_brief(&slug)?), Exit::Ok)),
@@ -344,6 +350,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
 
 /// A command line that says what to do.
 enum Run {
+    Tui,
     Ls(Selection),
     Show(ItemId),
     Lint,

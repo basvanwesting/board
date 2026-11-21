@@ -496,6 +496,27 @@ pub(crate) fn write<T>(
 /// push from another machine, and a hook that starts `board` cannot
 /// deadlock on its parent's lock.
 fn lock(root: &Path, notes: &dyn Fn(Note)) -> Result<File, Error> {
+    if let Some(file) = try_lock(root)? {
+        return Ok(file);
+    }
+    notes(Note::LockWait);
+    let (path, file) = lock_file(root)?;
+    file.lock()
+        .map_err(|source| Error::io("lock", &path, source))?;
+    Ok(file)
+}
+
+/// The clone's lock when no write holds it, else `None`, without waiting.
+fn try_lock(root: &Path) -> Result<Option<File>, Error> {
+    let (path, file) = lock_file(root)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(source)) => Err(Error::io("lock", &path, source)),
+    }
+}
+
+fn lock_file(root: &Path) -> Result<(PathBuf, File), Error> {
     let path = root.join(".git").join("board.lock");
     let file = OpenOptions::new()
         .create(true)
@@ -506,16 +527,73 @@ fn lock(root: &Path, notes: &dyn Fn(Note)) -> Result<File, Error> {
             io::ErrorKind::NotFound => not_a_clone(root, "it has no .git directory"),
             _ => Error::io("open", &path, source),
         })?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => {
-            notes(Note::LockWait);
-            file.lock()
-                .map_err(|source| Error::io("lock", &path, source))?;
+    Ok((path, file))
+}
+
+/// What the TUI's background fetch found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
+    /// A write held the clone's lock, so nothing ran.
+    Busy,
+    Ran {
+        /// Why the fetch failed: git's reason, or why the lock could not be
+        /// taken.
+        fetched: Result<(), String>,
+        /// `main` against `origin/main` as last fetched; `None` when either
+        /// is missing or git could not count.
+        counts: Option<Counts>,
+    },
+}
+
+/// The commits of the clone that are not on the remote, and the other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Counts {
+    pub unpushed: usize,
+    pub behind: usize,
+}
+
+/// Fetches `origin`'s `main` and counts, under the clone's lock; skipped
+/// when a write holds it.
+///
+/// Under the lock, so every git process in the clone runs under it, as a
+/// write's do. Skipped rather than waited for: the write fetches itself, and
+/// a fetch queued behind it would hold up the next write. Only a fetch: a
+/// commit or a push on a timer would publish a hand edit half made, and the
+/// owner wants commits on meaningful transitions only (SPEC.md, Sync).
+pub(crate) fn fetch_in_background(root: &Path) -> Fetched {
+    let lock = match try_lock(root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Fetched::Busy,
+        Err(error) => {
+            return Fetched::Ran {
+                fetched: Err(error.to_string()),
+                counts: None,
+            };
         }
-        Err(TryLockError::Error(source)) => return Err(Error::io("lock", &path, source)),
+    };
+    let git = Git::at(root);
+    // Held by git too: the TUI does not wait for this fetch when it quits.
+    let fetched = git
+        .fetch_holding(&lock)
+        .map_err(|failure| failure.to_string());
+    // Counted after a failed fetch too: what is not pushed matters most
+    // when the remote is out of reach.
+    let counts = || -> Result<Option<Counts>, Failure> {
+        let (Some(main), Some(upstream)) = (
+            git.commit("refs/heads/main")?,
+            git.commit("refs/remotes/origin/main")?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Counts {
+            unpushed: git.count_between(&upstream, &main)?,
+            behind: git.count_between(&main, &upstream)?,
+        }))
+    };
+    Fetched::Ran {
+        fetched,
+        counts: counts().ok().flatten(),
     }
-    Ok(file)
 }
 
 fn not_a_clone(root: &Path, why: &str) -> Error {
