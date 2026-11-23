@@ -2,6 +2,9 @@
 name = "board"
 version = "0.1.0"
 edition = "2024"
+# The highest of our own need (std File::lock, 1.89) and the locked dependencies'
+# (notify-types, 1.91), so an older rustc fails at once and names this number.
+rust-version = "1.91"
 description = "A file-based board for a planner/worker pair of coding agents and their user"
 license = "MIT"
 publish = false
