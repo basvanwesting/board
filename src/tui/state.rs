@@ -192,9 +192,22 @@ pub(crate) struct Row {
     pub at: usize,
     /// In flight since: a started or blocked brief.
     pub since: Option<Stamp>,
+    /// A brief's status, for its colour; `None` for a list row.
+    pub status: Option<Status>,
 }
 
 impl Row {
+    /// The id the row starts with, as the screen spells it (`128`, `c12`):
+    /// from the item's key, so a heading or an item without an id has none,
+    /// whatever its text looks like.
+    pub fn id_text(&self, source: Source) -> Option<String> {
+        match &self.key.as_ref()?.ident {
+            Ident::Brief(number, _) => Some(number.to_string()),
+            Ident::Id(_) => self.id_word(source.list()?),
+            Ident::Text(_) => None,
+        }
+    }
+
     /// A list item's id as the CLI spells it (`c12`), from the id the
     /// parser read, not off the text: what `y` yanks, and the preview's
     /// title.
@@ -1380,6 +1393,7 @@ fn brief_rows(briefs: &[BriefItem]) -> Vec<Row> {
                 }),
                 at,
                 since: brief.started.filter(|_| in_flight),
+                status: row.status,
             }
         })
         .collect()
@@ -1395,6 +1409,7 @@ fn list_rows(kind: ListKind, data: &Data) -> Vec<Row> {
                 key: None,
                 at,
                 since: None,
+                status: None,
             },
             ListEntry::Item { id, text } => {
                 let text = String::from_utf8_lossy(text).into_owned();
@@ -1406,6 +1421,7 @@ fn list_rows(kind: ListKind, data: &Data) -> Vec<Row> {
                     text,
                     at,
                     since: None,
+                    status: None,
                 }
             }
         })

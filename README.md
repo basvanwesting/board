@@ -89,7 +89,7 @@ $ board done c1
 done c1
 ```
 
-The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Open and Filed), Chores by group, Backlog in order; on the right a preview of the item under the cursor; at the bottom the project, the sync state and the brief in flight. The keys to start with:
+The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones, and Filed), Chores by group, Backlog in order, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor; at the bottom the project, the sync state and the brief in flight. The keys to start with:
 
 - `j`/`k` move, `1` `2` `3` or Tab focus a panel, Enter scrolls the preview, `/` filters the panel.
 - `d` marks a chore done, `x` drops a backlog item (each asks once), `J`/`K` reorder, `e` opens the item in `$EDITOR`.

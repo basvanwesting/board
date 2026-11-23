@@ -4,11 +4,12 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Text};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::data::Data;
 use super::state::{Panel, Row, Source};
+use super::view::id_style;
 
 /// The left column's share of the width, and its most columns (SPEC.md,
 /// TUI: built for a pane of about 200 columns).
@@ -77,7 +78,8 @@ pub(crate) fn areas(width: u16, height: u16, focus: Panel, rows: [usize; 3]) -> 
 
 /// What the preview shows of a row: its title and its text.
 pub(crate) struct Preview {
-    pub title: String,
+    /// The item's id, cyan as in its panel, and a brief's slug.
+    pub title: Line<'static>,
     pub text: Text<'static>,
 }
 
@@ -128,13 +130,17 @@ pub(crate) fn preview(data: &Data, source: Source, row: &Row) -> Preview {
             })
             .collect();
         return Preview {
-            title: format!("{} {}", brief.row.number, brief.row.slug),
+            title: Line::from(vec![
+                Span::styled(brief.row.number.to_string(), id_style()),
+                Span::raw(format!(" {}", brief.row.slug)),
+            ]),
             text: Text::from(lines),
         };
     }
     let title = source
         .list()
         .and_then(|kind| row.id_word(kind))
+        .map(|id| Line::from(Span::styled(id, id_style())))
         .unwrap_or_default();
     Preview {
         title,

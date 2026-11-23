@@ -78,19 +78,22 @@ The tool is the only thing that runs git in the board-data repo. It pushes: the 
 `board` on a terminal, laid out like LazyGit (owner, 2026-11-21): panels inside one terminal pane, built for a wide one (about 200 columns; no narrow layout, nobody uses one).
 
 ```
-┌─1 Briefs  Open · Filed──────────────┐┌─128 some-slug ────────────────────────────┐
-│▶128 started   some-slug        42m  ││ id: 128                                   │
-│ 127 reported  other-slug            ││ status: started                           │
-├─2 Chores────────────────────────────┤│                                           │
-│ ## deploy                           ││ # Title                                   │
-│ c12 Rotate the key. Check: …  (126) ││ ## Task                                   │
-├─3 Backlog───────────────────────────┤│ …                                         │
-│ b41 …                    (from 126) ││ ## Report                                 │
-└─────────────────────────────────────┘└───────────────────────────────────────────┘
+╭─[1]─Briefs - Filed──────────────────╮╭128 some-slug──────────────────────────────╮
+│▶128 started   some-slug        42m  ││id: 128                                    │
+│ 127 reported  other-slug            ││status: started                            │
+╰─────────────────────────────────────╯│                                           │
+╭─[2]─Chores──────────────────────────╮│# Title                                    │
+│ ## deploy                           ││## Task                                    │
+│ c12 Rotate the key. Check: …  (126) ││…                                          │
+╰─────────────────────────────────────╯│                                           │
+╭─[3]─Backlog─────────────────────────╮│## Report                                  │
+│ b41 …                    (from 126) ││                                           │
+╰─────────────────────────────────────╯╰───────────────────────────────────────────╯
  shop · fetched 1m ago · 2 unpushed · 128 started 42m         d done  e edit  ? help
 ```
 
-- Left, about 45% of the width and at most 90 columns: three stacked panels, each with its own cursor; the focused one takes the spare height. Briefs (tabs Open and Filed; open ones started and blocked first, then reported, queued, draft), chores by group, backlog in order. A line too long for its panel is cut there and whole in the preview.
+- Left, about 45% of the width and at most 90 columns: three stacked panels, each with its own cursor; the focused one takes the spare height. Briefs (tabs Briefs, the open ones, and Filed; open ones started and blocked first, then reported, queued, draft), chores by group, backlog in order. Titles as LazyGit draws them (owner, 2026-11-23): the jump key in brackets, then the tabs separated by ` - `, the panel's name being its first tab; the tab shown is bold, green when the panel has the focus. Rounded corners. The preview's title has no number: no key jumps to it. A line too long for its panel is cut there and whole in the preview.
+- Colour: an item's ID is cyan, in its panel and in the preview's title; an open brief's status is coloured by what it asks of the user (`blocked` red, `started` green, `reported` yellow, `draft` dim, `queued` plain); the age of a brief in flight is dim. A row pending a move is yellow as a whole. Only the terminal's 16 named colours, never RGB or indexed: the user's terminal theme decides what they look like, so the board reads on a light and a dark theme, and there is no second theme to maintain. Headings, references, the preview's body and the brief in flight on the status line stay plain: the ID and the status are what the eye looks up.
 - Right: the preview follows the cursor: a brief with its report, or the wrapped line of a chore or backlog item. Plain text, headings highlighted; no markdown renderer, which is much machinery for a pane briefs are read in.
 - Bottom line: project, sync state, the brief in flight and for how long, then key hints. Confirmations, sync notes and errors show here too.
 - The TUI edits no text: `e` suspends it and runs `$EDITOR` on the brief, or on the list file at the item's line (`+N`), and syncs on return (which commits the edit). It waits for the TUI's own writes to end first: an editor opened beside one reads the file before the write changes it, and saving would put back what the write took out. Any key but Esc calls the wait off, so the editor never takes the terminal while keys meant for the TUI are being typed. Its only writes are whole-item actions.

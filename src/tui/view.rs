@@ -5,10 +5,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 use super::layout::{self, inner_height};
-use super::state::{Panel, Source, State, Tab};
+use super::state::{Panel, Row, Source, State, Tab};
+use crate::brief::Status;
 
 const HELP: [(&str, &str); 19] = [
     ("j k", "down, up"),
@@ -16,7 +17,7 @@ const HELP: [(&str, &str); 19] = [
     ("ctrl-d ctrl-u", "half a page down, up"),
     ("1 2 3", "Briefs, Chores, Backlog"),
     ("h l S-Tab Tab", "previous, next panel"),
-    ("[ ]", "Open, Filed briefs"),
+    ("[ ]", "the Briefs tabs: Briefs, Filed"),
     ("Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
     ("d", "done: delete the chore, asked first (y/n)"),
@@ -60,27 +61,64 @@ fn border(focused: bool) -> Style {
     }
 }
 
-fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
-    let focused = state.focus() == panel && !state.in_preview();
-    let source = state.source_of(panel);
-    let mut title = vec![Span::raw(match panel {
-        Panel::Briefs => "1 Briefs  ",
-        Panel::Chores => "2 Chores",
-        Panel::Backlog => "3 Backlog",
-    })];
-    if panel == Panel::Briefs {
-        let tab = |name: &'static str, this: Tab| {
-            if state.tab() == this {
-                Span::styled(name, Style::new().add_modifier(Modifier::BOLD))
-            } else {
-                Span::styled(name, Style::new().add_modifier(Modifier::DIM))
-            }
-        };
-        title.extend([
-            tab("Open", Tab::Open),
-            Span::raw(" · "),
-            tab("Filed", Tab::Filed),
-        ]);
+/// Every block's frame: rounded, as LazyGit draws its panels.
+fn block(focused: bool) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(border(focused))
+}
+
+// Colours are the terminal's 16 named ones only, never RGB or indexed: the
+// user's terminal theme decides what they look like, so the board reads on
+// a light and a dark theme alike (SPEC.md, TUI).
+
+/// An item's id, in its panel and in the preview's title. Green is focus,
+/// yellow the filter and a pending move, red an error.
+pub(super) fn id_style() -> Style {
+    Style::new().fg(Color::Cyan)
+}
+
+/// A brief's status, by what it asks of the user: blocked is the worker
+/// idle on a question, reported waits to be filed.
+fn status_style(status: Status) -> Style {
+    match status {
+        Status::Blocked => Style::new().fg(Color::Red),
+        Status::Started => Style::new().fg(Color::Green),
+        Status::Reported => Style::new().fg(Color::Yellow),
+        Status::Draft => Style::new().add_modifier(Modifier::DIM),
+        Status::Queued | Status::Filed => Style::new(),
+    }
+}
+
+/// A panel's title as LazyGit draws it: `─[1]─Briefs - Filed`, the jump key
+/// in brackets, then the tabs; the panel's name is its first tab. The tab
+/// shown is bold, and green with the border when the panel has the focus.
+fn panel_title(state: &State, panel: Panel, focused: bool) -> Line<'static> {
+    let (key, tabs): (&str, &[(&'static str, Option<Tab>)]) = match panel {
+        Panel::Briefs => (
+            "1",
+            &[("Briefs", Some(Tab::Open)), ("Filed", Some(Tab::Filed))],
+        ),
+        Panel::Chores => ("2", &[("Chores", None)]),
+        Panel::Backlog => ("3", &[("Backlog", None)]),
+    };
+    // The block draws its title in the border's style; plain is said
+    // outright, or a focused panel's whole title would be green.
+    let plain = Style::new().fg(Color::Reset);
+    let mut title = vec![Span::styled(format!("─[{key}]─"), border(focused))];
+    for (at, (name, tab)) in tabs.iter().enumerate() {
+        if at > 0 {
+            title.push(Span::styled(" - ", plain));
+        }
+        let shown = tab.is_none_or(|tab| state.tab() == tab);
+        title.push(if shown {
+            Span::styled(
+                *name,
+                plain.patch(border(focused)).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(*name, plain)
+        });
     }
     if let Some(filter) = state.filter(panel) {
         let typing = state.typing() && state.focus() == panel;
@@ -89,9 +127,44 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
             Style::new().fg(Color::Yellow),
         ));
     }
-    let block = Block::bordered()
-        .title(Line::from(title))
-        .border_style(border(focused));
+    Line::from(title)
+}
+
+/// A row's text in spans: its id cyan, and an open brief's status in its
+/// colour. Both are found from what the row knows (its key, its status),
+/// not read off the text; a filed brief's status stays plain.
+fn row_spans(row: &Row, source: Source) -> Vec<Span<'static>> {
+    let text = row.text.as_str();
+    let lead = text.len() - text.trim_start_matches(' ').len();
+    let Some(id) = row.id_text(source).filter(|id| {
+        text[lead..]
+            .strip_prefix(id.as_str())
+            .is_some_and(|after| after.is_empty() || after.starts_with(' '))
+    }) else {
+        return vec![Span::raw(text.to_owned())];
+    };
+    let mut rest = &text[lead + id.len()..];
+    let mut spans = vec![
+        Span::raw(text[..lead].to_owned()),
+        Span::styled(id, id_style()),
+    ];
+    if let Some(status) = row.status.filter(|_| source == Source::Open)
+        && let Some(after) = rest
+            .strip_prefix(' ')
+            .and_then(|after| after.strip_prefix(status.as_str()))
+    {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(status.as_str(), status_style(status)));
+        rest = after;
+    }
+    spans.push(Span::raw(rest.to_owned()));
+    spans
+}
+
+fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
+    let focused = state.focus() == panel && !state.in_preview();
+    let source = state.source_of(panel);
+    let block = block(focused).title(panel_title(state, panel, focused));
     let width = usize::from(layout::inner_width(area));
     let rows = state.rows(source);
     let cursor = state.cursor_row(source);
@@ -115,13 +188,27 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
             .take(inner_height(area))
             .map(|(at, row)| {
                 let marker = if cursor == Some(at) { "▶" } else { " " };
-                let mut text = format!("{marker}{}", row.text);
+                // Where a move puts it, before the file has it: yellow as a
+                // whole, so its id and status are not coloured.
+                let pending = state.pending(source, row);
+                let mut spans = vec![Span::raw(marker)];
+                if pending {
+                    spans.push(Span::raw(row.text.clone()));
+                } else {
+                    spans.extend(row_spans(row, source));
+                }
                 if let Some(since) = row.since {
                     let age = age(now.unix().saturating_sub(since.unix()));
-                    let used = Line::raw(text.as_str()).width() + age.chars().count();
-                    text.push_str(&" ".repeat(width.saturating_sub(used).max(2)));
-                    text.push_str(&age);
+                    let used = Line::from(spans.clone()).width() + age.chars().count();
+                    spans.push(Span::raw(" ".repeat(width.saturating_sub(used).max(2))));
+                    spans.push(if pending {
+                        Span::raw(age)
+                    } else {
+                        Span::styled(age, Style::new().add_modifier(Modifier::DIM))
+                    });
                 }
+                // On the cursor's row the id and status keep their colour
+                // inside the reverse video, as LazyGit's selected line does.
                 let mut style = if row.key.is_none() {
                     Style::new().add_modifier(Modifier::BOLD)
                 } else if cursor == Some(at) && focused {
@@ -129,11 +216,10 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
                 } else {
                     Style::new()
                 };
-                // Where a move puts it, before the file has it.
-                if state.pending(source, row) {
+                if pending {
                     style = style.fg(Color::Yellow).add_modifier(Modifier::ITALIC);
                 }
-                Line::styled(text, style)
+                Line::from(spans).style(style)
             })
             .collect()
     };
@@ -141,7 +227,7 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
 }
 
 fn draw_preview(frame: &mut Frame, state: &State, area: Rect) {
-    let block = Block::bordered().border_style(border(state.in_preview()));
+    let block = block(state.in_preview());
     let Some(preview) = state.preview_content() else {
         frame.render_widget(block, area);
         return;
@@ -296,10 +382,7 @@ fn draw_help(frame: &mut Frame, body: Rect) {
     .flex(ratatui::layout::Flex::Center)
     .areas(area);
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("Help").border_style(border(true))),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block(true).title("Help")), area);
 }
 
 #[cfg(test)]
@@ -416,17 +499,17 @@ mod tests {
         assert_eq!(
             screen(&state(100, 12)),
             [
-                "┌1 Briefs  Open · Filed─────────────────────┐┌128 some-slug────────────────────────────────────────┐",
+                "╭─[1]─Briefs - Filed────────────────────────╮╭128 some-slug────────────────────────────────────────╮",
                 "│▶128 started   some-slug                42m││id: 128                                              │",
                 "│ 127 reported  other-slug                  ││status: started                                      │",
                 "│                                           ││                                                     │",
-                "└───────────────────────────────────────────┘│# Title                                              │",
-                "┌2 Chores───────────────────────────────────┐│## Task                                              │",
+                "╰───────────────────────────────────────────╯│# Title                                              │",
+                "╭─[2]─Chores────────────────────────────────╮│## Task                                              │",
                 "│▶c12 Rotate the key. Check: the old one fai││The task.                                            │",
-                "└───────────────────────────────────────────┘│## Report                                            │",
-                "┌3 Backlog──────────────────────────────────┐│                                                     │",
+                "╰───────────────────────────────────────────╯│## Report                                            │",
+                "╭─[3]─Backlog───────────────────────────────╮│                                                     │",
                 "│▶b41 Cache the prices  (from 126)          ││                                                     │",
-                "└───────────────────────────────────────────┘└─────────────────────────────────────────────────────┘",
+                "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
                 " shop · fetched 1m ago · 2 unpushed · 128 started 42m              e edit  y yank  / filter  ? help",
             ]
         );
@@ -442,7 +525,7 @@ mod tests {
         );
         assert_eq!(
             lines[2],
-            "└──────────────────────────────────┘│fails  (126)                              │"
+            "╰──────────────────────────────────╯│fails  (126)                              │"
         );
         assert_eq!(
             lines[4],
@@ -458,11 +541,11 @@ mod tests {
     fn the_filed_tab_shows_the_filed_briefs() {
         let lines = screen(&press(state(100, 12), "]"));
         assert!(
-            lines[0].starts_with("┌1 Briefs  Open · Filed──"),
+            lines[0].starts_with("╭─[1]─Briefs - Filed──"),
             "{}",
             lines[0]
         );
-        assert!(lines[0].contains("┌100 old──"), "{}", lines[0]);
+        assert!(lines[0].contains("╭100 old──"), "{}", lines[0]);
         assert!(
             lines[1].starts_with("│▶100 filed     old  "),
             "{}",
@@ -475,10 +558,10 @@ mod tests {
         let lines = screen(&press(state(100, 12), "3/zz"));
         let backlog = lines
             .iter()
-            .position(|line| line.contains("3 Backlog"))
+            .position(|line| line.contains("[3]─Backlog"))
             .unwrap();
         assert!(
-            lines[backlog].starts_with("┌3 Backlog  /zz▏──"),
+            lines[backlog].starts_with("╭─[3]─Backlog  /zz▏──"),
             "{}",
             lines[backlog]
         );
@@ -498,7 +581,7 @@ mod tests {
     fn help_shows_over_the_board() {
         let lines = screen(&press(state(100, 20), "?"));
         assert!(
-            lines.iter().any(|line| line.contains("┌Help")),
+            lines.iter().any(|line| line.contains("╭Help")),
             "{lines:#?}"
         );
         assert!(
@@ -574,8 +657,162 @@ mod tests {
         let (moved_row, other_row) = (row("│▶b41"), row("│ b42"));
         assert_eq!(moved_row, other_row + 1);
         assert_eq!(buffer[(2, moved_row)].fg, Color::Yellow);
-        assert_eq!(buffer[(2, other_row)].fg, Color::Reset);
+        // The other row's id is cyan: the pending row is yellow as a whole.
+        assert_eq!(buffer[(3, moved_row)].fg, Color::Yellow);
+        assert_eq!(buffer[(2, other_row)].fg, Color::Cyan);
         assert!(screen(&moved)[13].ends_with("J/K move  any key but Esc sends it"));
+    }
+
+    /// The state drawn, to read the cells' styles.
+    fn cells(state: &State) -> ratatui::buffer::Buffer {
+        let size = state.areas().status;
+        let mut terminal = Terminal::new(TestBackend::new(size.width, size.y + 1)).unwrap();
+        terminal.draw(|frame| draw(frame, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Where `text` starts on the screen: the first line that has it.
+    fn find(buffer: &ratatui::buffer::Buffer, text: &str) -> (u16, u16) {
+        let area = buffer.area;
+        (0..area.height)
+            .find_map(|y| {
+                let line: Vec<&str> = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                (0..line.len()).find_map(|x| {
+                    line[x..]
+                        .concat()
+                        .starts_with(text)
+                        .then(|| (u16::try_from(x).unwrap(), y))
+                })
+            })
+            .unwrap_or_else(|| panic!("{text} is not on the screen"))
+    }
+
+    /// The fg and whether bold of each cell of `text` where it starts.
+    fn styles(buffer: &ratatui::buffer::Buffer, text: &str) -> Vec<(Color, bool)> {
+        let (x, y) = find(buffer, text);
+        (x..x + u16::try_from(text.chars().count()).unwrap())
+            .map(|x| {
+                let cell = &buffer[(x, y)];
+                (cell.fg, cell.modifier.contains(Modifier::BOLD))
+            })
+            .collect()
+    }
+
+    fn all(text: &str, style: (Color, bool)) -> Vec<(Color, bool)> {
+        vec![style; text.chars().count()]
+    }
+
+    #[test]
+    fn a_panel_title_names_its_key_in_brackets_then_its_tabs() {
+        let lines = screen(&state(100, 12));
+        assert!(
+            lines[0].starts_with("╭─[1]─Briefs - Filed─────"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[5].starts_with("╭─[2]─Chores─────"), "{}", lines[5]);
+        assert!(lines[8].starts_with("╭─[3]─Backlog─────"), "{}", lines[8]);
+        // Briefs has the focus: its key and its tab shown are green, the
+        // other tab plain; the other panels' names are bold, not green.
+        let focused = cells(&state(100, 12));
+        assert_eq!(
+            styles(&focused, "─[1]─"),
+            all("─[1]─", (Color::Green, false))
+        );
+        assert_eq!(
+            styles(&focused, "Briefs - "),
+            [
+                vec![(Color::Green, true); 6],
+                all(" - ", (Color::Reset, false)),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            styles(&focused, "Filed"),
+            all("Filed", (Color::Reset, false))
+        );
+        assert_eq!(
+            styles(&focused, "─[2]─"),
+            all("─[2]─", (Color::Reset, false))
+        );
+        assert_eq!(
+            styles(&focused, "Chores"),
+            all("Chores", (Color::Reset, true))
+        );
+        // The Filed tab shown, and Chores focused.
+        let filed = cells(&press(state(100, 12), "]2"));
+        assert_eq!(
+            styles(&filed, "Briefs - Filed"),
+            [
+                all("Briefs - ", (Color::Reset, false)),
+                all("Filed", (Color::Reset, true)),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            styles(&filed, "─[2]─Chores"),
+            [
+                all("─[2]─", (Color::Green, false)),
+                all("Chores", (Color::Green, true)),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn ids_are_cyan_in_every_panel_and_a_heading_has_none() {
+        let buffer = cells(&state(100, 12));
+        for id in ["▶128 ", " 127 ", "▶c12 ", "▶b41 "] {
+            let (x, y) = find(&buffer, id);
+            let id_cells = (x + 1..x + 4).map(|x| buffer[(x, y)].fg);
+            assert!(id_cells.into_iter().all(|fg| fg == Color::Cyan), "{id}");
+            // The cell after the id is not.
+            assert_eq!(buffer[(x + 4, y)].fg, Color::Reset, "{id}");
+        }
+        // The focused panel takes the spare height, so its heading shows;
+        // and the preview's title has the id too.
+        let buffer = cells(&press(state(100, 12), "2"));
+        assert_eq!(
+            styles(&buffer, "## deploy"),
+            all("## deploy", (Color::Reset, true))
+        );
+        let (x, y) = find(&buffer, "╭c12");
+        assert_eq!(buffer[(x + 1, y)].fg, Color::Cyan);
+    }
+
+    #[test]
+    fn a_status_is_coloured_by_what_it_asks_of_the_user() {
+        let mut briefs = data();
+        briefs.open.push(brief(
+            129,
+            Status::Blocked,
+            "stuck",
+            Some(NOW - 60),
+            "# Stuck\n",
+        ));
+        briefs
+            .open
+            .push(brief(130, Status::Draft, "idea", None, "# Idea\n"));
+        let (state, _) = state(100, 14).step(Event::Loaded(Box::new(briefs)));
+        let buffer = cells(&state);
+        let fg = |text: &str| {
+            let (x, y) = find(&buffer, text);
+            buffer[(x, y)].fg
+        };
+        assert_eq!(fg("blocked "), Color::Red);
+        assert_eq!(fg("started "), Color::Green);
+        assert_eq!(fg("reported "), Color::Yellow);
+        let (x, y) = find(&buffer, "draft ");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
+        // The age is dim, the slug plain.
+        let (x, y) = find(&buffer, "42m");
+        assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
+        // On the panel row: the preview's title has the slug too, above it.
+        assert_eq!(fg("some-slug "), Color::Reset);
+        // A filed brief's status stays plain.
+        let filed = cells(&press(state, "]"));
+        let (x, y) = find(&filed, "filed ");
+        assert_eq!(filed[(x, y)].fg, Color::Reset);
     }
 
     #[test]
