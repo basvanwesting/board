@@ -15,7 +15,7 @@ const HELP: [(&str, &str); 19] = [
     ("gg G", "first, last"),
     ("ctrl-d ctrl-u", "half a page down, up"),
     ("1 2 3", "Briefs, Chores, Backlog"),
-    ("h l Tab", "previous, next panel"),
+    ("h l S-Tab Tab", "previous, next panel"),
     ("[ ]", "Open, Filed briefs"),
     ("Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),

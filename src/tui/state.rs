@@ -36,6 +36,8 @@ pub(crate) enum Key {
     Enter,
     Esc,
     Tab,
+    /// Shift-Tab.
+    BackTab,
     Backspace,
     Up,
     Down,
@@ -505,6 +507,8 @@ impl State {
             Key::Char('h') => self.focus_on(self.focus.previous()),
             Key::Char('l') if self.in_preview => {}
             Key::Char('l') | Key::Tab => self.focus_on(self.focus.next()),
+            // Tab backwards, so from the preview too: `h` only leaves it.
+            Key::BackTab => self.focus_on(self.focus.previous()),
             // Two tabs, so either key goes to the other one.
             Key::Char('[' | ']') if self.focus == Panel::Briefs => {
                 self.tab = match self.tab {
@@ -564,7 +568,7 @@ impl State {
                 }
             }
             Key::Char(c) => filter.get_or_insert_with(String::new).push(c),
-            Key::Ctrl(_) | Key::Tab | Key::Up | Key::Down => {}
+            Key::Ctrl(_) | Key::Tab | Key::BackTab | Key::Up | Key::Down => {}
         }
     }
 

@@ -144,7 +144,7 @@ fn files() -> impl Strategy<Value = Files> {
 }
 
 fn key() -> impl Strategy<Value = Key> {
-    use Key::{Backspace, Char, Ctrl, Down, Enter, Esc, Tab, Up};
+    use Key::{BackTab, Backspace, Char, Ctrl, Down, Enter, Esc, Tab, Up};
     prop::sample::select(vec![
         Char('j'),
         Char('j'),
@@ -164,6 +164,7 @@ fn key() -> impl Strategy<Value = Key> {
         Char('h'),
         Char('l'),
         Tab,
+        BackTab,
         Char('['),
         Char(']'),
         Enter,
@@ -1576,4 +1577,47 @@ fn the_traces_get_deep() {
         .map(|(name, _)| *name)
         .collect();
     assert!(missed.is_empty(), "not reached: {missed:?} in {depth:?}");
+}
+
+/// Where the focus is after each key, and whether in the preview.
+fn focus_along(keys: &[Key]) -> Vec<(Panel, bool)> {
+    let files = Files {
+        open: vec![(1, None, 1)],
+        filed: Vec::new(),
+        chores: vec![ChoreLine::Item(Some(1), 0)],
+        backlog: vec![(Some(1), 0)],
+    };
+    let (mut state, _) = start(&files, 1_000_000).unwrap();
+    let mut seen = Vec::new();
+    for key in keys {
+        state = state.step(Event::Key(*key)).0;
+        seen.push((state.focus(), state.in_preview()));
+    }
+    seen
+}
+
+#[test]
+fn shift_tab_walks_the_panels_backwards() {
+    assert_eq!(
+        focus_along(&[Key::BackTab, Key::BackTab, Key::BackTab]),
+        [
+            (Panel::Backlog, false),
+            (Panel::Chores, false),
+            (Panel::Briefs, false),
+        ]
+    );
+}
+
+/// Unlike `h`, which only leaves the preview, Shift-Tab goes on: it mirrors
+/// Tab.
+#[test]
+fn shift_tab_leaves_the_preview_for_the_previous_panel() {
+    assert_eq!(
+        focus_along(&[Key::Char('2'), Key::Enter, Key::BackTab]),
+        [
+            (Panel::Chores, false),
+            (Panel::Chores, true),
+            (Panel::Briefs, false),
+        ]
+    );
 }

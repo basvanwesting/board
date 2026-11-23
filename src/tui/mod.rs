@@ -556,6 +556,7 @@ fn key_of(key: KeyEvent) -> Option<Key> {
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Esc,
         KeyCode::Tab => Key::Tab,
+        KeyCode::BackTab => Key::BackTab,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
@@ -663,6 +664,10 @@ mod tests {
             Some(Key::Ctrl('d'))
         );
         assert_eq!(press(KeyCode::Esc, KeyModifiers::NONE), Some(Key::Esc));
+        assert_eq!(
+            press(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Some(Key::BackTab)
+        );
         assert_eq!(press(KeyCode::F(1), KeyModifiers::NONE), None);
         let mut release = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
