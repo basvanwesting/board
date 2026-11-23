@@ -433,17 +433,21 @@ fn list_lines(rows: &[ListRow]) -> Vec<u8> {
     lines
 }
 
-/// SPEC.md: every command the planner skill names must exist as it names it.
-/// Each `board` invocation in the skill's code is parsed by the definition
-/// above, nothing is run: a renamed command or flag breaks this test, not the
-/// first agent that follows the skill.
+/// SPEC.md: every command the planner skill names must exist as it names it,
+/// and so must every command the README names. Each `board` invocation in
+/// their code is parsed by the definition above, nothing is run: a renamed
+/// command or flag breaks this test, not the first agent that follows the
+/// skill or the first reader who follows the README. The README's status
+/// table is checked against the status type the same way.
 #[cfg(test)]
-mod skill {
+mod docs {
+    use board::Status;
     use clap::CommandFactory;
 
     use super::Cli;
 
     const SKILL: &str = include_str!("../skill/my-plan.SKILL.md");
+    const README: &str = include_str!("../README.md");
 
     /// The code in a markdown text: inline spans, and the lines of a fenced
     /// block. A `markdown` fence (the brief template) is prose again.
@@ -467,16 +471,20 @@ mod skill {
         code
     }
 
-    /// A piece of code that runs `board`: all of it, after a `$ ` prompt, or
-    /// a quoted part (`run "board next" and …`).
+    /// A piece of code that runs `board`: all of it, after a `$ ` prompt, the
+    /// end of a pipe (`echo … | board report 1`), or a quoted part (`run
+    /// "board next" and …`).
     fn invocations(text: &str) -> Vec<String> {
         let runs_board = |code: &str| code == "board" || code.starts_with("board ");
         let mut found = Vec::new();
         for code in code(text) {
             let whole = code.strip_prefix("$ ").unwrap_or(code);
-            if runs_board(whole) {
-                found.push(whole.to_owned());
-            }
+            found.extend(
+                whole
+                    .split(" | ")
+                    .filter(|part| runs_board(part))
+                    .map(str::to_owned),
+            );
             found.extend(
                 code.split('"')
                     .skip(1)
@@ -515,6 +523,9 @@ mod skill {
             "<id>" => vec!["128", "c12", "b41"],
             "<slug>" => vec!["fix-login"],
             "<question>" | "…" => vec!["Which table holds the orders?"],
+            "<text>" => vec!["Rotate the key"],
+            "<group>" => vec!["deploy"],
+            "<check>" => vec!["the key's date in the dashboard"],
             placeholder if placeholder.starts_with('<') && placeholder.ends_with('>') => {
                 panic!("no sample value for {placeholder}: add one here")
             }
@@ -620,5 +631,84 @@ mod skill {
         }
         let text = format!("{SKILL}\n```sh\n$ board sycn\n```\n");
         assert_eq!(failing_code(&text), ["board sycn"]);
+    }
+
+    #[test]
+    fn every_board_command_the_readme_names_parses() {
+        let found = invocations(README);
+        // Counted by reading the README: 44 code spans run `board`, two of
+        // them at the end of a pipe. Fewer found means the reading lost some.
+        assert!(found.len() >= 44, "found only {}: {found:#?}", found.len());
+        let wrong: Vec<String> = failing(README)
+            .into_iter()
+            .map(|(code, why)| format!("{code}\n{why}"))
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_misnamed_command_in_the_readme_fails_the_check() {
+        for (from, to, wrong) in [
+            (
+                "`board next`, `board amend <id>`",
+                "`board nxt`, `board amend <id>`",
+                "board nxt",
+            ),
+            (
+                "| board amend 1",
+                "| board amend 1 --resume",
+                "board amend 1 --resume",
+            ),
+            (
+                "$ board queue 1 --closes b1",
+                "$ board queue 1 --close b1",
+                "board queue 1 --close b1",
+            ),
+        ] {
+            let text = README.replacen(from, to, 1);
+            assert!(text != README, "the README no longer has {from}");
+            assert_eq!(failing_code(&text), [wrong]);
+        }
+    }
+
+    /// The statuses the README's table has a row for: the first cell, in
+    /// backticks, of each row in the section on a brief's life.
+    fn statuses_in_table(text: &str) -> Vec<&str> {
+        let section = text
+            .split("\n## ")
+            .find(|section| section.starts_with("The life of a brief"))
+            .expect("the README has a section on the life of a brief");
+        let mut statuses: Vec<&str> = section
+            .lines()
+            .filter_map(|line| line.strip_prefix('|')?.split('|').next())
+            .filter_map(|cell| cell.trim().strip_prefix('`')?.strip_suffix('`'))
+            .collect();
+        statuses.sort_unstable();
+        statuses
+    }
+
+    /// `Status::ALL` is the type's own list, kept complete by a match in
+    /// `brief.rs`; the README lists no second one to compare with.
+    fn known_statuses() -> Vec<&'static str> {
+        let mut known = Status::ALL.map(Status::as_str).to_vec();
+        known.sort_unstable();
+        known
+    }
+
+    #[test]
+    fn the_readme_has_a_row_for_every_status_and_no_other() {
+        assert_eq!(statuses_in_table(README), known_statuses());
+    }
+
+    #[test]
+    fn a_status_missing_from_the_readme_fails_the_check() {
+        let row = README
+            .lines()
+            .find(|line| line.starts_with("| `blocked` |"))
+            .expect("the README has a row for blocked");
+        let text = README.replacen(&format!("{row}\n"), "", 1);
+        assert_ne!(statuses_in_table(&text), known_statuses());
+        let text = README.replacen("| `filed` |", "| `closed` |", 1);
+        assert_ne!(statuses_in_table(&text), known_statuses());
     }
 }
