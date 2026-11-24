@@ -60,7 +60,7 @@ board-data/
 
 ## Usage
 
-The planner runs `board new brief <slug>`, `board queue <id>`, `board amend <id>`, `board file <id>`, `board add chore "<text>" --group <group> --check "<check>" --from <id>`, `board add backlog "<text>" --from <id>` and `board done <id>`, and reads with `board ls`, `board ls briefs --status reported` and `board show <id>`. The worker runs `board next`, `board block <id> "<question>"` and `board report <id>`. `board --help` is the reference, and each command has its own (`board queue --help`).
+The planner runs `board new brief <slug>`, `board queue <id>`, `board amend <id>`, `board file <id>`, `board add chore "<text>" --group <group> --check "<check>" --from <id>`, `board add backlog "<text>" --from <id>`, `board retitle <id> "<text>"` (an item's line, keeping its ID and place) and `board done <id>`, and reads with `board ls`, `board ls briefs --status reported` and `board show <id>`. The worker runs `board next`, `board block <id> "<question>"` and `board report <id>`. `board --help` is the reference, and each command has its own (`board queue --help`).
 
 A session in `~/Work/shop`, from a backlog item to a filed brief:
 

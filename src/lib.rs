@@ -25,7 +25,7 @@ pub use id::{BacklogId, BriefId, ChoreId, InvalidId, ItemId, ListId, ListKind};
 pub use lint::{Finding, Problem, lint};
 pub use list::{
     BadMove, Body, Entry, FindError, IdsExhausted, Line, ListFile, Move, MoveError, NoCheck,
-    RemoveError, Side,
+    RemoveError, RetitleError, Side,
 };
 pub use ops::{Commits, Filed, NewChore};
 pub use project::{BoardPath, BriefFile, BriefName, Env, InvalidSlug, Project, ProjectName, Slug};

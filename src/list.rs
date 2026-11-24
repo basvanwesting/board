@@ -79,6 +79,92 @@ fn without_source(check: &[u8]) -> &[u8] {
     }
 }
 
+/// A chore's line as `add` and `retitle` write it, without terminator:
+/// `- c12 <text>. Check: <check>  (126)`; see [`check_part`] for when it is
+/// refused.
+fn chore_line(id: &str, text: &[u8], check: &[u8], reference: &[u8]) -> Result<Vec<u8>, NoCheck> {
+    let check = check_part(check)?;
+    Ok([
+        b"- ",
+        id.as_bytes(),
+        b" ",
+        text,
+        join(text),
+        &check,
+        reference,
+    ]
+    .concat())
+}
+
+/// What goes between a chore's text and its `Check:`: a text that ends its
+/// own sentence is not given a second full stop, and none at all has no
+/// join (a hand-typed `- c12` given a check).
+fn join(text: &[u8]) -> &'static [u8] {
+    if text.is_empty() {
+        b""
+    } else if text.ends_with(b".") || text.ends_with(b"!") || text.ends_with(b"?") {
+        b" "
+    } else {
+        b". "
+    }
+}
+
+/// `Check: <check>`, refused when it would not read as the check given.
+/// Asked of the check as it will stand in the line, by the function lint
+/// asks, so the tool never writes a chore its own lint reports; without the
+/// reference, as a check must not need it to count. A check with a
+/// `Check:` of its own is refused too: lint reads after the last one, so
+/// only its tail would count, and `retitle` would keep only that tail.
+fn check_part(check: &[u8]) -> Result<Vec<u8>, NoCheck> {
+    let part = [&b"Check: "[..], check].concat();
+    if !has_check(&part) || check.windows(CHECK.len()).any(|w| w == CHECK) {
+        return Err(NoCheck);
+    }
+    Ok(part)
+}
+
+const CHECK: &[u8] = b"Check:";
+
+/// A backlog item's line as `add` and `retitle` write it, without
+/// terminator: `- b41 <text>  (from 126)`.
+fn backlog_line(id: &str, text: &[u8], reference: &[u8]) -> Vec<u8> {
+    [b"- ", id.as_bytes(), b" ", text, reference].concat()
+}
+
+/// An item's text after its id, split before its trailing reference as
+/// `add` writes it: blanks, then `(126)` on a chore (the form the check's
+/// reading strips, [`has_check`]) or `(from 126)` on a backlog item, naming
+/// an id. The reference keeps its blanks, so it is written back as it was;
+/// empty when there is none, and a backlog text ending in `(126)` is text.
+fn split_reference(kind: ListKind, text: &[u8]) -> (&[u8], &[u8]) {
+    let found = text.strip_suffix(b")").and_then(|inside| {
+        let open = inside.iter().rposition(|b| *b == b'(')?;
+        let id = &inside[open + 1..];
+        let id = match kind {
+            ListKind::Chores => id,
+            ListKind::Backlog => id.strip_prefix(b"from ")?,
+        };
+        str::from_utf8(id).ok()?.parse::<ItemId>().ok()?;
+        let head = text[..open].trim_ascii_end();
+        (head.len() < open).then_some(head.len())
+    });
+    match found {
+        Some(at) => text.split_at(at),
+        None => (text, &[]),
+    }
+}
+
+/// Where a chore's check starts, in its line without the reference: at the
+/// last `Check:`, as lint reads it, with the check after it. `None` when the
+/// line has no check lint would count.
+fn split_check(head: &[u8]) -> Option<(usize, &[u8])> {
+    if !has_check(head) {
+        return None;
+    }
+    let at = head.windows(CHECK.len()).rposition(|w| w == CHECK)?;
+    Some((at, head[at + CHECK.len()..].trim_ascii()))
+}
+
 /// A line continues the item above it when it is indented and not blank.
 pub(crate) fn is_continuation(content: &[u8]) -> bool {
     matches!(content.first(), Some(b' ' | b'\t')) && !raw::is_blank(content)
@@ -193,8 +279,20 @@ impl Body {
     }
 }
 
+/// Why `retitle` changed no line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetitleError {
+    /// The id is on no line, or on more than one.
+    Find(FindError),
+    /// The new check would not read as one once written.
+    NoCheck,
+    /// The chore's line has no check to keep, and none was given.
+    NoCheckOnLine,
+}
+
 /// The check would not read as one once written: it is only `(126)`, which
-/// reads as the `--from` suffix, or it ends in `Check:`.
+/// reads as the `--from` suffix, it ends in `Check:`, or it holds a
+/// `Check:` of its own, after which lint would read only its tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoCheck;
 
@@ -395,8 +493,9 @@ impl ListFile {
     }
 
     /// Adds a chore after the last item of the first group named `group`,
-    /// directly under the heading when the group is empty; a group that does
-    /// not exist is appended at the end of the file. `id` comes from
+    /// under the heading and the indented lines directly below it when the
+    /// group has no item; a group that does not exist is appended at the end
+    /// of the file. `id` comes from
     /// [`ListFile::next_id`].
     ///
     /// # Panics
@@ -411,24 +510,13 @@ impl ListFile {
         from: Option<ItemId>,
     ) -> Result<(), NoCheck> {
         assert_eq!(self.kind, ListKind::Chores, "a chore goes into chores.md");
-        // A text that ends its own sentence is not given a second full stop.
-        let join = if text.as_str().ends_with(['.', '!', '?']) {
-            " "
-        } else {
-            ". "
-        };
-        // Asked of the check as it will stand in the line, by the function
-        // lint asks, so the tool never writes a chore its own lint reports.
-        // Without the source suffix: a check must not need it to count.
-        let check = format!("Check: {check}");
-        if !has_check(check.as_bytes()) {
-            return Err(NoCheck);
-        }
-        let mut item = format!("- {id} {text}{join}{check}");
-        if let Some(from) = from {
-            item.push_str(&format!("  ({from})"));
-        }
-        let item = item.into_bytes();
+        let reference = from.map(|from| format!("  ({from})")).unwrap_or_default();
+        let item = chore_line(
+            &id.to_string(),
+            text.as_str().as_bytes(),
+            check.as_str().as_bytes(),
+            reference.as_bytes(),
+        )?;
 
         let heading = (0..self.lines.len()).find(|index| {
             self.entry(&self.lines[*index]) == Entry::Heading(group.as_str().as_bytes())
@@ -479,15 +567,97 @@ impl ListFile {
             ListKind::Backlog,
             "a backlog item goes into backlog.md"
         );
-        let mut item = format!("- {id} {text}");
-        if let Some(from) = from {
-            item.push_str(&format!("  (from {from})"));
-        }
+        let reference = from
+            .map(|from| format!("  (from {from})"))
+            .unwrap_or_default();
+        let item = backlog_line(
+            &id.to_string(),
+            text.as_str().as_bytes(),
+            reference.as_bytes(),
+        );
         let at = match self.items().next_back() {
             Some((last_item, ..)) => self.after_item(last_item),
             None => self.lines.len(),
         };
-        self.insert(at, vec![item.into_bytes()]);
+        self.insert(at, vec![item]);
+    }
+
+    /// Changes the line of the one item with this id: its text, and for a
+    /// chore its check, each kept when not given. The id, the trailing
+    /// reference (`(126)`, `(from 126)`), the place and the body stay as
+    /// they are. A part given is written with `add`'s rules (its join and
+    /// its check refusals), so the two cannot drift; a part not given stays
+    /// byte for byte. Only what the parser reads off the line is
+    /// taken apart: the reference, and a chore's check after its last
+    /// `Check:`; anything else is the text. A new check alone leaves the
+    /// line before it byte for byte.
+    ///
+    /// # Panics
+    ///
+    /// When a check is given for a backlog item: it has none.
+    pub fn retitle(
+        &mut self,
+        number: u32,
+        text: Option<&Line>,
+        check: Option<&Line>,
+    ) -> Result<(), RetitleError> {
+        let (index, line) = self.item(number).map_err(RetitleError::Find)?;
+        let (id, rest) = line
+            .split_at_checked(line.iter().position(|b| *b == b' ').unwrap_or(line.len()))
+            .expect("a position in the line");
+        let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+        let (head, reference) = split_reference(self.kind, rest);
+        let id = String::from_utf8_lossy(id).into_owned();
+        let new = match self.kind {
+            ListKind::Backlog => {
+                assert!(check.is_none(), "a backlog item has no check");
+                let text = text.map_or(head, |text| text.as_str().as_bytes());
+                backlog_line(&id, text, reference)
+            }
+            ListKind::Chores => match (text, check, split_check(head)) {
+                // Only the check: the line up to it stays byte for byte,
+                // written by `add` or by hand.
+                (None, Some(check), Some((at, _))) => {
+                    let check = check_part(check.as_str().as_bytes())
+                        .map_err(|NoCheck| RetitleError::NoCheck)?;
+                    [b"- ", id.as_bytes(), b" ", &head[..at], &check, reference].concat()
+                }
+                // Only the text: the check from its `Check:` on stays byte
+                // for byte, as for a check alone.
+                (Some(text), None, Some((at, _))) => {
+                    let text = text.as_str().as_bytes();
+                    [
+                        b"- ",
+                        id.as_bytes(),
+                        b" ",
+                        text,
+                        join(text),
+                        &head[at..],
+                        reference,
+                    ]
+                    .concat()
+                }
+                (None, None, Some(_)) => return Ok(()),
+                (None, None, None) => return Err(RetitleError::NoCheckOnLine),
+                // Both: the line as `add` writes one.
+                (Some(text), Some(check), _) => chore_line(
+                    &id,
+                    text.as_str().as_bytes(),
+                    check.as_str().as_bytes(),
+                    reference,
+                )
+                .map_err(|NoCheck| RetitleError::NoCheck)?,
+                // A check for a line without one: what it has is the text.
+                (None, Some(check), None) => {
+                    chore_line(&id, head, check.as_str().as_bytes(), reference)
+                        .map_err(|NoCheck| RetitleError::NoCheck)?
+                }
+                (_, None, None) => return Err(RetitleError::NoCheckOnLine),
+            },
+        };
+        let (_, terminator) = raw::split_terminator(&self.lines[index]);
+        self.lines[index] = [new.as_slice(), terminator].concat();
+        Ok(())
     }
 
     /// Writes the body of the one item with this id: after the indented
@@ -982,6 +1152,122 @@ mod tests {
         assert_eq!(written(&empty), "- b1 one\n");
     }
 
+    // ---- retitle ----
+
+    #[test]
+    fn retitle_changes_the_text_the_check_or_both_and_keeps_the_rest() {
+        let start = "## Home\n- c1 Rotate the key. Check: login works  (126)\n  the body\n- c2 two. Check: y\n";
+        let cases = [
+            (
+                Some("Rotate both keys"),
+                None,
+                "- c1 Rotate both keys. Check: login works  (126)",
+            ),
+            (
+                None,
+                Some("the old key fails"),
+                "- c1 Rotate the key. Check: the old key fails  (126)",
+            ),
+            (Some("Done!"), Some("z"), "- c1 Done! Check: z  (126)"),
+        ];
+        for (text, check, want) in cases {
+            let mut file = chores(start);
+            let (text, check) = (text.map(line), check.map(line));
+            file.retitle(1, text.as_ref(), check.as_ref()).unwrap();
+            assert_eq!(
+                written(&file),
+                format!("## Home\n{want}\n  the body\n- c2 two. Check: y\n")
+            );
+        }
+        let mut file = backlog("- b1 one  (from 126)\r\n  why\r\n- b2 two");
+        file.retitle(1, Some(&line("uno")), None).unwrap();
+        file.retitle(2, Some(&line("dos")), None).unwrap();
+        assert_eq!(written(&file), "- b1 uno  (from 126)\r\n  why\r\n- b2 dos");
+    }
+
+    /// A line typed by hand is read only as far as the parser reads it:
+    /// the reference, if it has one, and a chore's last `Check:`.
+    #[test]
+    fn retitle_reads_a_hand_typed_line_no_further_than_the_parser() {
+        let mut file = chores("- c1 a text (with parens) Check: it shows\n- c2 no check here\n");
+        file.retitle(1, Some(&line("b")), None).unwrap();
+        assert_eq!(
+            written(&file),
+            "- c1 b. Check: it shows\n- c2 no check here\n"
+        );
+        assert_eq!(
+            file.retitle(2, Some(&line("x")), None),
+            Err(RetitleError::NoCheckOnLine)
+        );
+        file.retitle(2, None, Some(&line("y"))).unwrap();
+        assert_eq!(
+            written(&file),
+            "- c1 b. Check: it shows\n- c2 no check here. Check: y\n"
+        );
+        let mut file = backlog("- b1 idea (b9 is related)  (from 12)\n");
+        file.retitle(1, Some(&line("better")), None).unwrap();
+        assert_eq!(written(&file), "- b1 better  (from 12)\n");
+    }
+
+    /// Review cases: a check alone leaves the text as it was, dots and
+    /// all; a backlog text ending in `(126)` is text, not a reference; a
+    /// bare `- c1` given a check gets no stray join.
+    #[test]
+    fn retitle_keeps_what_it_is_not_asked_to_change() {
+        let mut file = chores("- c1 Wait... Check: x\n- c2\n");
+        file.retitle(1, None, Some(&line("y"))).unwrap();
+        file.retitle(2, None, Some(&line("z"))).unwrap();
+        assert_eq!(written(&file), "- c1 Wait... Check: y\n- c2 Check: z\n");
+        // A new text alone keeps the check from its `Check:` on as typed.
+        let mut file = chores("- c1 t Check:the page  loads  (12)\n");
+        file.retitle(1, Some(&line("u")), None).unwrap();
+        assert_eq!(written(&file), "- c1 u. Check:the page  loads  (12)\n");
+        let mut file = backlog("- b1 Look at (126)\n");
+        file.retitle(1, Some(&line("New")), None).unwrap();
+        assert_eq!(written(&file), "- b1 New\n");
+    }
+
+    /// A check with a `Check:` of its own would read, to lint and to
+    /// `retitle`, as only its tail: `add` refuses it as `retitle` does.
+    #[test]
+    fn a_check_with_a_check_of_its_own_is_refused() {
+        let mut file = chores("- c1 one. Check: x\n");
+        assert_eq!(
+            file.add_chore(
+                chore_id(2),
+                &line("Home"),
+                &line("t"),
+                &line("the Check: tab"),
+                None
+            ),
+            Err(NoCheck)
+        );
+        assert_eq!(
+            file.retitle(1, None, Some(&line("the Check: tab"))),
+            Err(RetitleError::NoCheck)
+        );
+        assert_eq!(written(&file), "- c1 one. Check: x\n");
+    }
+
+    #[test]
+    fn retitle_refuses_what_add_refuses_and_changes_nothing() {
+        let start = "- c1 one. Check: x\n- c1 again. Check: x\n- c2 two. Check: y\n";
+        let mut file = chores(start);
+        assert_eq!(
+            file.retitle(2, None, Some(&line("(126)"))),
+            Err(RetitleError::NoCheck)
+        );
+        assert_eq!(
+            file.retitle(1, Some(&line("x")), None),
+            Err(RetitleError::Find(FindError::Duplicate(2)))
+        );
+        assert_eq!(
+            file.retitle(9, Some(&line("x")), None),
+            Err(RetitleError::Find(FindError::Missing))
+        );
+        assert_eq!(written(&file), start);
+    }
+
     // ---- bodies ----
 
     #[test]
@@ -1243,6 +1529,9 @@ mod tests {
             1 => Just("  (126)"),
             1 => Just(". Check: it works  (from b3)"),
             1 => Just(". Check:"),
+            // Typed by hand: no join, or one `add` would not write.
+            1 => Just(" Check: it works"),
+            1 => Just("... Check: it works  (12)"),
         ];
         prop_oneof![
             6 => ("[bc]", 1..12u32, words, suffix.clone())
@@ -1316,6 +1605,7 @@ mod tests {
             6 => input_line(),
             1 => "\\([bc]?[1-9][0-9]{0,2}\\)".prop_map(|check| line(&check)),
             1 => "([a-z]{1,4} )?Check:".prop_map(|check| line(&check)),
+            1 => "[a-z]{1,4} Check: [a-z]{1,4}".prop_map(|check| line(&check)),
         ]
     }
 
@@ -1447,10 +1737,14 @@ mod tests {
     ) -> Result<(), TestCaseError> {
         let mut file = ListFile::parse(CHORES, bytes);
         let id = file.next_id(mark).unwrap();
-        // Refused when the check would not read as one, and only then.
+        // Refused when the check would not read as one, or holds a
+        // `Check:` of its own, and only then.
         let refused = file.add_chore(chore_id(id), group, text, check, from) == Err(NoCheck);
         let check_alone = format!("Check: {check}");
-        prop_assert_eq!(refused, !has_check(check_alone.as_bytes()));
+        prop_assert_eq!(
+            refused,
+            !has_check(check_alone.as_bytes()) || check.as_str().contains("Check:")
+        );
         if refused {
             prop_assert_eq!(file.to_bytes(), bytes);
             return Ok(());
@@ -1557,6 +1851,100 @@ mod tests {
                 }
                 prop_assert_eq!(file.to_bytes(), bytes);
             }
+        }
+        Ok(())
+    }
+
+    /// `retitle` changes the one line, and of it only what it was asked to:
+    /// every other line, the body below included, is byte for byte what it
+    /// was, and so are the line's id, its reference and its terminator.
+    fn check_retitle(
+        kind: ListKind,
+        bytes: &[u8],
+        pick: prop::sample::Index,
+        text: Option<&Line>,
+        check: Option<&Line>,
+    ) -> Result<(), TestCaseError> {
+        let check = if kind == ListKind::Backlog {
+            None
+        } else {
+            check
+        };
+        let mut file = ListFile::parse(kind, bytes);
+        let ids: Vec<u32> = file
+            .items()
+            .filter_map(|(_, id, _)| id)
+            .filter(|id| file.find(*id).is_ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id = *pick.get(&ids);
+        let (at, _) = file.item(id).unwrap();
+        let old = raw_lines(bytes);
+        let old_rest = |line: &[u8]| -> Vec<u8> {
+            let content = content_of(line);
+            let word = content[2..]
+                .iter()
+                .position(|b| *b == b' ')
+                .map_or(content.len(), |w| w + 3);
+            content[word.min(content.len())..].to_vec()
+        };
+        let before = old_rest(&old[at]);
+        let (old_head, reference) = split_reference(kind, &before);
+        match file.retitle(id, text, check) {
+            Ok(()) => {
+                let new = raw_lines(&file.to_bytes());
+                prop_assert_eq!(new.len(), old.len());
+                for (index, (new, old)) in new.iter().zip(&old).enumerate() {
+                    if index != at {
+                        prop_assert_eq!(new, old);
+                    }
+                }
+                let line = &new[at];
+                prop_assert_eq!(
+                    &line[content_of(line).len()..],
+                    &old[at][content_of(&old[at]).len()..]
+                );
+                prop_assert_eq!(id_of(kind, line), Some(id));
+                let rest = old_rest(line);
+                prop_assert!(rest.ends_with(reference), "{:?}", utf8(&rest));
+                match (text, kind, split_check(old_head)) {
+                    // A new text alone: the check from its `Check:` on
+                    // stays byte for byte.
+                    (Some(text), ListKind::Chores, Some((at, _))) if check.is_none() => {
+                        prop_assert!(rest.starts_with(text.as_str().as_bytes()));
+                        prop_assert!(rest.ends_with(&before[at..]));
+                    }
+                    (Some(text), ..) => prop_assert!(rest.starts_with(text.as_str().as_bytes())),
+                    // No new text: the old one stays byte for byte, up to
+                    // the check on a chore that has one.
+                    (None, ListKind::Backlog, _) => prop_assert_eq!(&rest, &before),
+                    (None, ListKind::Chores, Some((at, _))) => {
+                        prop_assert_eq!(&rest[..at], &before[..at]);
+                    }
+                    (None, ListKind::Chores, None) => prop_assert!(rest.starts_with(old_head)),
+                }
+                if kind == ListKind::Chores {
+                    prop_assert!(has_check(&rest));
+                    let kept = split_check(old_head).map(|(_, check)| check.to_vec());
+                    let want = check.map_or(kept, |c| Some(c.as_str().as_bytes().to_vec()));
+                    let got = split_check(split_reference(kind, &rest).0)
+                        .map(|(_, check)| check.to_vec());
+                    prop_assert_eq!(got, want.map(|c| c.trim_ascii().to_vec()));
+                }
+            }
+            Err(RetitleError::NoCheck) => {
+                let check = check.expect("only a new check is refused");
+                let written = format!("Check: {check}");
+                prop_assert!(!has_check(written.as_bytes()) || check.as_str().contains("Check:"));
+                prop_assert_eq!(file.to_bytes(), bytes);
+            }
+            Err(RetitleError::NoCheckOnLine) => {
+                prop_assert!(check.is_none() && split_check(old_head).is_none());
+                prop_assert_eq!(file.to_bytes(), bytes);
+            }
+            Err(RetitleError::Find(why)) => prop_assert!(false, "{why:?} for an id on one line"),
         }
         Ok(())
     }
@@ -1802,6 +2190,17 @@ mod tests {
                 .map(|(pick, other)| if ids.is_empty() || other > 11 { other } else { *pick.get(&ids) })
                 .collect();
             check_remove(kind, &bytes, &numbers)?;
+        }
+
+        #[test]
+        fn retitle_changes_its_line_and_nothing_else(
+            kind in kind(),
+            bytes in file_bytes(),
+            pick in any::<prop::sample::Index>(),
+            text in prop::option::of(input_line()),
+            check in prop::option::of(check_line()),
+        ) {
+            check_retitle(kind, &bytes, pick, text.as_ref(), check.as_ref())?;
         }
 
         #[test]

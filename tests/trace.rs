@@ -91,6 +91,14 @@ enum Op {
         target: Index,
         after: bool,
     },
+    /// An item's line changed by `retitle`, its token kept: its text, a
+    /// chore's check, or both (a backlog item's text only).
+    Retitle {
+        backlog: bool,
+        item: Index,
+        text: bool,
+        check: bool,
+    },
     NewBrief,
     /// A draft of the clone or the remote, picked when the step runs.
     /// `write`: its sections are written by hand first when the clone's file
@@ -207,6 +215,8 @@ fn op() -> impl Strategy<Value = Op> {
         2 => any::<Index>().prop_map(Op::Drop),
         3 => (any::<bool>(), any::<Index>(), any::<Index>(), any::<bool>())
             .prop_map(|(backlog, item, target, after)| Op::Move { backlog, item, target, after }),
+        1 => (any::<bool>(), any::<Index>(), any::<bool>(), any::<bool>())
+            .prop_map(|(backlog, item, text, check)| Op::Retitle { backlog, item, text, check }),
         2 => Just(Op::NewBrief),
         3 => (any::<Index>(), prop::bool::weighted(0.8), prop::option::of(any::<Index>()))
             .prop_map(|(pick, write, closes)| Op::Queue { pick, write, closes }),
@@ -424,6 +434,9 @@ enum Subject {
     Close(Id),
     /// The item, whether it goes after the target, and the target.
     Move(Id, bool, Id),
+    /// The item, and what its line holds once retitled: the start of its
+    /// text after the id, and a chore's check when one was given.
+    Retitle(Id, String, Option<String>),
     /// The slug, a token.
     NewBrief(String),
     Queue(u32),
@@ -448,6 +461,7 @@ impl Subject {
             Subject::Add(_)
             | Subject::Close(_)
             | Subject::Move(..)
+            | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::Next
@@ -463,6 +477,7 @@ impl Subject {
             | Subject::Add(_)
             | Subject::Close(_)
             | Subject::Move(..)
+            | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::Next
@@ -514,6 +529,7 @@ struct Depth {
     closed_by_file: u32,
     items_moved: u32,
     moves_not_pushed: u32,
+    items_retitled: u32,
 }
 
 impl Depth {
@@ -545,6 +561,7 @@ impl Depth {
         self.closed_by_file += other.closed_by_file;
         self.items_moved += other.items_moved;
         self.moves_not_pushed += other.moves_not_pushed;
+        self.items_retitled += other.items_retitled;
     }
 }
 
@@ -824,6 +841,28 @@ impl<'w> Oracle<'w> {
                     ]),
                     Subject::Move(item, *after, target),
                 )
+            }
+            Op::Retitle {
+                backlog,
+                item,
+                text,
+                check,
+            } => {
+                let prefix = if *backlog { 'b' } else { 'c' };
+                let id = pick(self, prefix, item);
+                // The token stays first, so the item is the same one to
+                // every invariant; a fresh mark after it is the change.
+                let token = self.token_of(who, id).unwrap_or_else(|| self.token());
+                let mark = self.token();
+                let mut args = owned(&["retitle", &format!("{prefix}{}", id.1)]);
+                let check = (*check && !*backlog).then(|| format!("x {mark}"));
+                let text = (*text || check.is_none()).then(|| format!("{token} {mark}"));
+                args.extend(text.clone());
+                if let Some(check) = &check {
+                    args.extend(["--check".to_owned(), check.clone()]);
+                }
+                let start = text.unwrap_or(token);
+                (args, Subject::Retitle(id, start, check))
             }
             Op::NewBrief => {
                 let slug = self.token();
@@ -1266,7 +1305,9 @@ impl<'w> Oracle<'w> {
             | Op::NewBrief
             | Op::Queue { .. }
             | Op::Next => return Ok(()),
-            Op::Move { backlog, .. } => return self.prepare_list(who, *backlog),
+            Op::Move { backlog, .. } | Op::Retitle { backlog, .. } => {
+                return self.prepare_list(who, *backlog);
+            }
         };
         // At most new, queue, next and report; fewer when one is refused.
         for _ in 0..4 {
@@ -1571,6 +1612,7 @@ impl<'w> Oracle<'w> {
                         subject,
                         Subject::Close(_)
                             | Subject::Move(..)
+                            | Subject::Retitle(..)
                             | Subject::Queue(_)
                             | Subject::File(..)
                     ) || subject.brief_line().is_some(),
@@ -1663,6 +1705,15 @@ impl<'w> Oracle<'w> {
             }
             Subject::Move(item, after, target) => {
                 self.judge_move(who, run, pushed, (*item, *after, *target), (fault, window))?;
+            }
+            Subject::Retitle(id, start, check) => {
+                self.judge_retitle(
+                    who,
+                    run,
+                    pushed,
+                    (*id, start, check.as_deref()),
+                    (fault, window),
+                )?;
             }
             Subject::NewBrief(slug) => {
                 let name_end = format!("-{slug}.md");
@@ -1803,6 +1854,89 @@ impl<'w> Oracle<'w> {
                 Some(Line::Text { .. }) | None => None,
             })
             .collect()
+    }
+
+    /// A `retitle` run: what it printed, and the line with its new text
+    /// and check where the retitle was the last change, as for a move;
+    /// refused only for an id that is not there.
+    fn judge_retitle(
+        &mut self,
+        who: Who,
+        run: &Run,
+        pushed: bool,
+        (id, start, check): (Id, &str, Option<&str>),
+        (fault, window): (Option<&Fault>, bool),
+    ) -> Result<(), TestCaseError> {
+        match run.code {
+            Some(0) => {
+                prop_assert_eq!(&run.stdout, &format!("retitled {}{}\n", id.0, id.1));
+                let saved_after = !pushed && matches!(fault, Some(Fault::WindowEdit(_)));
+                if !window && !saved_after {
+                    // Counted where the line is judged, so the depth test
+                    // proves the judging runs.
+                    self.depth.items_retitled += 1;
+                    let place = if pushed { 2 } else { who.slot() };
+                    let line = self.line_of(place, id);
+                    let starts = format!("- {}{} {start}", id.0, id.1);
+                    prop_assert!(
+                        line.as_ref().is_some_and(|line| line.starts_with(&starts)
+                            && check.is_none_or(|check| line.contains(&format!("Check: {check}")))),
+                        "{:?} in place {} is {:?} after {:?}",
+                        id,
+                        place,
+                        line,
+                        run
+                    );
+                }
+            }
+            Some(1) => {
+                let last = run.stderr.lines().last().unwrap_or_default();
+                prop_assert!(
+                    last.starts_with(&format!("board: retitle {}{}: ", id.0, id.1))
+                        && (last.ends_with("no such chore")
+                            || last.ends_with("no such backlog item")),
+                    "{:?}",
+                    run
+                );
+                prop_assert!(!self.ids_in(who.slot(), id.0).contains(&id.1), "{:?}", run);
+            }
+            // Killed: retitled or not; a retitle closes nothing.
+            Some(_) | None => {}
+        }
+        Ok(())
+    }
+
+    /// The line an id is on in a place, the first when it is on more.
+    fn line_of(&self, place: usize, id: Id) -> Option<String> {
+        let (path, _) = FILES.iter().find(|(_, p)| *p == id.0).expect("a list");
+        let bytes = match place {
+            0 => self.world.a().file(path),
+            1 => self.world.b().file(path),
+            _ => self.world.remote_file(path),
+        };
+        String::from_utf8(bytes.unwrap_or_default())
+            .unwrap()
+            .lines()
+            .find(|line| {
+                matches!(parse(id.0, line.as_bytes()).first(), Some(Line::Item { id: Some(found), .. }) if *found == id)
+            })
+            .map(str::to_owned)
+    }
+
+    /// The token of an id in the clone or the remote.
+    fn token_of(&self, who: Who, id: Id) -> Option<String> {
+        [who.slot(), 2].into_iter().find_map(|place| {
+            self.read(place)
+                .into_iter()
+                .flat_map(|(_, lines)| lines)
+                .find_map(|line| match line {
+                    Line::Item {
+                        id: Some(found),
+                        token,
+                    } if found == id => Some(token),
+                    Line::Item { .. } | Line::Text { .. } => None,
+                })
+        })
     }
 
     /// A `move` run: what it printed, and the item next to its target in
@@ -2395,6 +2529,7 @@ fn the_traces_get_deep() {
     // fixed seed does not bring about: `a_move_made_offline_meets_the_remote_s`
     // has it.
     assert!(depth.items_moved > 0, "{depth:?}");
+    assert!(depth.items_retitled > 0, "{depth:?}");
     assert!(
         depth.succeeded * 10 >= depth.commands * 6,
         "fewer than 60% of the commands succeeded: {depth:?}"

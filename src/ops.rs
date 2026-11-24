@@ -13,7 +13,7 @@ use crate::brief::{
 use crate::error::Error;
 use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
-use crate::list::{Body, FindError, Line, Move, MoveError, NoCheck, RemoveError};
+use crate::list::{Body, FindError, Line, Move, MoveError, NoCheck, RemoveError, RetitleError};
 use crate::project::{BoardPath, BriefFile, BriefName, Project, Slug};
 
 /// The sections a brief needs text in before it is queued: what the worker
@@ -406,15 +406,19 @@ pub struct NewChore {
 pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore) -> Result<(), Error> {
     let list = project.list_mut(ListKind::Chores);
     list.add_chore(id, &new.group, &new.text, &new.check, new.from)
-        .map_err(|NoCheck| {
-            Error::Refused(format!(
-                "add chore: `{}` does not say how to see that the chore is done",
-                new.check
-            ))
-        })?;
+        .map_err(|NoCheck| Error::Refused(format!("add chore: {}", no_check(&new.check))))?;
     list.amend_body(id.get(), &new.body, false)
         .expect("an id just given is on one line");
     Ok(())
+}
+
+/// Why a check is refused, as `add chore` and `retitle` say it.
+fn no_check(check: &Line) -> String {
+    if check.as_str().contains("Check:") {
+        format!("`{check}` holds a `Check:` of its own; lint would read only what follows it")
+    } else {
+        format!("`{check}` does not say how to see that the chore is done")
+    }
 }
 
 pub(crate) fn add_backlog(
@@ -428,6 +432,32 @@ pub(crate) fn add_backlog(
     list.add_backlog(id, text, from);
     list.amend_body(id.get(), body, false)
         .expect("an id just given is on one line");
+}
+
+/// Changes a chore's or backlog item's line, keeping its id, place,
+/// reference and body; gives what `retitle` prints, as `retitled c12`.
+/// Without it the planner, which writes the board only through `board`,
+/// could change a line only by drop and add: a new id, and the item at the
+/// bottom.
+pub(crate) fn retitle(
+    project: &mut Project,
+    id: ListId,
+    text: Option<&Line>,
+    check: Option<&Line>,
+) -> Result<String, Error> {
+    let kind = id.kind();
+    let refused = |why: String| Error::Refused(format!("retitle {id}: {why}"));
+    project
+        .list_mut(kind)
+        .retitle(id.get(), text, check)
+        .map_err(|error| match error {
+            RetitleError::Find(why) => refused(not_one(kind, id.get(), why)),
+            RetitleError::NoCheck => refused(no_check(check.expect("only a new check is refused"))),
+            RetitleError::NoCheckOnLine => {
+                refused("its line has no check to keep; give one with --check".to_owned())
+            }
+        })?;
+    Ok(format!("retitled {id}"))
 }
 
 /// Writes a chore's or backlog item's body: appended, or in place of the

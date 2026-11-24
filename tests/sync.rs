@@ -104,6 +104,121 @@ fn done_and_drop_delete_lines_all_or_nothing() {
     in_step(&world, &a);
 }
 
+/// `retitle` changes an item's line in one commit and keeps its id, place,
+/// reference and body; a chore's check stays unless one is given.
+#[test]
+fn retitle_changes_an_item_s_line_and_keeps_the_rest() {
+    let world = World::new();
+    let a = world.a();
+    a.board_with_input(
+        &[
+            "add",
+            "chore",
+            "Rotate the key",
+            "--group",
+            "Home",
+            "--check",
+            "login works",
+            "--from",
+            "126",
+            "--body",
+        ],
+        b"the steps",
+    )
+    .ok();
+    a.board(&["add", "chore", "Other", "--group", "Home", "--check", "x"])
+        .ok();
+    a.board(&["add", "backlog", "Dark mode", "--from", "c1"])
+        .ok();
+    assert_eq!(
+        a.board(&["retitle", "c1", "Rotate both keys"]).ok(),
+        "retitled c1\n"
+    );
+    assert_eq!(
+        a.board(&["show", "c1"]).ok(),
+        "c1 Rotate both keys. Check: login works  (126)\n  the steps\n"
+    );
+    a.board(&["retitle", "c1", "--check", "the old key fails"])
+        .ok();
+    a.board(&["retitle", "b1", "Dark theme"]).ok();
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "## Home\n- c1 Rotate both keys. Check: the old key fails  (126)\n  the steps\n- c2 Other. Check: x\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b1 Dark theme  (from c1)\n"
+    );
+    assert_eq!(
+        world.remote_log()[..3],
+        ["proj: retitle b1", "proj: retitle c1", "proj: retitle c1"]
+    );
+    assert_eq!(a.board(&["lint"]).ok(), "ok\n");
+    in_step(&world, &a);
+}
+
+#[test]
+fn retitle_refuses_what_names_no_line_or_no_change() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&[
+        "add",
+        "chore",
+        "Rotate the key",
+        "--group",
+        "Home",
+        "--check",
+        "x",
+    ])
+    .ok();
+    a.board(&["add", "backlog", "Dark mode"]).ok();
+    a.write(
+        "proj/chores.md",
+        "## Home\n- c1 Rotate the key. Check: x\n- c2 by hand, no check\n",
+    );
+    // The sync commits the hand edit; lint notes the chore without a check.
+    assert_eq!(a.board(&["sync"]).code, 0);
+    for args in [
+        &["retitle", "c1"][..],
+        &["retitle", "128", "x"],
+        &["retitle", "b1", "--check", "y"],
+    ] {
+        a.board(args).failed(2);
+    }
+    assert!(
+        a.board(&["retitle", "128", "x"])
+            .failed(2)
+            .contains("a brief's title is in its file")
+    );
+    for (args, message) in [
+        (
+            &["retitle", "c9", "x"][..],
+            "board: retitle c9: no such chore\n",
+        ),
+        (
+            &["retitle", "c1", "--check", "(126)"],
+            "board: retitle c1: `(126)` does not say how to see that the chore is done\n",
+        ),
+        (
+            &["retitle", "c1", "--check", "the Check: tab"],
+            "board: retitle c1: `the Check: tab` holds a `Check:` of its own; lint would read only \
+             what follows it\n",
+        ),
+        (
+            &["retitle", "c2", "y"],
+            "board: retitle c2: its line has no check to keep; give one with --check\n",
+        ),
+    ] {
+        // After the note lint gives on every write here.
+        let said = a.board(args).failed(1);
+        assert!(said.ends_with(message), "{args:?}: {said}");
+    }
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        "## Home\n- c1 Rotate the key. Check: x\n- c2 by hand, no check\n"
+    );
+}
+
 /// A body is written through `board`: given at `add --body`, appended by
 /// `amend`, replaced by `amend --replace`; `show` gives it back and `done`
 /// takes it along.

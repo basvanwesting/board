@@ -129,6 +129,25 @@ impl Board {
         })
     }
 
+    /// Changes a chore's or backlog item's line: its text, a chore's check,
+    /// or both; gives what it did, as `retitled c12`.
+    ///
+    /// # Panics
+    ///
+    /// When a check is given for a backlog item, which has none: the
+    /// command line refuses that before the board is read.
+    pub fn retitle(
+        &self,
+        id: ListId,
+        text: Option<&Line>,
+        check: Option<&Line>,
+    ) -> Result<String, Error> {
+        self.command("retitle", &|tx| {
+            let retitled = ops::retitle(&mut tx.project, id, text, check)?;
+            Ok((retitled, format!("retitle {id}")))
+        })
+    }
+
     /// Appends to a chore's or backlog item's body, or replaces it; gives
     /// what it did, as `amended c12`.
     pub fn amend_item(&self, id: ListId, body: &Body, replace: bool) -> Result<String, Error> {

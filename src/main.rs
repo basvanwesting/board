@@ -7,7 +7,7 @@ use board::{
     BacklogId, Board, Body, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit,
     ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Side, Slug, Snapshot, Status, Text,
 };
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 /// A file-based board for a planner/worker pair of coding agents and their
 /// user. Without a command: the board, as a TUI on a terminal.
@@ -103,6 +103,23 @@ enum Command {
         /// Like b41
         #[arg(required = true)]
         ids: Vec<BacklogId>,
+    },
+    /// Change a chore's or backlog item's line: its text, a chore's check, or
+    /// both. Its id, place, reference and body stay
+    // The group alone would print `<TEXT|--check <CHECK>> <ID>`, as if
+    // the text came first.
+    #[command(
+        group(ArgGroup::new("change").required(true).multiple(true).args(["text", "check"])),
+        override_usage = "board retitle <ID> [TEXT] [--check <CHECK>]"
+    )]
+    Retitle {
+        /// Like c12 or b41
+        id: ItemId,
+        /// The new text
+        text: Option<Line>,
+        /// A chore's new check: how to see that it is done
+        #[arg(long)]
+        check: Option<Line>,
     },
     /// Put a chore or a backlog item before or after another item of its
     /// list; a chore goes into the group of that item
@@ -308,6 +325,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::Done { ids }) => Run::Done(ids),
         Some(Command::Drop { ids }) => Run::Drop(ids),
         Some(Command::Move { id, place }) => Run::Move(place.of(id)?),
+        Some(Command::Retitle { id, text, check }) => retitle(id, text, check)?,
         Some(Command::Sync) => Run::Sync,
     };
     // A note is written as it comes, before the command goes on: `waiting
@@ -349,6 +367,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Run::Done(ids) => line(board.done(&ids)?),
         Run::Drop(ids) => line(board.drop_items(&ids)?),
         Run::Move(wanted) => line(board.move_item(&wanted)?),
+        Run::Retitle(id, text, check) => line(board.retitle(id, text.as_ref(), check.as_ref())?),
         Run::Sync => {
             board.sync()?;
             line("synced".to_owned())
@@ -387,7 +406,25 @@ enum Run {
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
     Move(Move),
+    Retitle(ListId, Option<Line>, Option<Line>),
     Sync,
+}
+
+/// `retitle`: what the command line alone rules out is a usage error, before
+/// the board is read.
+fn retitle(id: ItemId, text: Option<Line>, check: Option<Line>) -> Result<Run, Error> {
+    let what = format!("retitle {id}");
+    match id {
+        ItemId::Brief(_) => Err(Error::Usage(format!(
+            "{what}: a brief's title is in its file and its slug in the file name; \
+             retitle is for a chore or a backlog item"
+        ))),
+        ItemId::Backlog(_) if check.is_some() => {
+            Err(Error::Usage(format!("{what}: a backlog item has no check")))
+        }
+        ItemId::Chore(chore) => Ok(Run::Retitle(ListId::Chore(chore), text, check)),
+        ItemId::Backlog(backlog) => Ok(Run::Retitle(ListId::Backlog(backlog), text, check)),
+    }
 }
 
 /// `amend` of a brief, or of a chore's or backlog item's body.
