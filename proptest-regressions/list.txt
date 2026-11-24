@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f5c1344a28cd97c1b60acee74304203824636389d49b5dc6976f6a1393a0145f # shrinks to kind = Backlog, bytes = [45, 32, 98, 49, 32, 97, 10, 32, 32, 97], picks = [(Index(0), 1)]
+cc 150b3f849dca8b5370935cc67c42cccdbd496226f119c5eaf191b57ce98a3d02 # shrinks to kind = Chores, bytes = [35, 35, 32, 72, 111, 109, 101, 10, 32, 32, 97, 10, 35, 35, 32, 72, 111, 109, 101], lines = [], pick = Index(0), replace = false
+cc a8b0f0f70292b91778449019f4546aab46e337ecd734e7b67fe604156065d5d9 # shrinks to bytes = [35, 35, 32, 87, 111, 114, 107, 10, 32, 32, 97, 10, 35, 35, 32, 72, 111, 109, 101], mark = 0, group = Line("Work"), text = Line("a"), check = Line("a"), from = None

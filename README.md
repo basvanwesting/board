@@ -17,10 +17,10 @@ Three parties:
 Three lists, one board per project:
 
 - **Briefs** (`126`): one markdown file per piece of work: the planner's design, then the worker's questions and report. Numbered per project. Written by the planner, moved along by both; it ends filed.
-- **Chores** (`c12`): an action of the user's that a brief leaves behind (a deploy, an edit on production, something to judge by eye). One line, under a group heading, with a check that tells it is done: a chore expires unannounced, and the check is how to see it did. It ends deleted, by the user or the planner.
-- **Backlog** (`b41`): an unrefined item for later, one line. Line order is the user's priority. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
+- **Chores** (`c12`): an action of the user's that a brief leaves behind (a deploy, an edit on production, something to judge by eye). A title line under a group heading, with a check that tells it is done, and a body below it if needed: a chore expires unannounced, and the check is how to see it did. It ends deleted, by the user or the planner.
+- **Backlog** (`b41`): an unrefined item for later: a title line, and a body below it if needed. Line order is the user's priority. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
 
-The ID is the first word after a list line's dash (`- b41 …`), so it copies and greps cleanly. An item that needs more than its line gets indented lines directly below it, written in an editor: they are part of the item, shown with it by `board show <id>` and the TUI's preview, and deleted with it. Git history is the archive of everything deleted.
+The ID is the first word after a list line's dash (`- b41 …`), so it copies and greps cleanly. What does not fit an item's line goes in its body, the indented lines below it: written from stdin with `board add backlog "<text>" --body`, added to with `board amend <id>` and rewritten with `board amend <id> --replace`, or edited by hand; `board show <id>` and the TUI's preview show it, and it goes when the item does. A chore's check stays on its line. Git history is the archive of everything deleted.
 
 ## The life of a brief
 

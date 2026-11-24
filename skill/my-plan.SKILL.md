@@ -25,6 +25,7 @@ One board per project, in the shared board-data repo (one clone per machine), re
 - Briefs (`126`): one file each. The design is the planner's; its status and its report are the worker's, set through `board`.
 - Chores (`c12`): the user's own actions that briefs leave behind (a PROD edit, a hand fix, things to judge after a deploy). Every "not doable by the worker" becomes one when its brief is filed. Chores expire unannounced (a push, a deploy, an edit in another repo), so each names its check: the command or place that shows it done.
 - Backlog (`b41`): unrefined items. The user owns their order. Add only on the user's word or from a worker's out-of-scope findings.
+- A chore's or backlog item's line is a title that fits a row. Instructions, queries and context go in its body: stdin of `board add backlog "<text>" --body` (or `board add chore … --group … --check … --body`); `board amend <id>` appends to it, `board amend <id> --replace` rewrites it. A chore's check stays on its line; a long one points at the body (`Check: the query below returns nothing`). Blank lines of a body are not kept.
 
 The user has the board open in a pane of their own and refers to items by ID. Resolve an ID with `board show <id>`, never from memory, and never print the lists into the conversation: say what changed and what needs the user.
 

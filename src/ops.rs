@@ -12,8 +12,8 @@ use crate::brief::{
 };
 use crate::error::Error;
 use crate::git::Oid;
-use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
-use crate::list::{FindError, Line, Move, MoveError, NoCheck, RemoveError};
+use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
+use crate::list::{Body, FindError, Line, Move, MoveError, NoCheck, RemoveError};
 use crate::project::{BoardPath, BriefFile, BriefName, Project, Slug};
 
 /// The sections a brief needs text in before it is queued: what the worker
@@ -399,24 +399,54 @@ pub struct NewChore {
     pub group: Line,
     pub check: Line,
     pub from: Option<ItemId>,
+    /// Empty for none.
+    pub body: Body,
 }
 
 pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore) -> Result<(), Error> {
-    project
-        .list_mut(ListKind::Chores)
-        .add_chore(id, &new.group, &new.text, &new.check, new.from)
+    let list = project.list_mut(ListKind::Chores);
+    list.add_chore(id, &new.group, &new.text, &new.check, new.from)
         .map_err(|NoCheck| {
             Error::Refused(format!(
                 "add chore: `{}` does not say how to see that the chore is done",
                 new.check
             ))
-        })
+        })?;
+    list.amend_body(id.get(), &new.body, false)
+        .expect("an id just given is on one line");
+    Ok(())
 }
 
-pub(crate) fn add_backlog(project: &mut Project, id: BacklogId, text: &Line, from: Option<ItemId>) {
+pub(crate) fn add_backlog(
+    project: &mut Project,
+    id: BacklogId,
+    text: &Line,
+    from: Option<ItemId>,
+    body: &Body,
+) {
+    let list = project.list_mut(ListKind::Backlog);
+    list.add_backlog(id, text, from);
+    list.amend_body(id.get(), body, false)
+        .expect("an id just given is on one line");
+}
+
+/// Writes a chore's or backlog item's body: appended, or in place of the
+/// one it has (`--replace`). A replace is there because the planner writes
+/// the board only through `board`: without it, rewriting a parked idea
+/// takes a hand edit of the list file, and append-only bodies collect text
+/// that is no longer true. Appending is the default: it cannot lose text.
+pub(crate) fn amend_item(
+    project: &mut Project,
+    id: ListId,
+    body: &Body,
+    replace: bool,
+) -> Result<String, Error> {
+    let kind = id.kind();
     project
-        .list_mut(ListKind::Backlog)
-        .add_backlog(id, text, from);
+        .list_mut(kind)
+        .amend_body(id.get(), body, replace)
+        .map_err(|why| Error::Refused(format!("amend {id}: {}", not_one(kind, id.get(), why))))?;
+    Ok(format!("amended {id}"))
 }
 
 /// Deletes the chores' lines, all or none; gives what `done` prints.
@@ -590,10 +620,17 @@ mod tests {
                 group: line("Home"),
                 check: line("login works"),
                 from: None,
+                body: Body::new(b""),
             },
         )
         .unwrap();
-        add_backlog(&mut shop, backlog(7), &line("Dark mode"), None);
+        add_backlog(
+            &mut shop,
+            backlog(7),
+            &line("Dark mode"),
+            None,
+            &Body::new(b""),
+        );
         assert_eq!(
             shop.chores.to_bytes(),
             b"## Home\n- c4 Rotate the key. Check: login works\n"
@@ -1180,6 +1217,7 @@ mod tests {
                 group: line("Home"),
                 check: line("(126)"),
                 from: None,
+                body: Body::new(b""),
             },
         );
         assert!(

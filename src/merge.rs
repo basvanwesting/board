@@ -301,8 +301,11 @@ impl<'a> Version<'a> {
 /// an item's line go with that line, never as text. An indented line of no
 /// item that the union puts after an item gets a blank line before it, so
 /// it does not become that item's. Rejected: merging indented lines line
-/// by line within the item, which needs an order of their own for what is
-/// mostly one line. Indented lines as they stood with a line of the union
+/// by line within the item, which needs an order of their own; it rests
+/// on a body rarely being written from two clones at once, so two appends
+/// to one body before a sync keep the clone's (`board amend <c-id|b-id>`
+/// made bodies a planner's home for text: reopen when that bites).
+/// Indented lines as they stood with a line of the union
 /// are put in with its bytes, as that line is.
 ///
 /// For any `union` the ids come out right; only the order of lines and blank

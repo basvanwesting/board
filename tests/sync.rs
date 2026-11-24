@@ -104,6 +104,152 @@ fn done_and_drop_delete_lines_all_or_nothing() {
     in_step(&world, &a);
 }
 
+/// A body is written through `board`: given at `add --body`, appended by
+/// `amend`, replaced by `amend --replace`; `show` gives it back and `done`
+/// takes it along.
+#[test]
+fn add_body_amend_and_replace_write_an_item_s_body() {
+    let world = World::new();
+    let a = world.a();
+    let body = b"Run the query:\n\n- a list\n  - nested   \n";
+    assert_eq!(
+        a.board_with_input(
+            &[
+                "add",
+                "chore",
+                "Rotate the key",
+                "--group",
+                "Home",
+                "--check",
+                "the query below returns nothing",
+                "--body"
+            ],
+            body,
+        )
+        .ok(),
+        "c1\n"
+    );
+    a.board_with_input(
+        &["add", "backlog", "Dark mode", "--body"],
+        b"why: the night shift",
+    )
+    .ok();
+    assert_eq!(
+        a.board_with_input(
+            &["amend", "c1"],
+            b"And then:\n## not a heading\n- c9 not an item\n"
+        )
+        .ok(),
+        "amended c1\n"
+    );
+    let chore = "c1 Rotate the key. Check: the query below returns nothing\n  Run the query:\n  \
+                 - a list\n    - nested\n  And then:\n  ## not a heading\n  - c9 not an item\n";
+    assert_eq!(a.board(&["show", "c1"]).ok(), chore);
+    assert_eq!(
+        text(world.remote_file("proj/chores.md")),
+        format!("## Home\n- {chore}")
+    );
+    assert_eq!(
+        a.board(&["ls", "chores"]).ok(),
+        "## Home\nc1 Rotate the key. Check: the query below returns nothing\n"
+    );
+    // Replace: in place of the body, or of none; empty removes it.
+    assert_eq!(
+        a.board_with_input(&["amend", "b1", "--replace"], b"why: battery")
+            .ok(),
+        "amended b1\n"
+    );
+    assert_eq!(
+        a.board(&["show", "b1"]).ok(),
+        "b1 Dark mode\n  why: battery\n"
+    );
+    a.board_with_input(&["amend", "b1", "--replace"], b"").ok();
+    assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n");
+    a.board_with_input(&["amend", "b1", "--replace"], b"back")
+        .ok();
+    assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n  back\n");
+    assert_eq!(
+        world.remote_log()[..5],
+        [
+            "proj: amended b1",
+            "proj: amended b1",
+            "proj: amended b1",
+            "proj: amended c1",
+            "proj: add b1"
+        ]
+    );
+    assert_eq!(a.board(&["done", "c1"]).ok(), "done c1\n");
+    assert_eq!(text(world.remote_file("proj/chores.md")), "## Home\n");
+    in_step(&world, &a);
+}
+
+#[test]
+fn a_body_command_that_says_nothing_or_names_no_item_is_refused() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "backlog", "Dark mode"]).ok();
+    for (args, input, message) in [
+        (
+            &["amend", "b1"][..],
+            &b" \n\n"[..],
+            "board: amend b1: no text on stdin, which is where it is read from\n",
+        ),
+        (
+            &["add", "backlog", "x", "--body"][..],
+            &b"\n"[..],
+            "board: add backlog: no text on stdin, which is where it is read from\n",
+        ),
+        (
+            &["amend", "1", "--replace"][..],
+            &b"x"[..],
+            "board: amend 1: --replace is for a chore's or backlog item's body; a brief's amendments are a record of what was decided when\n",
+        ),
+    ] {
+        assert_eq!(
+            a.board_with_input(args, input).failed(2),
+            message,
+            "{args:?}"
+        );
+    }
+    assert_eq!(
+        a.board_with_input(&["amend", "b9"], b"x").failed(1),
+        "board: amend b9: no such backlog item\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/backlog.md")),
+        "- b1 Dark mode\n"
+    );
+}
+
+/// One clone replaces an item's body while the other deletes the item:
+/// after sync both have neither.
+#[test]
+fn a_body_replaced_on_one_clone_goes_with_its_item_deleted_on_the_other() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    a.board_with_input(&["add", "backlog", "Dark mode", "--body"], b"old")
+        .ok();
+    a.board(&["add", "backlog", "Later"]).ok();
+    b.board(&["sync"]).ok();
+    b.set_online(false);
+    // Offline, so the replace waits on the clone while A drops the item.
+    let ran = b.board_with_input(&["amend", "b1", "--replace"], b"new\nand more");
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"amended b1\n"[..]));
+    assert_eq!(a.board(&["drop", "b1"]).ok(), "dropped b1\n");
+    b.set_online(true);
+    assert_eq!(b.board(&["sync"]).code, 0);
+    a.board(&["sync"]).ok();
+    for file in [
+        world.remote_file("proj/backlog.md"),
+        a.file("proj/backlog.md"),
+        b.file("proj/backlog.md"),
+    ] {
+        assert_eq!(text(file), "- b2 Later\n");
+    }
+    in_step(&world, &a);
+    in_step(&world, &b);
+}
+
 /// An item's indented lines are its own: dropped on one clone while the
 /// other edits them, they are gone from both, and the item above keeps
 /// only its own.

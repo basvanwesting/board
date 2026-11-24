@@ -4,8 +4,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use board::{
-    BacklogId, Board, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit, ItemId,
-    Line, ListId, ListKind, ListRow, Move, NewChore, Side, Slug, Snapshot, Status, Text,
+    BacklogId, Board, Body, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit,
+    ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Side, Slug, Snapshot, Status, Text,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -31,7 +31,7 @@ enum Command {
         #[arg(long, value_name = "STATUS")]
         status: Option<Status>,
     },
-    /// Print a brief, or the line of a chore or backlog item
+    /// Print a brief, or a chore or backlog item: its line and its body
     Show {
         /// Like 128, c12 or b41
         id: ItemId,
@@ -60,10 +60,17 @@ enum Command {
         /// No `## ` line outside a code fence; use `###`
         question: Text,
     },
-    /// Append stdin under ## Amendments; a blocked brief resumes
+    /// Append stdin under a brief's ## Amendments (a blocked brief resumes),
+    /// or to a chore's or backlog item's body, stored indented and without
+    /// its blank lines
     Amend {
-        /// Like 128
-        id: BriefId,
+        /// Like 128, c12 or b41
+        id: ItemId,
+        /// Make stdin the item's body in place of the one it has; empty
+        /// stdin removes it. Not for a brief: its amendments are a record of
+        /// what was decided when
+        #[arg(long)]
+        replace: bool,
     },
     /// Make stdin the started brief's ## Report
     Report {
@@ -132,6 +139,10 @@ enum AddItem {
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
+        /// Read the chore's body from stdin, stored indented below its line
+        /// and without its blank lines
+        #[arg(long)]
+        body: bool,
     },
     /// An item for later, below the others
     Backlog {
@@ -139,6 +150,10 @@ enum AddItem {
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
+        /// Read the item's body from stdin, stored indented below its line
+        /// and without its blank lines
+        #[arg(long)]
+        body: bool,
     },
 }
 
@@ -261,7 +276,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::Queue { id, closes }) => Run::Queue(id, closes),
         Some(Command::Next) => Run::Next,
         Some(Command::Block { id, question }) => Run::Block(id, question),
-        Some(Command::Amend { id }) => Run::Amend(id, stdin_text(&format!("amend {id}"))?),
+        Some(Command::Amend { id, replace }) => amend(id, replace)?,
         Some(Command::Report { id }) => Run::Report(id, stdin_text(&format!("report {id}"))?),
         Some(Command::File { id, no_commits }) => Run::File(
             id,
@@ -278,16 +293,18 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
                     group,
                     check,
                     from,
+                    body,
                 },
         }) => Run::AddChore(NewChore {
             text,
             group,
             check,
             from,
+            body: stdin_body(body, "add chore")?,
         }),
         Some(Command::Add {
-            item: AddItem::Backlog { text, from },
-        }) => Run::AddBacklog(text, from),
+            item: AddItem::Backlog { text, from, body },
+        }) => Run::AddBacklog(text, from, stdin_body(body, "add backlog")?),
         Some(Command::Done { ids }) => Run::Done(ids),
         Some(Command::Drop { ids }) => Run::Drop(ids),
         Some(Command::Move { id, place }) => Run::Move(place.of(id)?),
@@ -319,13 +336,16 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
             line(format!("blocked {id}"))
         }
         Run::Amend(id, text) => line(board.amend(id, &text)?),
+        Run::AmendItem(id, body, replace) => line(board.amend_item(id, &body, replace)?),
         Run::Report(id, text) => {
             board.report(id, &text)?;
             line(format!("reported {id}"))
         }
         Run::File(id, check) => line(board.file(id, check)?.to_string()),
         Run::AddChore(new) => line(board.add_chore(&new)?.to_string()),
-        Run::AddBacklog(text, from) => line(board.add_backlog(&text, from)?.to_string()),
+        Run::AddBacklog(text, from, body) => {
+            line(board.add_backlog(&text, from, &body)?.to_string())
+        }
         Run::Done(ids) => line(board.done(&ids)?),
         Run::Drop(ids) => line(board.drop_items(&ids)?),
         Run::Move(wanted) => line(board.move_item(&wanted)?),
@@ -359,20 +379,62 @@ enum Run {
     Next,
     Block(BriefId, Text),
     Amend(BriefId, Text),
+    AmendItem(ListId, Body, bool),
     Report(BriefId, Text),
     File(BriefId, CommitCheck),
     AddChore(NewChore),
-    AddBacklog(Line, Option<ItemId>),
+    AddBacklog(Line, Option<ItemId>, Body),
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
     Move(Move),
     Sync,
 }
 
+/// `amend` of a brief, or of a chore's or backlog item's body.
+fn amend(id: ItemId, replace: bool) -> Result<Run, Error> {
+    let what = format!("amend {id}");
+    let item = match id {
+        ItemId::Brief(_) if replace => {
+            return Err(Error::Usage(format!(
+                "{what}: --replace is for a chore's or backlog item's body; a brief's \
+                 amendments are a record of what was decided when"
+            )));
+        }
+        ItemId::Brief(number) => return Ok(Run::Amend(number, stdin_text(&what)?)),
+        ItemId::Chore(chore) => ListId::Chore(chore),
+        ItemId::Backlog(backlog) => ListId::Backlog(backlog),
+    };
+    let body = Body::new(&stdin_bytes()?);
+    // An empty replace removes the body; an empty append says nothing.
+    if body.is_empty() && !replace {
+        return Err(no_text(&what));
+    }
+    Ok(Run::AmendItem(item, body, replace))
+}
+
+/// The body of `add … --body`, which must say something; without the flag
+/// nothing reads stdin. A flag and not "stdin when there is some": an
+/// agent's stdin may be a pipe that never closes, and on a terminal the
+/// command would wait for the user.
+fn stdin_body(wanted: bool, what: &str) -> Result<Body, Error> {
+    if !wanted {
+        return Ok(Body::new(b""));
+    }
+    let body = Body::new(&stdin_bytes()?);
+    if body.is_empty() {
+        return Err(no_text(what));
+    }
+    Ok(body)
+}
+
 /// The text of `amend` and `report`, read whole from stdin before anything
 /// else happens: it is part of the command line, and a write may run its
 /// command more than once.
 fn stdin_text(what: &str) -> Result<Text, Error> {
+    Text::new(&stdin_bytes()?).map_err(|EmptyText| no_text(what))
+}
+
+fn stdin_bytes() -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     io::stdin()
         .lock()
@@ -382,11 +444,13 @@ fn stdin_text(what: &str) -> Result<Text, Error> {
             path: "stdin".into(),
             source,
         })?;
-    Text::new(&bytes).map_err(|EmptyText| {
-        Error::Usage(format!(
-            "{what}: no text on stdin, which is where it is read from"
-        ))
-    })
+    Ok(bytes)
+}
+
+fn no_text(what: &str) -> Error {
+    Error::Usage(format!(
+        "{what}: no text on stdin, which is where it is read from"
+    ))
 }
 
 fn ls(snapshot: &Snapshot, selection: &Selection) -> Vec<u8> {

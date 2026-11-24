@@ -135,7 +135,7 @@ impl fmt::Display for InvalidLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             InvalidLine::Empty => "the text is empty",
-            InvalidLine::LineBreak => "the text has a line break; an item is one line",
+            InvalidLine::LineBreak => "the text has a line break; a list line is one line (an item's body is given with `--body`)",
         })
     }
 }
@@ -161,6 +161,37 @@ pub struct RemoveError {
 /// The list holds or once held the id `u32::MAX`: there is no next id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdsExhausted;
+
+/// A chore's or backlog item's body, as the CLI writes it: the indented
+/// lines below the item's line (`board add … --body`, `board amend`).
+///
+/// Each line is indented by two spaces, its own leading whitespace kept
+/// after them, so a nested list stays nested; the indentation also makes
+/// every line text, never an item, a heading or a check. Trailing
+/// whitespace is trimmed and blank lines are left out: a blank line ends an
+/// item's block for every reader of the file ([`is_continuation`]), so a
+/// body with one would lose what comes after it. Rejected: another reading
+/// of a blank line inside a body, a second definition of where an item
+/// ends, which is where orphaned lines come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Body(Vec<Vec<u8>>);
+
+impl Body {
+    pub fn new(text: &[u8]) -> Body {
+        Body(
+            raw::lines(text)
+                .map(|line| raw::content(line).trim_ascii_end())
+                .filter(|line| !line.is_empty())
+                .map(|line| [b"  ", line].concat())
+                .collect(),
+        )
+    }
+
+    /// Whether it has no line: a text with only blank lines has none.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// The check would not read as one once written: it is only `(126)`, which
 /// reads as the `--from` suffix, or it ends in `Check:`.
@@ -411,10 +442,9 @@ impl ListFile {
                     .items()
                     .map(|(index, ..)| index)
                     .rfind(|index| (heading + 1..end).contains(index));
-                let at = match last_item {
-                    Some(last_item) => self.after_item(last_item),
-                    None => heading + 1,
-                };
+                // Past indented lines directly below the heading too: put
+                // above them, the new chore would take them as its body.
+                let at = self.after_item(last_item.unwrap_or(heading));
                 self.insert(at, vec![item]);
             }
             None => {
@@ -460,8 +490,27 @@ impl ListFile {
         self.insert(at, vec![item.into_bytes()]);
     }
 
-    /// The index after an item and the indented lines that continue it, so a
-    /// new item does not come between another item and its continuation.
+    /// Writes the body of the one item with this id: after the indented
+    /// lines it has, or in their place when `replace` (an empty body then
+    /// leaves the item without one).
+    pub fn amend_body(&mut self, number: u32, body: &Body, replace: bool) -> Result<(), FindError> {
+        let (index, _) = self.item(number)?;
+        let end = self.after_item(index);
+        let at = if replace {
+            self.lines.drain(index + 1..end);
+            index + 1
+        } else {
+            end
+        };
+        if !body.is_empty() {
+            self.insert(at, body.0.clone());
+        }
+        Ok(())
+    }
+
+    /// The index after an item (or a heading) and the indented lines that
+    /// continue it, so a new item does not come between a line and its
+    /// continuation.
     fn after_item(&self, item: usize) -> usize {
         (item + 1..self.lines.len())
             .find(|index| !is_continuation(raw::content(&self.lines[*index])))
@@ -933,6 +982,70 @@ mod tests {
         assert_eq!(written(&empty), "- b1 one\n");
     }
 
+    // ---- bodies ----
+
+    #[test]
+    fn a_body_is_indented_without_blank_lines_or_trailing_whitespace() {
+        let body = Body::new(b"\nfirst  \n\n- a list\n  - nested\r\n\t\n## not a heading\n");
+        let mut file = backlog("- b1 one\n");
+        file.amend_body(1, &body, false).unwrap();
+        assert_eq!(
+            written(&file),
+            "- b1 one\n  first\n  - a list\n    - nested\n  ## not a heading\n"
+        );
+        assert!(Body::new(b" \n\n\t").is_empty());
+    }
+
+    #[test]
+    fn amend_body_appends_or_replaces_and_leaves_the_rest() {
+        let start =
+            "## Home\n- c1 one. Check: x\n  old\n- c2 two. Check: y\n\n  free\n- c3 last. Check: z";
+        let new = Body::new(b"new");
+        let mut file = chores(start);
+        file.amend_body(1, &new, false).unwrap();
+        file.amend_body(3, &new, false).unwrap();
+        assert_eq!(
+            written(&file),
+            "## Home\n- c1 one. Check: x\n  old\n  new\n- c2 two. Check: y\n\n  free\n- c3 last. Check: z\n  new\n"
+        );
+        let mut file = chores(start);
+        file.amend_body(1, &new, true).unwrap();
+        file.amend_body(2, &new, true).unwrap();
+        assert_eq!(
+            written(&file),
+            "## Home\n- c1 one. Check: x\n  new\n- c2 two. Check: y\n  new\n\n  free\n- c3 last. Check: z"
+        );
+        // An empty replace removes the body, and only that.
+        let mut file = chores(start);
+        file.amend_body(1, &Body::new(b""), true).unwrap();
+        file.amend_body(3, &Body::new(b""), true).unwrap();
+        assert_eq!(
+            written(&file),
+            "## Home\n- c1 one. Check: x\n- c2 two. Check: y\n\n  free\n- c3 last. Check: z"
+        );
+        assert_eq!(
+            chores(start).amend_body(9, &new, false),
+            Err(FindError::Missing)
+        );
+    }
+
+    /// An indented line directly below a group's heading is no chore's: a
+    /// chore added to the group goes after it, or it would be the chore's.
+    #[test]
+    fn a_chore_added_to_a_group_without_items_goes_after_its_free_lines() {
+        let mut file = chores("## Home\n  about home\n## Work\n");
+        file.add_chore(chore_id(1), &line("Home"), &line("x"), &line("y"), None)
+            .unwrap();
+        assert_eq!(
+            written(&file),
+            "## Home\n  about home\n- c1 x. Check: y\n## Work\n"
+        );
+        assert_eq!(
+            file.find_with_indented(1),
+            Ok((&b"c1 x. Check: y"[..], vec![]))
+        );
+    }
+
     // ---- remove ----
 
     #[test]
@@ -1364,15 +1477,26 @@ mod tests {
         let lines = raw_lines(&after);
         let item_at = at + new.len() - 1;
         if old.iter().any(named) {
-            // Into the first group of that name, as its last item, directly
-            // under the heading when the group has none.
+            // Into the first group of that name, as its last item; when the
+            // group has none, under the heading and the indented lines
+            // directly below it, which are no chore's.
             prop_assert_eq!(new.len(), 1);
             let heading = lines.iter().position(named).unwrap();
             let end = (heading + 1..lines.len())
                 .find(|index| is_heading(&lines[*index]))
                 .unwrap_or(lines.len());
             prop_assert!((heading + 1..end).contains(&item_at));
-            placed_last(CHORES, &lines, (heading + 1, end), item_at, heading + 1)
+            let below = old[heading + 1..]
+                .iter()
+                .take_while(|line| is_continuation(content_of(line)))
+                .count();
+            placed_last(
+                CHORES,
+                &lines,
+                (heading + 1, end),
+                item_at,
+                heading + 1 + below,
+            )
         } else {
             // A new group at the end of the file, set apart by a blank line
             // unless the file is empty or ends in one.
@@ -1434,6 +1558,73 @@ mod tests {
                 prop_assert_eq!(file.to_bytes(), bytes);
             }
         }
+        Ok(())
+    }
+
+    /// What a body could change: the headings and the items, with their ids
+    /// and lines.
+    fn outline(file: &ListFile) -> Vec<String> {
+        file.entries()
+            .filter(|entry| !matches!(entry, Entry::Text(_)))
+            .map(|entry| format!("{entry:?}"))
+            .collect()
+    }
+
+    /// The body as `show` gives it back: each line indented by two spaces,
+    /// trailing whitespace off, blank lines out.
+    fn as_shown(text: &str) -> Vec<Vec<u8>> {
+        text.split('\n')
+            .map(str::trim_ascii_end)
+            .filter(|line| !line.is_empty())
+            .map(|line| format!("  {line}").into_bytes())
+            .collect()
+    }
+
+    /// A body, whatever its lines look like, never changes the items: an
+    /// item added with one, or one amended, leaves every heading, item and
+    /// id as without it, and the item gives the body back.
+    fn check_body(
+        kind: ListKind,
+        bytes: &[u8],
+        text: &str,
+        pick: prop::sample::Index,
+        replace: bool,
+    ) -> Result<(), TestCaseError> {
+        let body = Body::new(text.as_bytes());
+        let want = as_shown(text);
+        let indented = |file: &ListFile, id: u32| -> Vec<Vec<u8>> {
+            let (_, lines) = file.find_with_indented(id).unwrap();
+            lines.into_iter().map(<[u8]>::to_vec).collect()
+        };
+        // Added with it.
+        let mut without = ListFile::parse(kind, bytes);
+        let id = without.next_id(0).unwrap();
+        match kind {
+            ListKind::Chores => without
+                .add_chore(chore_id(id), &line("Home"), &line("x"), &line("y"), None)
+                .unwrap(),
+            ListKind::Backlog => without.add_backlog(backlog_id(id), &line("x"), None),
+        }
+        let mut with = without.clone();
+        with.amend_body(id, &body, false).unwrap();
+        prop_assert_eq!(outline(&with), outline(&without));
+        prop_assert_eq!(indented(&with, id), want.clone());
+        // Amended.
+        let mut file = ListFile::parse(kind, bytes);
+        let ids: Vec<u32> = file
+            .items()
+            .filter_map(|(_, id, _)| id)
+            .filter(|id| file.find(*id).is_ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id = *pick.get(&ids);
+        let (before, old) = (outline(&file), indented(&file, id));
+        file.amend_body(id, &body, replace).unwrap();
+        prop_assert_eq!(outline(&file), before);
+        let want = if replace { want } else { [old, want].concat() };
+        prop_assert_eq!(indented(&file, id), want);
         Ok(())
     }
 
@@ -1611,6 +1802,23 @@ mod tests {
                 .map(|(pick, other)| if ids.is_empty() || other > 11 { other } else { *pick.get(&ids) })
                 .collect();
             check_remove(kind, &bytes, &numbers)?;
+        }
+
+        #[test]
+        fn a_body_never_changes_the_items(
+            kind in kind(),
+            bytes in file_bytes(),
+            lines in prop::collection::vec(
+                prop_oneof![
+                    4 => content(),
+                    1 => content().prop_map(|line| format!("{line}  ")),
+                ],
+                0..6,
+            ),
+            pick in any::<prop::sample::Index>(),
+            replace in any::<bool>(),
+        ) {
+            check_body(kind, &bytes, &lines.join("\n"), pick, replace)?;
         }
 
         #[test]

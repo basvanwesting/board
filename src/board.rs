@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use crate::brief::{EntryText, Stamp, Status, Text};
 use crate::error::Error;
 use crate::git::{Failure, Git, Oid};
-use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
+use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
 use crate::lint::{Finding, lint};
-use crate::list::{Entry, Line, ListFile, Move};
+use crate::list::{Body, Entry, Line, ListFile, Move};
 use crate::ops::{self, Commits, Filed, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Fetched, Note};
@@ -114,12 +114,27 @@ impl Board {
         })
     }
 
-    /// Adds a backlog item below the others; gives its new id.
-    pub fn add_backlog(&self, text: &Line, from: Option<ItemId>) -> Result<BacklogId, Error> {
+    /// Adds a backlog item below the others, with its body (empty for
+    /// none); gives its new id.
+    pub fn add_backlog(
+        &self,
+        text: &Line,
+        from: Option<ItemId>,
+        body: &Body,
+    ) -> Result<BacklogId, Error> {
         self.command("add backlog", &|tx| {
             let id = tx.alloc_backlog()?;
-            ops::add_backlog(&mut tx.project, id, text, from);
+            ops::add_backlog(&mut tx.project, id, text, from, body);
             Ok((id, format!("add {id}")))
+        })
+    }
+
+    /// Appends to a chore's or backlog item's body, or replaces it; gives
+    /// what it did, as `amended c12`.
+    pub fn amend_item(&self, id: ListId, body: &Body, replace: bool) -> Result<String, Error> {
+        self.command("amend", &|tx| {
+            let amended = ops::amend_item(&mut tx.project, id, body, replace)?;
+            Ok((amended.clone(), amended))
         })
     }
 
