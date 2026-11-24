@@ -26,7 +26,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -399,14 +399,25 @@ impl Machine<'_> {
             .stderr(Stdio::piped())
             .spawn()
             .expect("run board");
-        // Small enough for the pipe: written whole before the output is
-        // read.
-        child
+        // Written whole before the output is read: a command reads its
+        // input before it prints more than the pipe holds. A command
+        // refused on its arguments exits before it reads stdin, and the
+        // write then meets a closed pipe: that is the command's answer,
+        // judged by the caller from its status and output, not a failure of
+        // the test. Rejected:
+        // `board` reading stdin before its usage checks, which would change
+        // the tool for its tests and wait on a terminal for input it is
+        // about to refuse.
+        let written = child
             .stdin
             .take()
             .expect("stdin was piped")
-            .write_all(input)
-            .expect("write stdin");
+            .write_all(input);
+        if let Err(error) = written
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
+            panic!("write stdin: {error}");
+        }
         let Output {
             status,
             stdout,

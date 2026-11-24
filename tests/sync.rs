@@ -336,6 +336,22 @@ fn a_body_command_that_says_nothing_or_names_no_item_is_refused() {
     );
 }
 
+/// A command refused on its arguments exits before it reads stdin: the
+/// input outgrows the pipe, so writing it meets a closed pipe every time,
+/// and the test still judges the command by what it printed.
+#[test]
+fn a_command_refused_before_it_reads_stdin_is_judged_by_its_output() {
+    let world = World::new();
+    let a = world.a();
+    let input = vec![b'x'; 1 << 20];
+    assert_eq!(
+        a.board_with_input(&["amend", "1", "--replace"], &input)
+            .failed(2),
+        "board: amend 1: --replace is for a chore's or backlog item's body; a brief's \
+         amendments are a record of what was decided when\n"
+    );
+}
+
 /// One clone replaces an item's body while the other deletes the item:
 /// after sync both have neither.
 #[test]
@@ -1063,14 +1079,20 @@ fn a_hostile_git_configuration_changes_nothing() {
         fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         path.to_str().unwrap().to_owned()
     };
-    // Makes a signature git takes, to sign a commit by hand.
+    // Makes a signature git takes, to sign a commit by hand. Each fake reads
+    // what git writes it first: one that exits before git is done writing
+    // breaks git's pipe, and git then fails now and then, under load.
     let signer = script(
         "signer",
-        "echo '[GNUPG:] SIG_CREATED ' >&2\n\
+        "cat >/dev/null\n\
+         echo '[GNUPG:] SIG_CREATED ' >&2\n\
          printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nfake\\n-----END PGP SIGNATURE-----\\n'\n",
     );
     // Signs nothing, and says an id line when asked to check a signature.
-    let gpg = script("gpg", "echo '+- b99 not a line' >&2\nexit 1\n");
+    let gpg = script(
+        "gpg",
+        "cat >/dev/null\necho '+- b99 not a line' >&2\nexit 1\n",
+    );
     let textconv = script("textconv", "cat \"$1\"\necho '- c99 not a line'\n");
     let attributes = world.dir().join("attributes");
     fs::write(
