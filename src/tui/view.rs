@@ -29,7 +29,7 @@ const HELP: [(&str, &str); 19] = [
     ),
     ("e", "edit the brief, or the list at the item, in $EDITOR"),
     ("r", "sync: commit hand edits, fetch, push"),
-    ("y Y", "yank the id, the line"),
+    ("y Y yy", "yank the id, the line, the whole item"),
     (
         "Esc",
         "leave the preview, close help, answer no, clear the filter",

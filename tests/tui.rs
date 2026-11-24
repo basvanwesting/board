@@ -157,4 +157,53 @@ fn main() {
     );
     // A yank writes nothing.
     assert_eq!(a.status(), "");
+
+    // yy: the whole item, what `board show` prints, after the id of the
+    // first y: a chore with a body, an open brief, a filed one.
+    let chore = a
+        .board_with_input(
+            &[
+                "add",
+                "chore",
+                "Wash the car",
+                "--group",
+                "Home",
+                "--check",
+                "it shines",
+                "--body",
+            ],
+            b"first the wheels\n  - front\n  - back\n",
+        )
+        .ok();
+    let chore = chore.trim_end();
+    let path = a.board(&["new", "brief", "yank-me"]).ok();
+    let open = path
+        .trim_end()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .split('-')
+        .next()
+        .unwrap()
+        .to_owned();
+    a.write(
+        "proj/briefs/done/77-old-one.md",
+        "id: 77\nstatus: filed\n\n# Old\n## Report\nall done\n",
+    );
+    a.board(&["sync"]).ok();
+    for (keys, id) in [
+        ("2/Wash\ryy", chore),
+        ("1/yank-me\ryy", open.as_str()),
+        ("1]/old-one\ryy", "77"),
+    ] {
+        fs::write(&clipboard, "").expect("empty the clipboard");
+        tui(&a, keys);
+        let show = a.board(&["show", id]).ok();
+        assert_eq!(
+            fs::read_to_string(&clipboard).expect("wl-copy ran"),
+            format!("{id}\n{show}\n"),
+            "{keys:?}"
+        );
+    }
+    assert_eq!(a.status(), "");
 }

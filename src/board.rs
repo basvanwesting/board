@@ -481,15 +481,20 @@ fn entry(text: &Text, what: &str) -> Result<EntryText, Error> {
 /// item.
 fn item(list: &ListFile, number: u32) -> Result<Vec<u8>, String> {
     list.find_with_indented(number)
-        .map(|(text, indented)| {
-            let mut shown = [text, b"\n"].concat();
-            for line in indented {
-                shown.extend_from_slice(line);
-                shown.push(b'\n');
-            }
-            shown
-        })
+        .map(|(text, indented)| shown_item(text, indented))
         .map_err(|why| ops::not_one(list.kind(), number, why))
+}
+
+/// A chore or backlog item as `show` prints it: its line without the `- `,
+/// then its body's lines as the file has them. The TUI's `yy` yanks the
+/// same, from this code.
+pub(crate) fn shown_item<'a>(text: &[u8], body: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut shown = [text, b"\n"].concat();
+    for line in body {
+        shown.extend_from_slice(line);
+        shown.push(b'\n');
+    }
+    shown
 }
 
 /// What the board shows of a project: the briefs, the chores by group, the

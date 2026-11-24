@@ -15,7 +15,7 @@ use std::fmt;
 use super::data::{BriefItem, Data, ListEntry};
 use super::layout::{self, Areas};
 use super::moves;
-use crate::board::Shown;
+use crate::board::{self, Shown};
 use crate::brief::{Stamp, Status};
 use crate::id::{BacklogId, BriefId, ChoreId, ListKind};
 use crate::list::{self, Move, Side};
@@ -358,6 +358,10 @@ pub(crate) struct State {
     typing: bool,
     /// `g` was pressed: a second one goes to the top.
     pending_g: bool,
+    /// A `y` was the last key, on this item: a `y` now yanks the whole of
+    /// it (`yy`). The item, not a flag: a reload between the two keys may
+    /// move the cursor onto another one, whose id was never yanked.
+    pending_y: Option<ItemKey>,
     help: bool,
     preview: Preview,
     sync: SyncState,
@@ -395,6 +399,7 @@ impl State {
             filters: Default::default(),
             typing: false,
             pending_g: false,
+            pending_y: None,
             help: false,
             preview: Preview::default(),
             sync: SyncState::default(),
@@ -510,6 +515,7 @@ impl State {
             }
         }
         let pending_g = std::mem::take(&mut self.pending_g);
+        let pending_y = std::mem::take(&mut self.pending_y);
         if self.typing {
             self.type_filter(key);
             return Vec::new();
@@ -589,7 +595,16 @@ impl State {
             Key::Char('K') => self.move_item(false),
             Key::Char('e') => commands.extend(self.edit_key()),
             Key::Char('r') => commands.extend(self.run(Action::Sync)),
-            Key::Char('y') => commands.extend(self.yank(false)),
+            // The id at once, as `gg` is read: no timer for a key that can
+            // answer now; a `y` as the very next key then takes the whole
+            // item instead, and a third starts over.
+            Key::Char('y') if pending_y.is_some() && pending_y == self.cursor_key() => {
+                commands.extend(self.yank_whole());
+            }
+            Key::Char('y') => {
+                commands.extend(self.yank(false));
+                self.pending_y = self.cursor_key();
+            }
             Key::Char('Y') => commands.extend(self.yank(true)),
             _ => {}
         }
@@ -937,6 +952,48 @@ impl State {
             },
         };
         self.say(format!("yanked {text}"), false);
+        vec![Command::Yank(text)]
+    }
+
+    /// The item under the cursor of the focused panel.
+    fn cursor_key(&self) -> Option<ItemKey> {
+        self.cursor_item().and_then(|(_, row)| row.key)
+    }
+
+    /// `yy`: the whole item, as `board show` prints it, from the same code: a
+    /// brief's file, a chore's or backlog item's line with its body; also an
+    /// item without an id, whose text is there all the same. The bottom
+    /// line says what was taken, never the text.
+    fn yank_whole(&mut self) -> Vec<Command> {
+        let Some((source, row)) = self.cursor_item() else {
+            return Vec::new();
+        };
+        let (text, what) = match source.list() {
+            None => {
+                let brief = self.brief(source, &row);
+                (brief.text.clone(), brief.row.number.to_string())
+            }
+            Some(kind) => {
+                let ListEntry::Item { text, indented, .. } = &self.data.list(kind)[row.at].entry
+                else {
+                    return Vec::new();
+                };
+                let name = row.id_word(kind).unwrap_or_else(|| "the item".to_owned());
+                let what = if indented.is_empty() {
+                    name
+                } else {
+                    format!("{name} with its body")
+                };
+                (
+                    board::shown_item(text, indented.iter().map(Vec::as_slice)),
+                    what,
+                )
+            }
+        };
+        let text = String::from_utf8_lossy(&text).into_owned();
+        let lines = text.lines().count();
+        let plural = if lines == 1 { "" } else { "s" };
+        self.say(format!("yanked {what}, {lines} line{plural}"), false);
         vec![Command::Yank(text)]
     }
 

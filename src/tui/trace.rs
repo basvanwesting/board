@@ -617,6 +617,8 @@ struct Depth {
     /// the CLI.
     on_tab_typed_id: u32,
     yanks: u32,
+    /// `yy`: the whole item yanked.
+    whole_yanks: u32,
     syncs: u32,
     wrote_ok: u32,
     wrote_failed: u32,
@@ -672,6 +674,7 @@ impl Depth {
             followed,
             on_tab_typed_id,
             yanks,
+            whole_yanks,
             syncs,
             wrote_ok,
             wrote_failed,
@@ -692,6 +695,8 @@ struct Oracle {
     writes: VecDeque<Action>,
     /// Edits asked for and not answered.
     edits: usize,
+    /// The item the last key, a `y`, yanked the id of.
+    y_armed: Option<ItemKey>,
     /// Which briefs are unpushed was asked and has not answered.
     unpushed_out: bool,
     /// When it was last asked.
@@ -706,6 +711,7 @@ impl Oracle {
             fetch_last: Some(now),
             writes: VecDeque::new(),
             edits: 0,
+            y_armed: None,
             unpushed_out: true,
             unpushed_last: now,
         }
@@ -1056,6 +1062,18 @@ fn judge(
         && !before.typing
         && before.question.is_none()
         && !before.help;
+    // `yy`, by the keys this trace sent, not by the state's own reading: a
+    // `y` right after a `y` on the same item, with no key between.
+    let cursor_key = before.cursor_item().and_then(|(_, row)| row.key);
+    let whole = plain
+        && key == Some(Key::Char('y'))
+        && oracle.y_armed.is_some()
+        && oracle.y_armed == cursor_key;
+    if key.is_some() {
+        oracle.y_armed = (plain && key == Some(Key::Char('y')) && !whole)
+            .then(|| cursor_key.clone())
+            .flatten();
+    }
 
     let sent: Vec<&Move> = commands
         .iter()
@@ -1168,7 +1186,21 @@ fn judge(
             }
             Command::Yank(text) => {
                 prop_assert!(pressed('y') || pressed('Y'), "yank after {event:?}");
+                // `yy`: the whole item; the trace's items have no body, so
+                // a list item is its line, a brief its file.
                 if pressed('y')
+                    && whole
+                    && let Some((source, row)) = before.cursor_item()
+                {
+                    let want = match source.list() {
+                        Some(_) => format!("{}\n", row.text),
+                        None => {
+                            String::from_utf8_lossy(&before.brief(source, &row).text).into_owned()
+                        }
+                    };
+                    prop_assert_eq!(text, &want);
+                    depth.whole_yanks += 1;
+                } else if pressed('y')
                     && let Some((source, row)) = before.cursor_item()
                     && let Some(kind) = source.list()
                 {
@@ -1176,6 +1208,11 @@ fn judge(
                     prop_assert_eq!(kind.parse_id(text.as_bytes()), cli_id(kind, &row));
                     prop_assert!(cli_id(kind, &row).is_some());
                     prop_assert!(row.text.starts_with(&format!("{text} ")), "{:?}", row);
+                } else if pressed('y')
+                    && let Some((source, row)) = before.cursor_item()
+                {
+                    // A brief's id: its number.
+                    prop_assert_eq!(text, &before.brief(source, &row).row.number.to_string());
                 }
                 depth.yanks += 1;
             }
@@ -1647,6 +1684,7 @@ fn the_traces_get_deep() {
         ("followed", depth.followed > 0),
         ("on_tab_typed_id", depth.on_tab_typed_id > 0),
         ("yanks", depth.yanks > 0),
+        ("whole_yanks", depth.whole_yanks > 0),
         ("syncs", depth.syncs > 0),
         ("wrote_ok", depth.wrote_ok > 0),
         ("wrote_failed", depth.wrote_failed > 0),
@@ -1769,4 +1807,78 @@ fn zero_typed_into_a_filter_is_filter_text() {
         .fold(state, |state, key| state.step(Event::Key(key)).0);
     assert_eq!(state.filter(Panel::Briefs), Some("10"));
     assert!(!state.in_preview());
+}
+
+/// The yanks each key gives, on a board with brief 1 and two chores: c1,
+/// and one without an id.
+fn yanks_along(keys: &[Key]) -> Vec<Vec<String>> {
+    let files = Files {
+        open: vec![(1, Some(Status::Queued), 0)],
+        filed: Vec::new(),
+        chores: vec![ChoreLine::Item(Some(1), 0), ChoreLine::Item(None, 1)],
+        backlog: Vec::new(),
+    };
+    let (mut state, _) = start(&files, 1_000_000).unwrap();
+    let mut seen = Vec::new();
+    for key in keys {
+        let commands;
+        (state, commands) = state.step(Event::Key(*key));
+        seen.push(
+            commands
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::Yank(text) => Some(text),
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    seen
+}
+
+/// `y` the id at once; a `y` as the very next key the whole item, a third
+/// the id again; any key between starts over.
+#[test]
+fn yy_yanks_the_whole_item_and_y_still_the_id() {
+    use Key::Char;
+    let whole = "id: 1\nstatus: queued\n\n# Brief 1\n## Task\n".to_owned();
+    let id = "1".to_owned();
+    assert_eq!(
+        yanks_along(&[Char('y'), Char('y'), Char('y')]),
+        [vec![id.clone()], vec![whole.clone()], vec![id.clone()]]
+    );
+    assert_eq!(
+        yanks_along(&[Char('y'), Char('j'), Char('y')]),
+        [vec![id.clone()], vec![], vec![id.clone()]]
+    );
+    assert_eq!(
+        yanks_along(&[Char('y'), Key::Esc, Char('y'), Char('Y'), Char('y')]),
+        [
+            vec![id.clone()],
+            vec![],
+            vec![id.clone()],
+            vec!["1 queued s1".to_owned()],
+            vec![id]
+        ]
+    );
+    // A chore: its line; one without an id: `y` takes nothing, `yy` its
+    // line all the same.
+    assert_eq!(
+        yanks_along(&[
+            Char('2'),
+            Char('y'),
+            Char('y'),
+            Char('j'),
+            Char('y'),
+            Char('y')
+        ]),
+        [
+            vec![],
+            vec!["c1".to_owned()],
+            vec!["c1 chore v0. Check: it is done\n".to_owned()],
+            vec![],
+            vec![],
+            vec!["chore v1. Check: it is done\n".to_owned()],
+        ]
+    );
 }
