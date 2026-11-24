@@ -332,6 +332,20 @@ impl ListFile {
         self.item(number).map(|(_, text)| text)
     }
 
+    /// The one item with this id: its text, and the contents of the
+    /// indented lines that continue it, which are its own.
+    pub fn find_with_indented(&self, number: u32) -> Result<(&[u8], Vec<&[u8]>), FindError> {
+        self.item(number)
+            .map(|(index, text)| (text, self.indented_below(index).collect()))
+    }
+
+    /// The contents of the indented lines that continue the item at `index`.
+    pub(crate) fn indented_below(&self, index: usize) -> impl Iterator<Item = &[u8]> {
+        self.lines[index + 1..self.after_item(index)]
+            .iter()
+            .map(|line| raw::content(line))
+    }
+
     /// The highest id on an item line; 0 for none.
     pub fn max_id(&self) -> u32 {
         self.items().filter_map(|(_, id, _)| id).max().unwrap_or(0)
@@ -474,9 +488,10 @@ impl ListFile {
         );
     }
 
-    /// Deletes the item lines with these ids, all or none: every id must sit
-    /// on exactly one line. Only the item line goes; indented lines below it
-    /// stay, as text the tool does not own.
+    /// Deletes the items with these ids, all or none: every id must sit on
+    /// exactly one line. An item goes with the indented lines that continue
+    /// it: they are its own, and left behind they would continue whichever
+    /// item ends up above them.
     pub fn remove(&mut self, numbers: &[u32]) -> Result<(), RemoveError> {
         let indexes = numbers
             .iter()
@@ -489,7 +504,8 @@ impl ListFile {
             })
             .collect::<Result<BTreeSet<usize>, RemoveError>>()?;
         for index in indexes.into_iter().rev() {
-            self.lines.remove(index);
+            let end = self.after_item(index);
+            self.lines.drain(index..end);
         }
         Ok(())
     }
@@ -499,11 +515,10 @@ impl ListFile {
     /// between an item and its continuation. In a chores file it is then in
     /// the target's group: no heading is between the two.
     ///
-    /// The item's continuation lines go with it. `remove` leaves them, as
-    /// text the tool does not own and that is kept either way; left behind
-    /// by a move they would continue whichever item ends up above them, and
-    /// the move would change what that item says. The merge of a sync keeps
-    /// them under the item as well (`merge::reconcile`).
+    /// The item's indented lines go with it: they are its own, as for
+    /// `remove`, and left behind they would continue whichever item ends up
+    /// above them. The merge of a sync keeps them under the item as well
+    /// (`merge::reconcile`).
     ///
     /// Nothing else changes, except that a line without a terminator (the
     /// file's last) gets one when a line comes after it. An item that is
@@ -921,10 +936,24 @@ mod tests {
     // ---- remove ----
 
     #[test]
-    fn remove_deletes_the_item_line_only() {
-        let mut file = chores("## Home\n- c1 one\n  more about one\n- c2 two\n\n- c3 three\n");
+    fn remove_deletes_the_item_with_its_indented_lines() {
+        let mut file = chores(
+            "## Home\n- c1 one\n  more about one\n\t- and a list\n\n- c2 two\n- c3 three\n  of three",
+        );
         assert_eq!(file.remove(&[3, 1]), Ok(()));
-        assert_eq!(written(&file), "## Home\n  more about one\n- c2 two\n\n");
+        // The heading above and the item below stay, and so does the blank
+        // line after c1's lines.
+        assert_eq!(written(&file), "## Home\n\n- c2 two\n");
+    }
+
+    #[test]
+    fn an_item_is_found_with_its_indented_lines() {
+        let file = chores("- c1 one\n  more\n    deeper\n\n  free\n- c2 two\n");
+        assert_eq!(
+            file.find_with_indented(1),
+            Ok((&b"c1 one"[..], vec![&b"  more"[..], b"    deeper"]))
+        );
+        assert_eq!(file.find_with_indented(2), Ok((&b"c2 two"[..], vec![])));
     }
 
     #[test]
@@ -1376,9 +1405,18 @@ mod tests {
         match file.remove(numbers) {
             Ok(()) => {
                 prop_assert!(numbers.iter().all(|number| count(*number) == 1));
+                // An item removed takes the indented lines below it: no
+                // indented line outlives its item or moves under another.
+                let mut gone = false;
                 let kept = old
                     .iter()
-                    .filter(|line| !id_of(kind, line).is_some_and(|id| numbers.contains(&id)))
+                    .filter(|line| {
+                        gone = match id_of(kind, line) {
+                            Some(id) => numbers.contains(&id),
+                            None => gone && is_continuation(content_of(line)),
+                        };
+                        !gone
+                    })
                     .cloned()
                     .collect::<Vec<_>>()
                     .concat();

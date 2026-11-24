@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::data::Data;
+use super::data::{Data, ListEntry};
 use super::state::{Panel, Row, Source};
 use super::view::id_style;
 
@@ -142,8 +142,36 @@ pub(crate) fn preview(data: &Data, source: Source, row: &Row) -> Preview {
         .and_then(|kind| row.id_word(kind))
         .map(|id| Line::from(Span::styled(id, id_style())))
         .unwrap_or_default();
+    let indented = source
+        .list()
+        .and_then(|kind| data.list(kind).get(row.at))
+        .map_or(&[][..], |line| match &line.entry {
+            ListEntry::Item { indented, .. } => indented.as_slice(),
+            ListEntry::Group(_) => &[],
+        });
+    let mut lines = vec![Line::raw(row.text.replace('\t', "    "))];
+    lines.extend(outdented(indented).map(|line| Line::raw(line.replace('\t', "    "))));
     Preview {
         title,
-        text: Text::raw(row.text.replace('\t', "    ")),
+        text: Text::from(lines),
     }
+}
+
+/// An item's indented lines without the indentation they have in common:
+/// it only says they belong to the item. Deeper indentation stays, so a
+/// nested list stays a list.
+fn outdented(lines: &[Vec<u8>]) -> impl Iterator<Item = String> + '_ {
+    let indent = |line: &[u8]| {
+        line.iter()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count()
+    };
+    let common = lines.split_first().map_or(0, |(first, rest)| {
+        rest.iter().fold(indent(first), |common, line| {
+            common.min(line.iter().zip(first).take_while(|(a, b)| a == b).count())
+        })
+    });
+    lines
+        .iter()
+        .map(move |line| String::from_utf8_lossy(&line[common..]).into_owned())
 }

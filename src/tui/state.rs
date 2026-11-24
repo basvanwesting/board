@@ -1415,7 +1415,7 @@ fn list_rows(kind: ListKind, data: &Data) -> Vec<Row> {
                 since: None,
                 status: None,
             },
-            ListEntry::Item { id, text } => {
+            ListEntry::Item { id, text, .. } => {
                 let text = String::from_utf8_lossy(text).into_owned();
                 Row {
                     key: Some(ItemKey {

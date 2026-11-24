@@ -45,8 +45,13 @@ pub struct ListLine {
 pub enum ListEntry {
     /// A `## group` heading, as its name.
     Group(Vec<u8>),
-    /// An item, as its line without the `- `.
-    Item { id: Option<u32>, text: Vec<u8> },
+    /// An item, as its line without the `- `, and the contents of the
+    /// indented lines below it, which are its own: the preview shows them.
+    Item {
+        id: Option<u32>,
+        text: Vec<u8>,
+        indented: Vec<Vec<u8>>,
+    },
 }
 
 impl BriefItem {
@@ -105,6 +110,7 @@ fn list_lines(list: &ListFile) -> Vec<ListLine> {
                 Entry::Item { id, text } => ListEntry::Item {
                     id,
                     text: text.to_vec(),
+                    indented: list.indented_below(index).map(<[u8]>::to_vec).collect(),
                 },
                 Entry::Text(_) => return None,
             };
@@ -182,7 +188,7 @@ mod tests {
             .iter()
             .map(|line| match &line.entry {
                 ListEntry::Group(name) => (ListRow::Group(name.clone()), None),
-                ListEntry::Item { id, text } => (ListRow::Item(text.clone()), *id),
+                ListEntry::Item { id, text, .. } => (ListRow::Item(text.clone()), *id),
             })
             .unzip();
         assert_eq!(rows, Snapshot::of(&project).chores);

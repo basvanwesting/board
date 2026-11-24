@@ -1061,7 +1061,8 @@ mod tests {
         let filed = file(&mut shop, BriefId::new(1), &counted(3), at(T)).unwrap();
         // b9 was dropped since the brief was queued: skipped.
         assert_eq!(filed.to_string(), "filed 1 (3 commits) closed b41 b52");
-        assert_eq!(shop.backlog.to_bytes(), b"  more on a\n- b60 c\n");
+        // A closed item goes with its indented lines, as on `drop`.
+        assert_eq!(shop.backlog.to_bytes(), b"- b60 c\n");
         assert_eq!(
             paths(&shop),
             [

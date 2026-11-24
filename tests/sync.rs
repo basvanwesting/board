@@ -104,6 +104,44 @@ fn done_and_drop_delete_lines_all_or_nothing() {
     in_step(&world, &a);
 }
 
+/// An item's indented lines are its own: dropped on one clone while the
+/// other edits them, they are gone from both, and the item above keeps
+/// only its own.
+#[test]
+fn an_item_dropped_on_one_clone_goes_with_the_indented_lines_the_other_edited() {
+    let world = World::new();
+    let (a, b) = (world.a(), world.b());
+    a.board(&["add", "backlog", "first"]).ok();
+    a.board(&["add", "backlog", "second"]).ok();
+    a.write(
+        "proj/backlog.md",
+        "- b1 first\n  about first\n- b2 second\n  why: slow\n  - and a list\n",
+    );
+    a.board(&["sync"]).ok();
+    b.board(&["sync"]).ok();
+    // B edits b2's lines by hand; A drops b2 and pushes first.
+    b.write(
+        "proj/backlog.md",
+        "- b1 first\n  about first\n- b2 second\n  why: very slow\n  - and a list\n  - more\n",
+    );
+    assert_eq!(a.board(&["drop", "b2"]).ok(), "dropped b2\n");
+    let ran = b.board(&["sync"]);
+    assert_eq!(
+        (ran.code, ran.stderr.as_str()),
+        (
+            0,
+            "board: merged 1 local commit (by line: proj/backlog.md)\n"
+        )
+    );
+    a.board(&["sync"]).ok();
+    let want = "- b1 first\n  about first\n";
+    assert_eq!(text(world.remote_file("proj/backlog.md")), want);
+    assert_eq!(text(a.file("proj/backlog.md")), want);
+    assert_eq!(text(b.file("proj/backlog.md")), want);
+    in_step(&world, &a);
+    in_step(&world, &b);
+}
+
 #[test]
 fn move_puts_an_item_next_to_another_in_one_commit() {
     let world = World::new();

@@ -209,6 +209,23 @@ fn show_prints_an_item_as_its_line_without_the_dash() {
     assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n");
 }
 
+/// The indented lines below an item are its own: shown with it, as the file
+/// has them, up to the first line that is not one.
+#[test]
+fn show_prints_an_item_with_its_indented_lines() {
+    let world = World::new();
+    let a = world.a();
+    a.write(
+        "proj/backlog.md",
+        "- b1 Dark mode\n  why: the night shift\n\t- and a list\n\n  not b1's\n- b2 Other\n",
+    );
+    assert_eq!(
+        a.board(&["show", "b1"]).ok(),
+        "b1 Dark mode\n  why: the night shift\n\t- and a list\n"
+    );
+    assert_eq!(a.board(&["show", "b2"]).ok(), "b2 Other\n");
+}
+
 #[test]
 fn show_refuses_an_id_that_is_not_there() {
     let world = World::new();

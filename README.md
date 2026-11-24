@@ -20,7 +20,7 @@ Three lists, one board per project:
 - **Chores** (`c12`): an action of the user's that a brief leaves behind (a deploy, an edit on production, something to judge by eye). One line, under a group heading, with a check that tells it is done: a chore expires unannounced, and the check is how to see it did. It ends deleted, by the user or the planner.
 - **Backlog** (`b41`): an unrefined item for later, one line. Line order is the user's priority. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
 
-The ID is the first word after a list line's dash (`- b41 …`), so it copies and greps cleanly. Git history is the archive of everything deleted.
+The ID is the first word after a list line's dash (`- b41 …`), so it copies and greps cleanly. An item that needs more than its line gets indented lines directly below it, written in an editor: they are part of the item, shown with it by `board show <id>` and the TUI's preview, and deleted with it. Git history is the archive of everything deleted.
 
 ## The life of a brief
 

@@ -853,6 +853,37 @@ mod tests {
         assert_eq!(filed[(x, y)].fg, Color::Reset);
     }
 
+    /// A list item's preview: its line, then its indented lines without the
+    /// indentation they share; a deeper one keeps the rest of its own.
+    #[test]
+    fn an_item_s_preview_has_its_indented_lines() {
+        let mut project = crate::project::Project::empty(ProjectName::parse("shop").unwrap());
+        project.backlog = crate::list::ListFile::parse(
+            ListKind::Backlog,
+            b"- b41 Cache the prices\n    why: slow\n    - a list\n      - nested\n\n  free\n- b42 plain\n",
+        );
+        let data = Data {
+            backlog: Data::of(&project).backlog,
+            ..data()
+        };
+        let (state, _) = State::new(data, 100, 12, Stamp::from_unix(NOW).unwrap());
+        let text = |state: &State| -> Vec<String> {
+            let preview = state.preview_content().unwrap();
+            preview.text.lines.iter().map(ToString::to_string).collect()
+        };
+        let state = press(state, "3");
+        assert_eq!(
+            text(&state),
+            [
+                "b41 Cache the prices",
+                "why: slow",
+                "- a list",
+                "  - nested"
+            ]
+        );
+        assert_eq!(text(&press(state, "j")), ["b42 plain"]);
+    }
+
     #[test]
     fn ages_read_in_their_largest_unit() {
         assert_eq!(age(0), "<1m");

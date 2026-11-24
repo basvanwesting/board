@@ -16,8 +16,8 @@
 //!   detection, whose modify/delete and rename cases would have to be
 //!   untangled again here.
 //! - A list file is merged by line, and its lines by id: a delete beats an
-//!   edit and a move, and an item's indented lines stay under it, counted as
-//!   text: a delete of the item does not undo an edit of them. Rejected:
+//!   edit and a move. An item's indented lines are its own: they stay under
+//!   it, and go with it, also when the other side edited them. Rejected:
 //!   `merge=union`, which brings a deleted line back when the other side
 //!   edited or moved it.
 
@@ -281,28 +281,29 @@ impl<'a> Version<'a> {
 /// An id is ambiguous when a version has it on two lines, or when both sides
 /// added it with different text: only a hand-typed id gets there, and which
 /// line it was meant for is a guess, so all its lines are kept as text and
-/// lint reports them. Text (headings, free text, indented lines, items
-/// without an id) is counted three-way: as often as the remote's and the
-/// clone's have it, less the base's, so a line deleted on one side goes and
-/// a line added on both is kept twice. Blank lines are kept as the union has
-/// them.
+/// lint reports them. Other text (headings, free text, indented lines below
+/// no item with an id, items without an id) is counted three-way: as often
+/// as the remote's and the clone's have it, less the base's, so a line
+/// deleted on one side goes and a line added on both is kept twice. An
+/// item without an id owns no lines here: one typed by hand, which the next
+/// write gives an id, so this is rare and brief. Blank
+/// lines are kept as the union has them, plus the one put in below.
 ///
-/// An item's indented lines are text by that count, but they are put where
-/// the item is: the union puts lines where its hunks fall, so an item moved
-/// on one side and edited on the other comes out of it in two places, its
-/// indented lines under the wrong one. So of an expected item, its indented
-/// lines on the side that changed them (as for its line) go directly below
-/// it, as far as the count allows, and have the first claim on that count;
-/// the union's other text takes what is left, where the union has it.
-/// Whether an indented line stays is the count's, never the item's: `board
-/// done` and `drop` delete only the item line, and the indented lines left
-/// then read as the item above's, on one side and not the other, so a rule
-/// by item would lose an edit of them made on the other side. The cost: an
-/// item deleted with its indented lines on one side keeps the ones the other
-/// side edited, as text below the item above. Rejected: merging indented
-/// lines line by line within the item, which needs an order of their own
-/// for what is mostly one line. Indented lines as they stood with a line of
-/// the union are put in with its bytes, as that line is.
+/// An item's indented lines are its own ([`indented_below`]), as `board
+/// done`, `drop` and `move` treat them, so they go by the item, not by the
+/// count: of an expected item, the ones of the side that changed them (as
+/// for its line) go directly below it; of an item not expected, none, also
+/// when the other side edited them (the delete wins, as for its line). They
+/// are not counted as text on any side. They cannot be left where the union
+/// has them: the union puts lines where its hunks fall, so an item moved on
+/// one side and edited on the other comes out of it in two places, its
+/// indented lines under the wrong one; so the union's indented lines below
+/// an item's line go with that line, never as text. An indented line of no
+/// item that the union puts after an item gets a blank line before it, so
+/// it does not become that item's. Rejected: merging indented lines line
+/// by line within the item, which needs an order of their own for what is
+/// mostly one line. Indented lines as they stood with a line of the union
+/// are put in with its bytes, as that line is.
 ///
 /// For any `union` the ids come out right; only the order of lines and blank
 /// lines depend on it.
@@ -358,26 +359,30 @@ pub fn reconcile(kind: ListKind, base: &[u8], ours: &[u8], theirs: &[u8], union:
         wanted.insert(*n, (line, below));
     }
 
+    // The text count leaves out each side's indented lines of an item:
+    // they go by the item.
     let mut budget = Budget::default();
-    let count = |version: &Version<'_>, text: &[u8]| {
-        version
+    let count = |v: usize, text: &[u8]| {
+        let all = versions[v]
             .lines
             .iter()
             .filter(|line| line_key(kind, &ambiguous, line) == LineKey::Text(text))
-            .count()
+            .count();
+        let owned = under[v]
+            .values()
+            .flatten()
+            .filter(|line| raw::content(line) == text)
+            .count();
+        all - owned
     };
     for version in &versions[1..] {
         for line in &version.lines {
             if let LineKey::Text(text) = line_key(kind, &ambiguous, line) {
                 budget.allowed.entry(text).or_insert_with(|| {
-                    (count(&versions[1], text) + count(&versions[2], text))
-                        .saturating_sub(count(&versions[0], text))
+                    (count(1, text) + count(2, text)).saturating_sub(count(0, text))
                 });
             }
         }
-    }
-    for line in wanted.values().flat_map(|(_, below)| *below) {
-        *budget.reserved.entry(raw::content(line)).or_default() += 1;
     }
 
     let union: Vec<&[u8]> = raw::lines(union).collect();
@@ -392,40 +397,53 @@ pub fn reconcile(kind: ListKind, base: &[u8], ours: &[u8], theirs: &[u8], union:
         }
     };
     let mut emitted: BTreeSet<u32> = BTreeSet::new();
+    // Whether what was put in last is an item with an id or its indented
+    // lines: an indented line put in now would continue that item.
+    let mut in_item = false;
     let mut at = 0;
     while let Some(line) = union.get(at).copied() {
         at += 1;
         match key(line) {
-            LineKey::Blank => push(&[line]),
+            LineKey::Blank => {
+                push(&[line]);
+                in_item = false;
+            }
             LineKey::Id(n) => {
+                // The union's indented lines here are this copy of the
+                // item's: they go with it, never as text, or a line of a
+                // side that changed them would come in a second time, or
+                // under the item put in before.
+                let run = union[at..]
+                    .iter()
+                    .take_while(|line| is_continuation(raw::content(line)))
+                    .count();
+                let here = &union[at..at + run];
+                at += run;
                 if let Some((want, under)) = wanted.get(&n)
                     && !emitted.contains(&n)
                     && raw::content(line) == raw::content(want)
                 {
                     emitted.insert(n);
                     push(&[line]);
-                    // The union's indented lines here when they are the
-                    // ones wanted; else they are candidates as text.
-                    let run = union[at..]
-                        .iter()
-                        .take_while(|line| is_continuation(raw::content(line)))
-                        .count();
-                    let under = if same_contents(&union[at..at + run], under) {
-                        at += run;
-                        &union[at - run..at]
+                    // As they stood with the union's line, with its bytes.
+                    push(if same_contents(here, under) {
+                        here
                     } else {
                         under
-                    };
-                    for line in under {
-                        if budget.below(raw::content(line)) {
-                            push(&[line]);
-                        }
-                    }
+                    });
+                    in_item = true;
                 }
             }
             LineKey::Text(text) => {
                 if budget.loose(text) {
+                    // An indented line below no item stays below none: a
+                    // blank line keeps it off the item the union put it
+                    // after.
+                    if is_continuation(text) && in_item {
+                        push(&[terminator]);
+                    }
                     push(&[line]);
+                    in_item = false;
                 }
             }
         }
@@ -433,45 +451,25 @@ pub fn reconcile(kind: ListKind, base: &[u8], ours: &[u8], theirs: &[u8], union:
     for (n, (line, under)) in &wanted {
         if !emitted.contains(n) {
             push(&[line]);
-            for line in *under {
-                if budget.below(raw::content(line)) {
-                    push(&[line]);
-                }
-            }
+            push(under);
         }
     }
     out
 }
 
-/// How often [`reconcile`] may still put in each text: its three-way count,
-/// of which the lines wanted below an item have first claim.
+/// How often [`reconcile`] may still put in each text: its three-way count.
 #[derive(Default)]
 struct Budget<'a> {
     allowed: BTreeMap<&'a [u8], usize>,
-    /// Lines wanted below an item, not yet come to.
-    reserved: BTreeMap<&'a [u8], usize>,
     emitted: BTreeMap<&'a [u8], usize>,
 }
 
 impl<'a> Budget<'a> {
-    /// Whether a line wanted below an item goes in.
-    fn below(&mut self, text: &'a [u8]) -> bool {
-        if let Some(reserved) = self.reserved.get_mut(text) {
-            *reserved = reserved.saturating_sub(1);
-        }
-        self.take(text, 0)
-    }
-
-    /// Whether a line of the union outside the items goes in.
+    /// Whether a text line of the union goes in.
     fn loose(&mut self, text: &'a [u8]) -> bool {
-        let reserved = self.reserved.get(text).copied().unwrap_or(0);
-        self.take(text, reserved)
-    }
-
-    fn take(&mut self, text: &'a [u8], keep: usize) -> bool {
         let allowed = self.allowed.get(text).copied().unwrap_or(0);
         let emitted = self.emitted.entry(text).or_insert(0);
-        let fits = *emitted + keep < allowed;
+        let fits = *emitted < allowed;
         *emitted += usize::from(fits);
         fits
     }
@@ -897,13 +895,14 @@ mod tests {
 
     /// The rules of `reconcile`, said again the plain way, against any
     /// union: every id that names one line everywhere is there once when
-    /// expected, with the line wanted, and gone otherwise. Every other
-    /// non-blank line, indented or not, is text with a three-way count.
-    /// Directly below each expected item, in the result's order, come the
-    /// indented lines wanted below it that the count still allows. A text is
-    /// there at most as often as its count, and as the union and the lines
-    /// wanted below items have it together; at least as often as its count
-    /// and either of the two allows.
+    /// expected, with the line wanted, and gone otherwise. Directly below
+    /// each expected item come the indented lines wanted below it, all of
+    /// them and no other. Every other non-blank line is text with a
+    /// three-way count, an item's indented lines left out of it on every
+    /// side: so those of an item not expected are gone. Outside the lines
+    /// wanted below items, a text is there at most as often as its count and
+    /// the union allow, and at least as often as its count and the union's
+    /// lines of it below no item allow.
     fn check_reconcile(
         base: &str,
         ours: &str,
@@ -929,9 +928,16 @@ mod tests {
         };
         let lines = contents(&result);
         let count = |bytes: &str, text: &str| contents(bytes).iter().filter(|l| *l == text).count();
-        let allowed = |text: &str| {
-            (count(ours, text) + count(theirs, text)).saturating_sub(count(base, text))
+        // Lines below no item with an id.
+        let free = |bytes: &str, text: &str| {
+            contents(bytes)
+                .into_iter()
+                .zip(owners(bytes, ambiguous))
+                .filter(|(line, owner)| line == text && owner.is_none())
+                .count()
         };
+        let allowed =
+            |text: &str| (free(ours, text) + free(theirs, text)).saturating_sub(free(base, text));
         // Per expected id, where the result has it and the indented lines
         // wanted below it.
         let mut placed: Vec<(usize, Vec<String>)> = Vec::new();
@@ -979,20 +985,22 @@ mod tests {
         for line in placed.iter().flat_map(|(_, want)| want) {
             *below_items.entry(line).or_default() += 1;
         }
-        let mut put: BTreeMap<&str, usize> = BTreeMap::new();
         for (at, want) in &placed {
-            let fits: Vec<&String> = want
-                .iter()
-                .filter(|line| {
-                    let put = put.entry(line).or_default();
-                    let fits = *put < allowed(line);
-                    *put += usize::from(fits);
-                    fits
-                })
-                .collect();
-            let end = (at + 1 + fits.len()).min(lines.len());
-            let got: Vec<&String> = lines[at + 1..end].iter().collect();
-            prop_assert_eq!(got, fits, "below {:?}: {:?}", &lines[*at], result);
+            let end = (at + 1 + want.len()).min(lines.len());
+            prop_assert_eq!(
+                &lines[at + 1..end],
+                &want[..],
+                "below {:?}: {:?}",
+                &lines[*at],
+                result
+            );
+            let indented = |line: &String| line.starts_with([' ', '\t']) && !line.trim().is_empty();
+            prop_assert!(
+                !lines.get(end).is_some_and(indented),
+                "a line more below {:?}: {:?}",
+                &lines[*at],
+                result
+            );
         }
         let is_text = |line: &String| {
             !line.trim().is_empty()
@@ -1009,10 +1017,10 @@ mod tests {
         for text in texts.iter().filter(|l| is_text(l)) {
             let (allowed, in_union) = (allowed(text), count(union, text));
             let below = below_items.get(text.as_str()).copied().unwrap_or(0);
-            let got = count(&result, text);
+            let got = count(&result, text) - below;
             prop_assert!(
-                allowed.min(in_union.max(below)) <= got && got <= allowed.min(in_union + below),
-                "{:?} {} times, {} allowed, {} in the union, {} wanted below items: {:?}",
+                allowed.min(free(union, text)) <= got && got <= allowed.min(in_union),
+                "{:?} {} times outside items, {} allowed, {} in the union, {} wanted below items: {:?}",
                 text,
                 got,
                 allowed,
@@ -1113,14 +1121,14 @@ mod tests {
     /// base, the odd ones with an indented line below, new ids from 20 (the
     /// remote) and 40 (the clone), so that only the edits decide what is
     /// expected. An item is its line and the indented lines below it, and
-    /// every edit but `Close` takes them as one, as `board move` and an
-    /// editor do.
+    /// every edit takes them as one, as `board done`, `drop` and `move` and
+    /// an editor do.
     #[derive(Debug, Clone)]
     enum Edit {
         Delete(prop::sample::Index),
-        /// Only the item's line deleted, as `board done` and `board drop`
-        /// do: its indented lines then continue the item above, or open the
-        /// file.
+        /// Only the item's line deleted, by hand in an editor: its indented
+        /// lines then continue the item above, or open the file. So a line
+        /// is one item's on one side and another's, or none's, on the other.
         Close(prop::sample::Index),
         Change(prop::sample::Index),
         /// The item's first indented line changed, or one added.
@@ -1272,24 +1280,25 @@ mod tests {
         }
     }
 
-    /// `board done` leaves the item's indented line, which then continues
-    /// the item above (or opens the group); the other side edited it. The
-    /// edit stays, and the old text goes, either way round.
+    /// `board done` deletes the item with its indented lines; the other
+    /// side edited them meanwhile. The delete wins, as it does against an
+    /// edit of the item's line: neither the edit nor the old text stays, and
+    /// nothing is left under the item above, either way round.
     #[test]
-    fn an_edited_indented_line_survives_its_item_closed_on_the_other_side() {
+    fn an_item_closed_on_one_side_goes_with_the_indented_lines_edited_on_the_other() {
         let dir = tempfile::tempdir().unwrap();
         for (base, closed, edited, want) in [
             (
                 "- c2 b\n- c1 a\n  about a\n- c3 c\n",
-                "- c2 b\n  about a\n- c3 c\n",
-                "- c2 b\n- c1 a\n  about A\n- c3 c\n",
-                "- c2 b\n  about A\n- c3 c\n",
+                "- c2 b\n- c3 c\n",
+                "- c2 b\n- c1 a\n  about A\n  and more\n- c3 c\n",
+                "- c2 b\n- c3 c\n",
             ),
             (
-                "## Home\n- c1 a\n  about a\n- c3 c\n",
-                "## Home\n  about a\n- c3 c\n",
-                "## Home\n- c1 a\n  about A\n- c3 c\n",
-                "## Home\n  about A\n- c3 c\n",
+                "## Home\n- c1 a\n  about a\n\n- c3 c\n",
+                "## Home\n\n- c3 c\n",
+                "## Home\n- c1 a\n  about A\n\n- c3 c\n",
+                "## Home\n\n- c3 c\n",
             ),
         ] {
             for (ours, theirs) in [(closed, edited), (edited, closed)] {
@@ -1298,6 +1307,38 @@ mod tests {
                 assert_eq!(reconciled(base, ours, theirs, &union), want, "{union:?}");
             }
         }
+    }
+
+    /// An indented line below no item (after a blank line) stays below none
+    /// when the union puts it after an item whose own lines changed: it
+    /// does not become the item's, to be shown and deleted with it.
+    #[test]
+    fn a_free_indented_line_does_not_slide_under_an_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "- c2 b\n- c1 a\n  x\n- c3 c\n\n  x\n";
+        let edited = "- c2 b\n- c1 a\n  y\n- c3 c\n\n  x\n";
+        let moved = "- c1 a\n  x\n- c2 b\n- c3 c\n\n  x\n";
+        for (ours, theirs) in [(edited, moved), (moved, edited)] {
+            let union = git_union(dir.path(), base, ours, theirs);
+            check_reconcile(base, ours, theirs, &union).unwrap();
+            let result = reconciled(base, ours, theirs, &union);
+            assert_eq!(
+                below_line(&result, "- c1 a"),
+                Some(vec!["  y".to_owned()]),
+                "{result:?}"
+            );
+            assert_eq!(result.matches("  x").count(), 1, "{result:?}");
+        }
+        // The union as the base, with the other side's edit of c1's line.
+        let base = "- c1 a\n  x\n\n  x\n";
+        let result = reconciled(base, "- c1 a\n  y\n\n  x\n", base, base);
+        assert_eq!(result, "- c1 a\n  y\n\n  x\n");
+        // A union that has the free line after a line the count drops, and
+        // so after the item: a blank line keeps it off the item.
+        let (base, ours) = ("- c1 a\n", "- c1 a\n\n  x\n");
+        let union = "- c1 a\nnote\n  x\n";
+        check_reconcile(base, ours, base, union).unwrap();
+        assert_eq!(reconciled(base, ours, base, union), "- c1 a\n\n  x\n");
     }
 
     /// The indented lines below the first line of `bytes` that is `line`.

@@ -81,7 +81,8 @@ impl Board {
     }
 
     /// What `show` prints: a brief's file as it is, open or filed, or an
-    /// item's line without the `- `.
+    /// item's line without the `- ` and the indented lines below it, which
+    /// are its own, as they are in the file.
     pub fn show(&self, id: ItemId) -> Result<Vec<u8>, Error> {
         let project = self.load()?;
         let refused = |why: String| Error::Refused(format!("show {id}: {why}"));
@@ -353,8 +354,15 @@ fn entry(text: &Text, what: &str) -> Result<EntryText, Error> {
 /// The line of the one item with this id, else why the id names no single
 /// item.
 fn item(list: &ListFile, number: u32) -> Result<Vec<u8>, String> {
-    list.find(number)
-        .map(|text| [text, b"\n"].concat())
+    list.find_with_indented(number)
+        .map(|(text, indented)| {
+            let mut shown = [text, b"\n"].concat();
+            for line in indented {
+                shown.extend_from_slice(line);
+                shown.push(b'\n');
+            }
+            shown
+        })
         .map_err(|why| ops::not_one(list.kind(), number, why))
 }
 

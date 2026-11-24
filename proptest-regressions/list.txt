@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f5c1344a28cd97c1b60acee74304203824636389d49b5dc6976f6a1393a0145f # shrinks to kind = Backlog, bytes = [45, 32, 98, 49, 32, 97, 10, 32, 32, 97], picks = [(Index(0), 1)]
