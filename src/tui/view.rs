@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 use super::layout::{self, inner_height};
 use super::state::{Panel, Row, Source, State, Tab};
+use crate::board::Shown;
 use crate::brief::Status;
 
 const HELP: [(&str, &str); 19] = [
@@ -79,14 +80,16 @@ pub(super) fn id_style() -> Style {
 }
 
 /// A brief's status, by what it asks of the user: blocked is the worker
-/// idle on a question, reported waits to be filed.
-fn status_style(status: Status) -> Style {
-    match status {
-        Status::Blocked => Style::new().fg(Color::Red),
-        Status::Started => Style::new().fg(Color::Green),
-        Status::Reported => Style::new().fg(Color::Yellow),
-        Status::Draft => Style::new().add_modifier(Modifier::DIM),
-        Status::Queued | Status::Filed => Style::new(),
+/// idle on a question, unpushed waits for the owner's push, the one row
+/// that asks something of him. Reported asks nothing of him: it waits for
+/// the planner's read, which files it (SPEC.md, TUI).
+fn status_style(shown: Shown) -> Style {
+    match shown {
+        Shown::Status(Status::Blocked) => Style::new().fg(Color::Red),
+        Shown::Status(Status::Started) => Style::new().fg(Color::Green),
+        Shown::Unpushed => Style::new().fg(Color::Yellow),
+        Shown::Status(Status::Draft) => Style::new().add_modifier(Modifier::DIM),
+        Shown::Status(Status::Reported | Status::Queued | Status::Filed) => Style::new(),
     }
 }
 
@@ -277,7 +280,10 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
     ];
     if let Some(counts) = sync.counts {
         if counts.unpushed > 0 {
-            left.extend([dot(), Span::raw(format!("{} unpushed", counts.unpushed))]);
+            // `unsynced`, not `unpushed`: that word is the label of a brief
+            // whose project commits wait for the owner's push; this is the
+            // board-data clone, which `r` syncs.
+            left.extend([dot(), Span::raw(format!("{} unsynced", counts.unpushed))]);
         }
         if counts.behind > 0 {
             left.extend([dot(), Span::raw(format!("{} behind", counts.behind))]);
@@ -394,6 +400,8 @@ fn draw_help(frame: &mut Frame, body: Rect) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -422,6 +430,7 @@ mod tests {
                 number: BriefId::new(number),
                 status: Some(status),
                 slug: slug.to_owned(),
+                unpushed: false,
             },
             started.map(|at| Stamp::from_unix(at).unwrap()),
             format!("id: {number}\nstatus: {status}\n\n{body}").into_bytes(),
@@ -517,7 +526,7 @@ mod tests {
                 "╭─[3]─Backlog───────────────────────────────╮│                                                     │",
                 "│▶b41 Cache the prices  (from 126)          ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
-                " shop · fetched 1m ago · 2 unpushed · 128 started 42m              e edit  y yank  / filter  ? help",
+                " shop · fetched 1m ago · 2 unsynced · 128 started 42m              e edit  y yank  / filter  ? help",
             ]
         );
     }
@@ -818,6 +827,58 @@ mod tests {
         );
     }
 
+    /// The set of briefs with unpushed commits puts a filed one in the
+    /// Briefs tab, after reported and before queued, and back in Filed
+    /// once pushed; the cursor stays on its item while rows move.
+    #[test]
+    fn an_unpushed_brief_is_in_the_briefs_tab_until_pushed() {
+        let mut briefs = data();
+        briefs
+            .open
+            .push(brief(131, Status::Queued, "next-up", None, "# Next\n"));
+        let (state, _) = state(100, 16).step(Event::Loaded(Box::new(briefs)));
+        let state = press(state, "jj");
+        let rows = |state: &State| -> Vec<String> {
+            screen(state)[1..5]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .skip(1)
+                        .take(30)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let (pushing, _) = state.step(Event::Unpushed(Ok([BriefId::new(100)].into())));
+        assert_eq!(
+            rows(&pushing),
+            [
+                " 128 started   some-slug",
+                " 127 reported  other-slug",
+                " 100 unpushed  old",
+                "▶131 queued    next-up",
+            ]
+        );
+        let filed = screen(&press(pushing.clone(), "]"));
+        assert!(
+            !filed.iter().any(|line| line.contains("100 ")),
+            "{filed:#?}"
+        );
+        let (pushed, _) = pushing.step(Event::Unpushed(Ok(BTreeSet::new())));
+        assert_eq!(
+            rows(&pushed)[..3],
+            [
+                " 128 started   some-slug",
+                " 127 reported  other-slug",
+                "▶131 queued    next-up"
+            ]
+        );
+        let filed = screen(&press(pushed, "]"));
+        assert!(filed[1].contains("100 filed     old"), "{filed:#?}");
+    }
+
     #[test]
     fn a_status_is_coloured_by_what_it_asks_of_the_user() {
         let mut briefs = data();
@@ -831,7 +892,9 @@ mod tests {
         briefs
             .open
             .push(brief(130, Status::Draft, "idea", None, "# Idea\n"));
-        let (state, _) = state(100, 14).step(Event::Loaded(Box::new(briefs)));
+        let (state, _) = state(100, 16).step(Event::Loaded(Box::new(briefs)));
+        // Brief 100 is filed, with a commit still to push.
+        let (state, _) = state.step(Event::Unpushed(Ok([BriefId::new(100)].into())));
         let buffer = cells(&state);
         let fg = |text: &str| {
             let (x, y) = find(&buffer, text);
@@ -839,7 +902,9 @@ mod tests {
         };
         assert_eq!(fg("blocked "), Color::Red);
         assert_eq!(fg("started "), Color::Green);
-        assert_eq!(fg("reported "), Color::Yellow);
+        // Reported waits for the planner, not the owner; the push is his.
+        assert_eq!(fg("reported "), Color::Reset);
+        assert_eq!(fg("unpushed "), Color::Yellow);
         let (x, y) = find(&buffer, "draft ");
         assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
         // The age is dim, the slug plain.
@@ -847,7 +912,8 @@ mod tests {
         assert!(buffer[(x, y)].modifier.contains(Modifier::DIM));
         // On the panel row: the preview's title has the slug too, above it.
         assert_eq!(fg("some-slug "), Color::Reset);
-        // A filed brief's status stays plain.
+        // A filed brief's status stays plain; once pushed, 100 is one.
+        let (state, _) = state.step(Event::Unpushed(Ok(BTreeSet::new())));
         let filed = cells(&press(state, "]"));
         let (x, y) = find(&filed, "filed ");
         assert_eq!(filed[(x, y)].fg, Color::Reset);

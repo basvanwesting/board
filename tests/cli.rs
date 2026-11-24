@@ -156,7 +156,7 @@ fn a_status_goes_with_briefs_only() {
     }
     let unknown = a.board(&["ls", "--status", "done"]).failed(2);
     assert!(
-        unknown.starts_with("board: invalid value 'done' for '--status <STATUS>': `done` is not a status (draft, queued, started, blocked, reported, filed)"),
+        unknown.starts_with("board: invalid value 'done' for '--status <STATUS>': `done` is not a status (draft, queued, started, blocked, reported, filed, unpushed)"),
         "{unknown}"
     );
     let no_kind = a.board(&["ls", "ideas"]).failed(2);
@@ -863,4 +863,159 @@ fn help_goes_to_stdout_and_names_the_commands() {
     for command in ["ls", "show", "lint", "--board"] {
         assert!(help.contains(command), "{command} is not in:\n{help}");
     }
+}
+
+// ---- the `unpushed` label ----
+
+/// The project repository with a bare upstream it has pushed to, and a
+/// commit per message on top, not pushed.
+fn upstream(machine: &Machine, world: &World, messages: &[&str]) {
+    let bare = world.dir().join("proj-upstream.git");
+    machine.git(
+        world.dir(),
+        ["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+    );
+    machine.git(
+        &machine.proj(),
+        ["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    machine.git(&machine.proj(), ["push", "-q", "-u", "origin", "main"]);
+    for message in messages {
+        commit(machine, message);
+    }
+}
+
+fn commit(machine: &Machine, message: &str) {
+    machine.git(
+        &machine.proj(),
+        ["commit", "-q", "--allow-empty", "-m", message],
+    );
+}
+
+fn push(machine: &Machine) {
+    machine.git(&machine.proj(), ["push", "-q"]);
+}
+
+/// Filed briefs 1, 12 and 120, reported 3, queued 4.
+fn briefs(machine: &Machine) {
+    for (file, status) in [
+        ("briefs/done/1-one.md", "filed"),
+        ("briefs/done/12-twelve.md", "filed"),
+        ("briefs/done/120-more.md", "filed"),
+        ("briefs/3-read-me.md", "reported"),
+        ("briefs/4-next.md", "queued"),
+    ] {
+        machine.write(&format!("proj/{file}"), format!("status: {status}\n"));
+    }
+}
+
+/// A filed brief with a commit above the project's upstream is listed
+/// with the open ones as `unpushed`, after reported and before queued,
+/// until the commit is pushed; the trailer names its brief by the whole
+/// number.
+#[test]
+fn a_filed_brief_with_unpushed_commits_is_listed_as_unpushed() {
+    let world = World::new();
+    let a = world.a();
+    briefs(&a);
+    upstream(&a, &world, &["one\n\nBrief: 1", "twelve\n\nBrief: 12"]);
+    push(&a);
+    // Brief 1: one commit pushed, one not.
+    commit(&a, "one more\n\nBrief: 1  ");
+    let ls = |args: &[&str]| a.board(&[&["ls", "briefs"], args].concat()).ok();
+    assert_eq!(
+        ls(&[]),
+        "3 reported read-me\n1 unpushed one\n4 queued next\n"
+    );
+    assert_eq!(ls(&["--status", "unpushed"]), "1 unpushed one\n");
+    assert_eq!(
+        ls(&["--status", "filed"]),
+        "12 filed twelve\n120 filed more\n"
+    );
+    assert!(
+        a.board(&["ls"])
+            .ok()
+            .starts_with("# briefs\n3 reported read-me\n1 unpushed one\n")
+    );
+    // Amended: a new hash, the same trailer.
+    a.git(
+        &a.proj(),
+        [
+            "commit",
+            "-q",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            "amended\n\nBrief: 1",
+        ],
+    );
+    assert_eq!(ls(&["--status", "unpushed"]), "1 unpushed one\n");
+    push(&a);
+    assert_eq!(ls(&[]), "3 reported read-me\n4 queued next\n");
+    assert_eq!(ls(&["--status", "unpushed"]), "");
+    assert_eq!(
+        ls(&["--status", "filed"]),
+        "1 filed one\n12 filed twelve\n120 filed more\n"
+    );
+    // A log encoding with NUL bytes in it does not split the messages.
+    a.git(&a.proj(), ["config", "i18n.logOutputEncoding", "UTF-16"]);
+    commit(&a, "again\n\nBrief: 12");
+    assert_eq!(ls(&["--status", "unpushed"]), "12 unpushed twelve\n");
+}
+
+/// Where the checkout says nothing about the project's pushes, nothing is
+/// labelled and nothing is refused: no upstream, a detached `HEAD`, or a
+/// checkout of another project with `--board`.
+#[test]
+fn without_an_upstream_of_the_project_nothing_is_labelled() {
+    let world = World::new();
+    let a = world.a();
+    briefs(&a);
+    upstream(&a, &world, &["one\n\nBrief: 1"]);
+    let open = "3 reported read-me\n4 queued next\n";
+    let labelled = "3 reported read-me\n1 unpushed one\n4 queued next\n";
+    assert_eq!(a.board(&["ls", "briefs"]).ok(), labelled);
+    // The same project named: labelled; another checkout naming it: not.
+    assert_eq!(a.board(&["ls", "briefs", "--board", "proj"]).ok(), labelled);
+    // Another project's checkout, with a commit of its own for its own
+    // brief 1, not pushed: it says nothing about this board's brief 1.
+    let other = a.repository("Work/other");
+    let bare = world.dir().join("other-upstream.git");
+    a.git(
+        world.dir(),
+        ["init", "-q", "--bare", "-b", "main", bare.to_str().unwrap()],
+    );
+    a.git(&other, ["commit", "-q", "--allow-empty", "-m", "start"]);
+    a.git(&other, ["remote", "add", "origin", bare.to_str().unwrap()]);
+    a.git(&other, ["push", "-q", "-u", "origin", "main"]);
+    a.git(
+        &other,
+        ["commit", "-q", "--allow-empty", "-m", "theirs\n\nBrief: 1"],
+    );
+    // Its own board would label its brief 1: the rule is the checkout's.
+    a.write("other/briefs/done/1-theirs.md", "status: filed\n");
+    assert_eq!(
+        a.board_in(&other, &["ls", "briefs"]).ok(),
+        "1 unpushed theirs\n"
+    );
+    let ran = a.board_in(&other, &["ls", "briefs", "--board", "proj"]);
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, open.as_bytes()));
+    a.git(&a.proj(), ["checkout", "-q", "--detach"]);
+    assert_eq!(a.board(&["ls", "briefs"]).ok(), open);
+    a.git(&a.proj(), ["checkout", "-q", "main"]);
+    a.git(&a.proj(), ["branch", "-q", "--unset-upstream"]);
+    assert_eq!(a.board(&["ls", "briefs"]).ok(), open);
+    // A branch with no commit yet whose upstream was fetched: `@{upstream}`
+    // names a commit, `HEAD` none.
+    let fresh = a.repository("Work/fresh");
+    let upstream = world.dir().join("proj-upstream.git");
+    a.git(
+        &fresh,
+        ["remote", "add", "origin", upstream.to_str().unwrap()],
+    );
+    a.git(&fresh, ["fetch", "-q", "origin"]);
+    a.git(&fresh, ["config", "branch.main.remote", "origin"]);
+    a.git(&fresh, ["config", "branch.main.merge", "refs/heads/main"]);
+    a.write("fresh/briefs/done/1-one.md", "status: filed\n");
+    assert_eq!(a.board_in(&fresh, &["ls", "briefs"]).ok(), "");
 }

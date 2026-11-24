@@ -15,7 +15,7 @@ mod raw;
 mod sync;
 pub mod tui;
 
-pub use board::{Board, BriefRow, CommitCheck, Fetcher, ListRow, Snapshot};
+pub use board::{Board, BriefRow, CommitCheck, Fetcher, ListRow, Shown, Snapshot, UnknownShown};
 pub use brief::{
     BadStatus, Brief, EmptyText, EntryText, NotABacklogId, Section, SplitsSection, Stamp, Status,
     Text, Transition, TransitionError,

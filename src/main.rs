@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use board::{
     BacklogId, Board, Body, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit,
-    ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Side, Slug, Snapshot, Status, Text,
+    ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Shown, Side, Slug, Snapshot, Text,
 };
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
@@ -27,9 +27,10 @@ enum Command {
     /// List the open briefs, the chores and the backlog, or one of the three
     Ls {
         kind: Option<Kind>,
-        /// The briefs with this status; `filed` lists the filed ones
+        /// The briefs shown with this word: a status, or `unpushed` (filed,
+        /// with commits not yet pushed); `filed` lists the other filed ones
         #[arg(long, value_name = "STATUS")]
-        status: Option<Status>,
+        status: Option<Shown>,
     },
     /// Print a brief, or a chore or backlog item: its line and its body
     Show {
@@ -211,12 +212,12 @@ enum Kind {
 enum Selection {
     /// The three blocks, each under its head.
     Board,
-    Briefs(Option<Status>),
+    Briefs(Option<Shown>),
     List(ListKind),
 }
 
 impl Selection {
-    fn new(kind: Option<Kind>, status: Option<Status>) -> Result<Selection, Error> {
+    fn new(kind: Option<Kind>, status: Option<Shown>) -> Result<Selection, Error> {
         match (kind, status) {
             (None, None) => Ok(Selection::Board),
             (None | Some(Kind::Briefs), status) => Ok(Selection::Briefs(status)),

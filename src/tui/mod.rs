@@ -119,6 +119,7 @@ pub fn run(board: Board) -> Result<(), Error> {
     // any command's is.
     let pending = Arc::new(AtomicBool::new(false));
     let _watcher = watch(&files, messages.clone(), Arc::clone(&pending))?;
+    let (asks, _asker) = spawn_worker(asker(&board), messages.clone());
     let (jobs, _worker) = spawn_worker(worker(board, messages.clone()), messages.clone());
     let terminal = ratatui::try_init().map_err(terminal_error)?;
     let panicked = note_panics();
@@ -128,7 +129,14 @@ pub fn run(board: Board) -> Result<(), Error> {
         input,
         panicked: Arc::clone(&panicked),
     };
-    let result = run_loop(&mut screen, &files, &inbox, &jobs, &pending, &panicked);
+    let result = run_loop(
+        &mut screen,
+        &files,
+        &inbox,
+        (&jobs, &asks),
+        &pending,
+        &panicked,
+    );
     let restored = ratatui::try_restore().map_err(terminal_error);
     // The worker is not waited for: a fetch it runs may take as long as a
     // stalled connection, and quitting should not. An unfinished fetch
@@ -155,6 +163,7 @@ pub fn run_headless(board: Board, keys: &str) -> Result<Vec<u8>, Error> {
     };
     let pending = Arc::new(AtomicBool::new(false));
     let watcher = watch(&files, messages.clone(), Arc::clone(&pending))?;
+    let (asks, asker) = spawn_worker(asker(&board), messages.clone());
     let (jobs, worker) = spawn_worker(worker(board, messages.clone()), messages.clone());
     for key in keys.chars() {
         let key = match key {
@@ -177,13 +186,15 @@ pub fn run_headless(board: Board, keys: &str) -> Result<Vec<u8>, Error> {
         &mut screen,
         &files,
         &inbox,
-        &jobs,
+        (&jobs, &asks),
         &pending,
         &AtomicBool::new(false),
     );
-    drop((jobs, watcher, inbox));
-    if let Err(payload) = worker.join() {
-        panic::resume_unwind(payload);
+    drop((jobs, asks, watcher, inbox));
+    for thread in [worker, asker] {
+        if let Err(payload) = thread.join() {
+            panic::resume_unwind(payload);
+        }
     }
     result.map(|()| screen.raw)
 }
@@ -310,7 +321,7 @@ fn run_loop(
     screen: &mut impl Screen,
     files: &Files,
     inbox: &Receiver<Message>,
-    jobs: &Sender<Job>,
+    (jobs, asks): (&Sender<Job>, &Sender<()>),
     pending: &AtomicBool,
     panicked: &AtomicBool,
 ) -> Result<(), Error> {
@@ -336,6 +347,7 @@ fn run_loop(
                 // The worker is gone only after it panicked, and then
                 // its message ends the loop.
                 Command::Fetch => drop(jobs.send(Job::Fetch)),
+                Command::Unpushed => drop(asks.send(())),
                 Command::Run(action) => drop(jobs.send(Job::Run(action))),
                 Command::Edit { path, line } => {
                     let file = files.root.join(path.to_string());
@@ -464,12 +476,21 @@ fn worker(board: Board, messages: Sender<Message>) -> impl FnMut(Job) -> Event +
     }
 }
 
+/// What asks git which briefs have unpushed commits: on a thread of its
+/// own, not the worker's, so a fetch that stalls on the network or a write
+/// that waits for the lock never holds up a question that is local and
+/// quick (SPEC.md, TUI).
+fn asker(board: &Board) -> impl FnMut(()) -> Event + Send + 'static {
+    let pushes = board.pushes();
+    move |()| Event::Unpushed(pushes.unpushed().map_err(|error| error.to_string()))
+}
+
 /// Runs each job with `run` on a thread of its own and sends its answer; a
 /// panic is sent too, and is the worker's last message.
-fn spawn_worker(
-    mut run: impl FnMut(Job) -> Event + Send + 'static,
+fn spawn_worker<J: Send + 'static>(
+    mut run: impl FnMut(J) -> Event + Send + 'static,
     messages: Sender<Message>,
-) -> (Sender<Job>, JoinHandle<()>) {
+) -> (Sender<J>, JoinHandle<()>) {
     let (jobs, queue) = mpsc::channel();
     let worker = thread::spawn(move || {
         for job in queue {

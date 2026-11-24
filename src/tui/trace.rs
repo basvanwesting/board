@@ -92,6 +92,11 @@ enum Step {
     /// typed by hand ([`assigned`]): what a sync gives.
     LoadAssigned,
     LoadFailed,
+    /// The answer to `Command::Unpushed` that is out: these briefs have
+    /// unpushed commits, which puts the filed ones among them in the
+    /// Briefs tab; `None` when git could not tell. Skipped when none is
+    /// out.
+    Unpushed(Option<Vec<u32>>),
     /// The worker's answer to the fetch that is out; skipped when none is.
     Answer(Answer),
     /// The worker's answer to the oldest write out, a success or not;
@@ -223,6 +228,7 @@ fn step() -> impl Strategy<Value = Step> {
         3 => (60u16..=200, 10u16..=50).prop_map(|(w, h)| Step::Resize(w, h)),
         1 => (0u16..60, 0u16..10).prop_map(|(w, h)| Step::Resize(w, h)),
         2 => Just(Step::LoadFailed),
+        4 => prop::option::weighted(0.9, prop::collection::vec(1u32..10, 0..4)).prop_map(Step::Unpushed),
         1 => Just(Step::InputGone),
     ]
 }
@@ -469,6 +475,7 @@ fn data(files: &Files) -> Data {
             number: BriefId::new(number),
             status,
             slug: format!("s{number}"),
+            unpushed: false,
         };
         let mut text = format!(
             "id: {number}\nstatus: {}\n\n# Brief {number}\n## Task\n",
@@ -557,6 +564,8 @@ struct Depth {
     kept_on_moved_item: u32,
     /// A reload took a cursor's item away, and the cursor went to another.
     item_gone: u32,
+    /// A new set of unpushed briefs moved a brief between the tabs.
+    relabelled: u32,
     /// A cursor on the second row of one ident.
     on_duplicate: u32,
     esc_typing: u32,
@@ -626,6 +635,7 @@ impl Depth {
             steps,
             kept_on_moved_item,
             item_gone,
+            relabelled,
             on_duplicate,
             esc_typing,
             esc_question,
@@ -682,6 +692,10 @@ struct Oracle {
     writes: VecDeque<Action>,
     /// Edits asked for and not answered.
     edits: usize,
+    /// Which briefs are unpushed was asked and has not answered.
+    unpushed_out: bool,
+    /// When it was last asked.
+    unpushed_last: u64,
 }
 
 impl Oracle {
@@ -692,6 +706,8 @@ impl Oracle {
             fetch_last: Some(now),
             writes: VecDeque::new(),
             edits: 0,
+            unpushed_out: true,
+            unpushed_last: now,
         }
     }
 }
@@ -699,7 +715,10 @@ impl Oracle {
 /// A TUI started at `now` on these files.
 fn start(files: &Files, now: u64) -> Result<(State, Oracle), TestCaseError> {
     let (state, commands) = State::new(Data::empty(shop()), 160, 40, stamp(now));
-    prop_assert_eq!(commands, vec![Command::Load, Command::Fetch]);
+    prop_assert_eq!(
+        commands,
+        vec![Command::Load, Command::Unpushed, Command::Fetch]
+    );
     let (state, commands) = state.step(Event::Loaded(Box::new(data(files))));
     prop_assert!(commands.is_empty());
     Ok((state, Oracle::new(now)))
@@ -733,6 +752,16 @@ fn run_trace(first: &Files, steps: &[Step]) -> Result<Depth, TestCaseError> {
                 Event::Loaded(Box::new(data(&last)))
             }
             Step::LoadFailed => Event::LoadFailed("cannot read shop/chores.md".to_owned()),
+            Step::Unpushed(numbers) => {
+                if !oracle.unpushed_out {
+                    continue;
+                }
+                oracle.unpushed_out = false;
+                Event::Unpushed(match numbers {
+                    Some(numbers) => Ok(numbers.iter().copied().map(BriefId::new).collect()),
+                    None => Err("cannot read the unpushed commits".to_owned()),
+                })
+            }
             Step::Answer(answer) => {
                 if !oracle.fetch_out {
                     continue;
@@ -774,6 +803,11 @@ fn run_trace(first: &Files, steps: &[Step]) -> Result<Depth, TestCaseError> {
         };
         let before = state.clone();
         let (after, commands) = state.step(event.clone());
+        if matches!(event, Event::Unpushed(_))
+            && before.items(Source::Open) != after.items(Source::Open)
+        {
+            depth.relabelled += 1;
+        }
         judge(
             &before,
             &event,
@@ -793,6 +827,16 @@ fn run_trace(first: &Files, steps: &[Step]) -> Result<Depth, TestCaseError> {
             state = after;
         }
         check(&state, &mut depth)?;
+        // The tabs are the files of the last load, labelled by the last set
+        // of unpushed briefs, after every step: a load keeps the label, and
+        // a set relabels.
+        let mut want = data(&last);
+        want.label(&state.unpushed);
+        let tabs = |data: &Data| -> [Vec<String>; 2] {
+            [&data.open, &data.filed]
+                .map(|briefs| briefs.iter().map(|brief| brief.row.ls_line()).collect())
+        };
+        prop_assert_eq!(tabs(&state.data), tabs(&want));
     }
     Ok(depth)
 }
@@ -1076,12 +1120,16 @@ fn judge(
                         "{:?}",
                         source
                     );
-                    if matches!(event, Event::Loaded(_)) && at != before.cursor(source).at {
+                    if matches!(event, Event::Loaded(_) | Event::Unpushed(_))
+                        && at != before.cursor(source).at
+                    {
                         depth.kept_on_moved_item += 1;
                     }
                 }
                 None => {
-                    if matches!(event, Event::Loaded(_)) && after.cursor(source).key.is_some() {
+                    if matches!(event, Event::Loaded(_) | Event::Unpushed(_))
+                        && after.cursor(source).key.is_some()
+                    {
                         depth.item_gone += 1;
                     }
                 }
@@ -1097,6 +1145,8 @@ fn judge(
                 prop_assert!(matches!(event, Event::FilesChanged | Event::Ran(..)));
             }
             Command::Fetch => prop_assert!(matches!(event, Event::Tick(_))),
+            // At each load and about once a minute: below, with its timing.
+            Command::Unpushed => {}
             Command::Quit => {
                 prop_assert!(
                     quit_key || matches!(event, Event::InputGone | Event::Ran(..)),
@@ -1148,7 +1198,16 @@ fn judge(
         Event::Key(key) if navigates(*key) => {
             prop_assert!(commands.len() == sent.len(), "{commands:?} after {key:?}");
         }
-        Event::FilesChanged => prop_assert_eq!(commands, [Command::Load].as_slice()),
+        // The question of what is unpushed goes with it, unless one is out.
+        Event::FilesChanged => {
+            let ask: &[Command] = if before.unpushed_out {
+                &[]
+            } else {
+                &[Command::Unpushed]
+            };
+            let want = [&[Command::Load][..], ask].concat();
+            prop_assert_eq!(commands, want.as_slice());
+        }
         // A write's answer reads the files at once: the rows of a move no
         // longer out stand where the files have them.
         Event::Ran(..) => prop_assert_eq!(commands.first(), Some(&Command::Load)),
@@ -1232,6 +1291,28 @@ fn judge(
             oracle.fetch_last = Some(now);
             depth.fetches += 1;
         }
+    }
+
+    // The question of what is unpushed: one at a time, at a load and
+    // about once a minute, apart from the fetch.
+    let asked = commands
+        .iter()
+        .filter(|command| **command == Command::Unpushed)
+        .count();
+    prop_assert!(asked <= 1, "{commands:?}");
+    if asked == 1 {
+        prop_assert!(!oracle.unpushed_out, "asked again while out: {event:?}");
+        prop_assert!(matches!(
+            event,
+            Event::FilesChanged | Event::Ran(..) | Event::Tick(_)
+        ));
+        oracle.unpushed_out = true;
+        oracle.unpushed_last = now;
+    } else if let Event::Tick(_) = event {
+        prop_assert!(
+            oracle.unpushed_out || now - oracle.unpushed_last < FETCH_EVERY,
+            "not asked at {now}"
+        );
     }
 
     // T9: a done or a drop only by `y`, to the question that asked it.
@@ -1529,6 +1610,7 @@ fn the_traces_get_deep() {
         ("steps", depth.steps > 64 * 30),
         ("kept_on_moved_item", depth.kept_on_moved_item > 0),
         ("item_gone", depth.item_gone > 0),
+        ("relabelled", depth.relabelled > 0),
         ("on_duplicate", depth.on_duplicate > 0),
         ("esc_typing", depth.esc_typing > 0),
         ("esc_question", depth.esc_question > 0),

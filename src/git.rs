@@ -735,20 +735,27 @@ impl Git {
             .map_err(|_| Failure::Said("git rev-list --count printed no number".to_owned()))
     }
 
-    /// How many commits reachable from `HEAD` have a message line that
-    /// matches `pattern`, an extended regular expression.
-    ///
-    /// `-E` pins the dialect whatever the user's `grep.patternType` says:
-    /// with `fixed`, `git log --grep` without `-E` matches literally (git
-    /// 2.56; `rev-list` reads no `grep.*` setting). `rev-list` for
-    /// `--count`: one number, not lines to count.
-    pub(crate) fn count_matching_head(&self, pattern: &str) -> Result<usize, Failure> {
-        let grep = format!("--grep={pattern}");
-        let stdout = self.run(&["rev-list", "--count", "-E", &grep, "HEAD"])?;
-        String::from_utf8_lossy(&stdout)
-            .trim()
-            .parse()
-            .map_err(|_| Failure::Said("git rev-list --count printed no number".to_owned()))
+    /// The messages of the commits in `range` (`HEAD`, `<a>..HEAD`), as
+    /// written. `log` and not `rev-list`, which cannot separate them by NUL
+    /// with `--format`. A user's settings stay out of what is parsed:
+    /// `--no-show-signature` for `log.showSignature`, `--encoding` for an
+    /// `i18n.logOutputEncoding` such as UTF-16, whose NUL bytes would split
+    /// the messages.
+    pub(crate) fn messages(&self, range: &str) -> Result<Vec<Vec<u8>>, Failure> {
+        let stdout = self.run(&[
+            "log",
+            "-z",
+            "--no-show-signature",
+            "--encoding=UTF-8",
+            "--format=%B",
+            range,
+            "--",
+        ])?;
+        Ok(stdout
+            .split(|b| *b == 0)
+            .filter(|message| !message.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
     }
 
     /// The three blobs' lines merged, with both sides of a conflict kept,

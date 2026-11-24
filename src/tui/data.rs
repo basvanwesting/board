@@ -1,8 +1,10 @@
 //! What the TUI shows of a project, read from its files at each reload.
 
-use crate::board::{BriefRow, briefs_in_order};
+use std::collections::BTreeSet;
+
+use crate::board::{BriefRow, arrange};
 use crate::brief::Stamp;
-use crate::id::ListKind;
+use crate::id::{BriefId, ListKind};
 use crate::list::{Entry, ListFile};
 use crate::project::{BoardPath, BriefFile, Project, ProjectName};
 
@@ -55,6 +57,12 @@ pub enum ListEntry {
 }
 
 impl BriefItem {
+    /// Its row, and whether its file is in `briefs/done/`.
+    fn row_in_done(&mut self) -> (&mut BriefRow, bool) {
+        let in_done = matches!(self.path, BoardPath::Brief { filed: true, .. });
+        (&mut self.row, in_done)
+    }
+
     fn of(project: &ProjectName, file: &BriefFile) -> BriefItem {
         BriefItem {
             row: BriefRow::of(file),
@@ -70,21 +78,32 @@ impl BriefItem {
 }
 
 impl Data {
+    /// The files as read; no brief is `unpushed` until [`Data::label`]
+    /// is given the set, which comes from git and not from the files.
     pub fn of(project: &Project) -> Data {
         let name = project.name();
-        let briefs = |filed: bool| -> Vec<BriefItem> {
-            briefs_in_order(project, filed)
-                .into_iter()
-                .map(|file| BriefItem::of(name, file))
-                .collect()
-        };
+        let briefs = project
+            .briefs()
+            .iter()
+            .map(|file| BriefItem::of(name, file));
+        let (open, filed) = arrange(briefs, &BTreeSet::new(), BriefItem::row_in_done);
         Data {
             project: name.clone(),
-            open: briefs(false),
-            filed: briefs(true),
+            open,
+            filed,
             chores: list_lines(project.list(ListKind::Chores)),
             backlog: list_lines(project.list(ListKind::Backlog)),
         }
+    }
+
+    /// The briefs labelled anew by the set of briefs with unpushed commits,
+    /// in the tabs and the order that gives: an unpushed brief is in the
+    /// Briefs tab, the other filed ones in Filed.
+    pub fn label(&mut self, unpushed: &BTreeSet<BriefId>) {
+        let briefs = std::mem::take(&mut self.open)
+            .into_iter()
+            .chain(std::mem::take(&mut self.filed));
+        (self.open, self.filed) = arrange(briefs, unpushed, BriefItem::row_in_done);
     }
 
     /// The board before its first load.
@@ -191,7 +210,7 @@ mod tests {
                 ListEntry::Item { id, text, .. } => (ListRow::Item(text.clone()), *id),
             })
             .unzip();
-        assert_eq!(rows, Snapshot::of(&project).chores);
+        assert_eq!(rows, Snapshot::of(&project, &BTreeSet::new()).chores);
         // As the CLI reads them: `c2<tab>` is no id (`list::parse_line`).
         assert_eq!(ids, [None, Some(1), None, None]);
         let lines: Vec<usize> = data.chores.iter().map(|line| line.line).collect();

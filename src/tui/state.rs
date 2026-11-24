@@ -9,12 +9,13 @@
 //! keeps what is out, so it shows a move that is out where it goes and
 //! knows when the last one is done.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use super::data::{BriefItem, Data, ListEntry};
 use super::layout::{self, Areas};
 use super::moves;
+use crate::board::Shown;
 use crate::brief::{Stamp, Status};
 use crate::id::{BacklogId, BriefId, ChoreId, ListKind};
 use crate::list::{self, Move, Side};
@@ -61,6 +62,9 @@ pub(crate) enum Event {
     LoadFailed(String),
     /// The answer to [`Command::Fetch`].
     Fetched(Fetched),
+    /// The answer to [`Command::Unpushed`]: the briefs with unpushed
+    /// commits (`board::Pushes::unpushed`), or why git could not tell.
+    Unpushed(Result<BTreeSet<BriefId>, String>),
     /// The answer to [`Command::Run`]: what the command printed, or its
     /// error.
     Ran(Action, Result<String, String>),
@@ -90,6 +94,12 @@ pub(crate) enum Command {
     Load,
     /// The background fetch, on the worker thread.
     Fetch,
+    /// Which briefs have commits above the project repository's upstream:
+    /// git, on a thread of its own, off the drawing thread and apart from
+    /// the fetch. Asked at each load and about once a minute, so a push the
+    /// owner makes shows within the minute, or at once on `r`, without a
+    /// board file changing; one at a time.
+    Unpushed,
     /// A write, on the worker thread after what is out there.
     Run(Action),
     /// `$EDITOR` on a file of the board, at a line (`+N`), with the
@@ -192,8 +202,9 @@ pub(crate) struct Row {
     pub at: usize,
     /// In flight since: a started or blocked brief.
     pub since: Option<Stamp>,
-    /// A brief's status, for its colour; `None` for a list row.
-    pub status: Option<Status>,
+    /// What a brief is shown as (its status, or `unpushed`), for its
+    /// colour; `None` for a list row.
+    pub status: Option<Shown>,
 }
 
 impl Row {
@@ -324,7 +335,14 @@ pub(crate) struct Message {
 
 #[derive(Debug, Clone)]
 pub(crate) struct State {
+    /// Labelled by `unpushed`.
     data: Data,
+    /// The last answer to [`Command::Unpushed`].
+    unpushed: BTreeSet<BriefId>,
+    /// When [`Command::Unpushed`] was last asked, and whether its answer is
+    /// still out.
+    unpushed_asked: Option<Stamp>,
+    unpushed_out: bool,
     width: u16,
     height: u16,
     now: Stamp,
@@ -364,6 +382,9 @@ impl State {
     pub fn new(data: Data, width: u16, height: u16, now: Stamp) -> (State, Vec<Command>) {
         let mut state = State {
             data,
+            unpushed: BTreeSet::new(),
+            unpushed_asked: None,
+            unpushed_out: false,
             width,
             height,
             now,
@@ -386,6 +407,7 @@ impl State {
             messages: Vec::new(),
         };
         let mut commands = vec![Command::Load];
+        commands.extend(state.ask_unpushed());
         // A fetch at once, not a minute on: until one answers, the status
         // line knows nothing of the remote.
         commands.extend(state.fetch_if_due());
@@ -404,14 +426,35 @@ impl State {
             }
             Event::Tick(now) => {
                 self.now = now;
-                self.fetch_if_due()
+                let mut commands = self.fetch_if_due();
+                let due = self
+                    .unpushed_asked
+                    .is_none_or(|asked| asked.unix().abs_diff(now.unix()) >= FETCH_EVERY);
+                if due {
+                    commands.extend(self.ask_unpushed());
+                }
+                commands
             }
-            Event::FilesChanged => vec![Command::Load],
+            Event::FilesChanged => {
+                let mut commands = vec![Command::Load];
+                commands.extend(self.ask_unpushed());
+                commands
+            }
             Event::Loaded(data) => {
-                let before = std::mem::replace(&mut self.data, *data);
+                let mut data = *data;
+                data.label(&self.unpushed);
                 self.load_error = None;
-                self.follow_ids(&before);
+                self.relabel(data);
                 self.loaded()
+            }
+            Event::Unpushed(answer) => {
+                self.unpushed_out = false;
+                match answer {
+                    Ok(unpushed) => self.unpushed_now(unpushed),
+                    // The set stays as it was; the next ask tries again.
+                    Err(why) => self.say(why, true),
+                }
+                Vec::new()
             }
             Event::LoadFailed(why) => {
                 self.load_error = Some(why);
@@ -819,11 +862,23 @@ impl State {
     /// The editor on the brief's file, or on the list file at the item's
     /// line.
     fn edit(&mut self, source: Source, key: &ItemKey) -> Vec<Command> {
-        let row = self
-            .rows(source)
+        // A brief may have changed tabs meanwhile: pushed, an unpushed one
+        // goes to Filed. It is the same file.
+        let other = match source {
+            Source::Open => Some(Source::Filed),
+            Source::Filed => Some(Source::Open),
+            Source::Chores | Source::Backlog => None,
+        };
+        let found = [Some(source), other]
             .into_iter()
-            .find(|row| row.key.as_ref() == Some(key));
-        let Some(row) = row else {
+            .flatten()
+            .find_map(|source| {
+                self.rows(source)
+                    .into_iter()
+                    .find(|row| row.key.as_ref() == Some(key))
+                    .map(|row| (source, row))
+            });
+        let Some((source, row)) = found else {
             self.say("the item is gone: nothing to edit".to_owned(), true);
             return Vec::new();
         };
@@ -903,6 +958,7 @@ impl State {
         // rows of a move that is no longer out would stand where they were
         // until then.
         let mut commands = vec![Command::Load];
+        commands.extend(self.ask_unpushed());
         if self.quitting && self.writes.is_empty() {
             commands.push(Command::Quit);
         }
@@ -941,6 +997,37 @@ impl State {
                 keep(key);
             }
         }
+    }
+
+    /// Asks which briefs are unpushed, unless an answer is still out: it
+    /// answers for now soon enough.
+    fn ask_unpushed(&mut self) -> Vec<Command> {
+        if self.unpushed_out {
+            return Vec::new();
+        }
+        self.unpushed_out = true;
+        self.unpushed_asked = Some(self.now);
+        vec![Command::Unpushed]
+    }
+
+    /// A new set of unpushed briefs. Not a load: the files are as they
+    /// were, so nothing that waits for the load after a write (an edit)
+    /// goes on.
+    fn unpushed_now(&mut self, unpushed: BTreeSet<BriefId>) {
+        if unpushed == self.unpushed {
+            return;
+        }
+        self.unpushed = unpushed;
+        let mut data = self.data.clone();
+        data.label(&self.unpushed);
+        self.relabel(data);
+    }
+
+    /// New data, from the files or from a new set of unpushed briefs: the
+    /// cursors stay on their items, wherever the rows went.
+    fn relabel(&mut self, data: Data) {
+        let before = std::mem::replace(&mut self.data, data);
+        self.follow_ids(&before);
     }
 
     /// After a reload: a run of `J`/`K` whose item or neighbour is gone is
@@ -1397,7 +1484,7 @@ fn brief_rows(briefs: &[BriefItem]) -> Vec<Row> {
                 }),
                 at,
                 since: brief.started.filter(|_| in_flight),
-                status: row.status,
+                status: row.shown(),
             }
         })
         .collect()

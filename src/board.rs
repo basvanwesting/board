@@ -1,6 +1,9 @@
 //! One project's board: a method per command.
 
+use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use crate::brief::{EntryText, Stamp, Status, Text};
 use crate::error::Error;
@@ -20,6 +23,9 @@ pub struct Board {
     /// brief is based on, also when `--board` names the project.
     cwd: PathBuf,
     project: ProjectName,
+    /// Whether the repository the command runs in is the project's own:
+    /// only there do its commits say which filed briefs are unpushed.
+    in_project: bool,
     /// Where a write says what happens along the way. A note is passed on
     /// as it comes: `waiting for lock` has to show before the wait. `Send`:
     /// the TUI's writes run on a thread of their own.
@@ -30,6 +36,14 @@ impl Board {
     /// Finds the project and the board-data clone; reads nothing yet.
     pub fn open(env: Env, notes: Box<dyn Fn(Note) + Send>) -> Result<Board, Error> {
         let project = resolve(&env)?;
+        // Named with `--board`: the checkout may be another project's, or
+        // none, and then nothing is labelled.
+        let in_project = env.board.is_none()
+            || resolve(&Env {
+                board: None,
+                ..env.clone()
+            })
+            .is_ok_and(|checkout| checkout == project);
         // A project without a directory is an empty board, so a root that
         // is not there would read as one too: every list empty, lint `ok`,
         // on a machine where the board was never cloned or `BOARD_ROOT` has
@@ -45,6 +59,7 @@ impl Board {
             root: env.cwd.join(env.root),
             cwd: env.cwd,
             project,
+            in_project,
             notes,
         })
     }
@@ -77,7 +92,23 @@ impl Board {
 
     /// The board as `ls` prints it.
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        self.load().map(|project| Snapshot::of(&project))
+        let unpushed = self.unpushed()?;
+        self.load().map(|project| Snapshot::of(&project, &unpushed))
+    }
+
+    /// The briefs with a commit in the project repository that its
+    /// upstream does not have ([`Pushes::unpushed`]).
+    pub fn unpushed(&self) -> Result<BTreeSet<BriefId>, Error> {
+        self.pushes().unpushed()
+    }
+
+    /// The question [`Board::unpushed`] asks, apart from the board so a
+    /// thread can own it.
+    pub fn pushes(&self) -> Pushes {
+        Pushes {
+            cwd: self.cwd.clone(),
+            in_project: self.in_project,
+        }
     }
 
     /// What `show` prints: a brief's file as it is, open or filed, or an
@@ -302,12 +333,15 @@ impl Board {
             ))
         };
         // A repository without a commit has none with the trailer; `HEAD`
-        // names nothing there, and rev-list would fail on it.
+        // names nothing there, and log would fail on it.
         let count = match git.commit("HEAD").map_err(git_error)? {
             None => 0,
             Some(_) => git
-                .count_matching_head(&format!("^Brief: {number}[[:space:]]*$"))
-                .map_err(git_error)?,
+                .messages("HEAD")
+                .map_err(git_error)?
+                .iter()
+                .filter(|message| trailers(message).any(|named| named == number))
+                .count(),
         };
         Ok(Commits::Counted { count, repository })
     }
@@ -348,6 +382,51 @@ impl Board {
     }
 }
 
+/// Which briefs the project repository the command runs in has commits
+/// for above its upstream.
+#[derive(Debug, Clone)]
+pub struct Pushes {
+    cwd: PathBuf,
+    /// As the board's: whether this is the project's own checkout.
+    in_project: bool,
+}
+
+impl Pushes {
+    /// The briefs with a commit in the project repository that its
+    /// upstream does not have: the filed ones among them are shown as
+    /// `unpushed` until the owner pushes. Derived from git each time, never
+    /// stored: a stored copy would go stale at every push made without
+    /// `board`. One `log` for all of them, after the questions whether
+    /// there is an upstream and a commit. None where the command does not
+    /// run in the project's own checkout, where its branch has no upstream,
+    /// where `HEAD` is detached (which has none either) or has no commit
+    /// yet. About this checkout: the one the owner pushes from.
+    pub fn unpushed(&self) -> Result<BTreeSet<BriefId>, Error> {
+        if !self.in_project {
+            return Ok(BTreeSet::new());
+        }
+        let git = Git::at(&self.cwd);
+        let error = |failure: Failure| {
+            Error::Git(format!(
+                "cannot read the unpushed commits in {}: {failure}",
+                self.cwd.display()
+            ))
+        };
+        let Some(upstream) = git.commit("@{upstream}").map_err(error)? else {
+            return Ok(BTreeSet::new());
+        };
+        // A branch without a commit may still name an upstream it fetched.
+        if git.commit("HEAD").map_err(error)?.is_none() {
+            return Ok(BTreeSet::new());
+        }
+        let messages = git.messages(&format!("{upstream}..HEAD")).map_err(error)?;
+        Ok(messages
+            .iter()
+            .flat_map(|message| trailers(message))
+            .collect())
+    }
+}
+
 /// The TUI's background job, apart from the [`Board`] so a thread can own
 /// it.
 pub struct Fetcher {
@@ -377,6 +456,19 @@ pub enum CommitCheck {
 fn now() -> Result<Stamp, Error> {
     Stamp::now()
         .ok_or_else(|| Error::Setup("the clock is outside the years 1970 to 9999".to_owned()))
+}
+
+/// The briefs a commit message names: each line that is `Brief: <id>`,
+/// blanks after it allowed, the id as `board` writes it (no leading zero).
+/// One reading for `file`, which counts a brief's commits, and the
+/// `unpushed` label, which looks for them above the upstream, so the two
+/// cannot disagree; whole lines, so `Brief: 12` names neither 1 nor 120.
+pub(crate) fn trailers(message: &[u8]) -> impl Iterator<Item = BriefId> + '_ {
+    message.split(|b| *b == b'\n').filter_map(|line| {
+        let id = str::from_utf8(line.strip_prefix(b"Brief: ")?.trim_ascii_end()).ok()?;
+        let number: u32 = id.parse().ok()?;
+        (number.to_string() == id).then(|| BriefId::new(number))
+    })
 }
 
 /// The text of a question or an amendment, refused before the write when it
@@ -414,6 +506,49 @@ pub struct Snapshot {
     pub backlog: Vec<ListRow>,
 }
 
+/// A word `ls --status` takes: a status, or the `unpushed` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    Status(Status),
+    Unpushed,
+}
+
+impl Shown {
+    /// The word: `ls` prints it, `--status` takes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Shown::Status(status) => status.as_str(),
+            Shown::Unpushed => UNPUSHED,
+        }
+    }
+}
+
+impl FromStr for Shown {
+    type Err = UnknownShown;
+
+    fn from_str(s: &str) -> Result<Shown, UnknownShown> {
+        if s == UNPUSHED {
+            return Ok(Shown::Unpushed);
+        }
+        s.parse()
+            .map(Shown::Status)
+            .map_err(|_| UnknownShown(s.to_owned()))
+    }
+}
+
+/// A word that is neither a status nor `unpushed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownShown(pub String);
+
+impl fmt::Display for UnknownShown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let known = Status::ALL.map(Status::as_str).join(", ");
+        write!(f, "`{}` is not a status ({known}, {UNPUSHED})", self.0)
+    }
+}
+
+impl std::error::Error for UnknownShown {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BriefRow {
     pub number: BriefId,
@@ -421,6 +556,10 @@ pub struct BriefRow {
     /// which.
     pub status: Option<Status>,
     pub slug: String,
+    /// Filed, with a commit still above the project repository's upstream
+    /// ([`Board::unpushed`]): shown among the open briefs as `unpushed`
+    /// until the owner pushes. A label, not a status: nothing stores it.
+    pub unpushed: bool,
 }
 
 impl BriefRow {
@@ -429,29 +568,47 @@ impl BriefRow {
             number: file.name.number(),
             status: file.status().ok(),
             slug: file.name.slug().to_owned(),
+            unpushed: false,
         }
+    }
+
+    /// Whether the brief is among the open ones: outside `briefs/done/`,
+    /// or filed and unpushed.
+    fn open(&self, in_done: bool) -> bool {
+        !in_done || self.unpushed
     }
 
     /// Where the row stands among the briefs: what is in flight first
     /// (started, blocked), then what waits for the planner (reported), then
-    /// what waits for the worker (queued), then what is still being written.
-    /// A brief without a usable status comes last, where it cannot push the
-    /// brief in flight out of sight.
+    /// what waits for the owner's push (unpushed), then what waits for the
+    /// worker (queued), then what is still being written. A brief without a
+    /// usable status comes last, where it cannot push the brief in flight
+    /// out of sight.
     fn rank(&self) -> u8 {
         match self.status {
+            _ if self.unpushed => 3,
             Some(Status::Started) => 0,
             Some(Status::Blocked) => 1,
             Some(Status::Reported) => 2,
-            Some(Status::Queued) => 3,
-            Some(Status::Draft) => 4,
-            None => 5,
-            Some(Status::Filed) => 6,
+            Some(Status::Queued) => 4,
+            Some(Status::Draft) => 5,
+            None => 6,
+            Some(Status::Filed) => 7,
         }
     }
 
-    /// The word in the status column.
+    /// What the row is shown as: its status, or `unpushed`; `None` for a
+    /// brief without a usable status.
+    pub fn shown(&self) -> Option<Shown> {
+        if self.unpushed {
+            return Some(Shown::Unpushed);
+        }
+        self.status.map(Shown::Status)
+    }
+
+    /// The word in the status column: `unpushed` for a brief so labelled.
     pub fn status_word(&self) -> &'static str {
-        self.status.map_or("unknown", Status::as_str)
+        self.shown().map_or("unknown", Shown::as_str)
     }
 
     /// The row as `board ls` prints it, without the newline; the TUI's `Y`
@@ -472,49 +629,70 @@ pub enum ListRow {
     Item(Vec<u8>),
 }
 
-/// The project's open briefs (`filed` false) or filed ones, in the order the
-/// board shows them: by [`BriefRow::rank`], then by number. One order for
-/// `ls` and the TUI. Filed ones go by number: a brief in `briefs/done/` is
-/// filed whatever its header says ([`BriefFile::status`]), so all rank alike.
-pub(crate) fn briefs_in_order(project: &Project, filed: bool) -> Vec<&BriefFile> {
-    let mut files: Vec<&BriefFile> = project
-        .briefs()
-        .iter()
-        .filter(|file| file.filed == filed)
-        .collect();
-    files.sort_by_cached_key(|file| {
-        let row = BriefRow::of(file);
-        (row.rank(), row.number)
-    });
-    files
+/// The label of a filed brief with unpushed commits.
+pub const UNPUSHED: &str = "unpushed";
+
+/// Labels the briefs by `unpushed` and splits them into the open ones and
+/// the filed ones, in the order the board shows them: by [`BriefRow::rank`],
+/// then by number. One order for `ls` and the TUI, which hold a brief as a
+/// row or as an item: `row` gives an item's row and whether its file is in
+/// `briefs/done/`. Filed ones go by number: a brief in `briefs/done/` is
+/// filed whatever its header says ([`BriefFile::status`]), so all rank
+/// alike.
+pub(crate) fn arrange<T>(
+    briefs: impl IntoIterator<Item = T>,
+    unpushed: &BTreeSet<BriefId>,
+    mut row: impl FnMut(&mut T) -> (&mut BriefRow, bool),
+) -> (Vec<T>, Vec<T>) {
+    let mut open = Vec::new();
+    let mut filed = Vec::new();
+    for mut brief in briefs {
+        let (row, in_done) = row(&mut brief);
+        row.unpushed = row.status == Some(Status::Filed) && unpushed.contains(&row.number);
+        let key = (row.rank(), row.number);
+        if row.open(in_done) {
+            open.push((key, brief));
+        } else {
+            filed.push((key, brief));
+        }
+    }
+    let sorted = |mut briefs: Vec<((u8, BriefId), T)>| -> Vec<T> {
+        briefs.sort_by_key(|(key, _)| *key);
+        briefs.into_iter().map(|(_, brief)| brief).collect()
+    };
+    (sorted(open), sorted(filed))
 }
 
 impl Snapshot {
-    pub fn of(project: &Project) -> Snapshot {
-        let rows = |filed: bool| -> Vec<BriefRow> {
-            briefs_in_order(project, filed)
-                .into_iter()
-                .map(BriefRow::of)
-                .collect()
-        };
+    pub fn of(project: &Project, unpushed: &BTreeSet<BriefId>) -> Snapshot {
+        let rows = project
+            .briefs()
+            .iter()
+            .map(|file| (BriefRow::of(file), file.filed));
+        let (open, filed) = arrange(rows, unpushed, |(row, in_done)| (row, *in_done));
+        let rows = |briefs: Vec<(BriefRow, bool)>| briefs.into_iter().map(|(row, _)| row).collect();
         Snapshot {
             project: project.name().clone(),
-            open: rows(false),
-            filed: rows(true),
+            open: rows(open),
+            filed: rows(filed),
             chores: list_rows(project.list(ListKind::Chores)),
             backlog: list_rows(project.list(ListKind::Backlog)),
         }
     }
 
-    /// The briefs `ls` lists: the open ones, or those with one status.
-    /// `filed` is the briefs in `briefs/done/`.
-    pub fn briefs(&self, status: Option<Status>) -> impl Iterator<Item = &BriefRow> {
-        let rows = match status {
-            Some(Status::Filed) => &self.filed,
+    /// The briefs `ls` lists: the open ones, or those it shows with one
+    /// word. `filed` is the briefs in `briefs/done/` that are not
+    /// `unpushed`.
+    pub fn briefs(&self, shown: Option<Shown>) -> impl Iterator<Item = &BriefRow> {
+        let rows = match shown {
+            Some(Shown::Status(Status::Filed)) => &self.filed,
             Some(_) | None => &self.open,
         };
-        rows.iter()
-            .filter(move |row| status.is_none() || row.status == status)
+        rows.iter().filter(move |row| match shown {
+            None | Some(Shown::Status(Status::Filed)) => true,
+            Some(Shown::Unpushed) => row.unpushed,
+            Some(Shown::Status(status)) => !row.unpushed && row.status == Some(status),
+        })
     }
 
     pub fn list(&self, kind: ListKind) -> &[ListRow] {
@@ -570,19 +748,22 @@ mod tests {
 
     #[test]
     fn open_briefs_come_in_the_order_of_who_has_to_act() {
-        let snapshot = Snapshot::of(&project(vec![
-            brief("briefs/1-draft.md", "status: draft\n"),
-            brief("briefs/2-queued.md", "status: queued\n"),
-            brief("briefs/3-reported.md", "status: reported\n"),
-            brief("briefs/4-blocked.md", "status: blocked\n"),
-            brief("briefs/5-started.md", "status: started\n"),
-            brief("briefs/6-no-status.md", "# no header\n"),
-            brief("briefs/7-typo.md", "status: strated\n"),
-            brief("briefs/8-filed-by-hand.md", "status: filed\n"),
-            brief("briefs/9-started.md", "status: started\n"),
-            brief("briefs/done/10-old.md", "# no header\n"),
-            brief("briefs/done/007-older.md", "status: started\n"),
-        ]));
+        let snapshot = Snapshot::of(
+            &project(vec![
+                brief("briefs/1-draft.md", "status: draft\n"),
+                brief("briefs/2-queued.md", "status: queued\n"),
+                brief("briefs/3-reported.md", "status: reported\n"),
+                brief("briefs/4-blocked.md", "status: blocked\n"),
+                brief("briefs/5-started.md", "status: started\n"),
+                brief("briefs/6-no-status.md", "# no header\n"),
+                brief("briefs/7-typo.md", "status: strated\n"),
+                brief("briefs/8-filed-by-hand.md", "status: filed\n"),
+                brief("briefs/9-started.md", "status: started\n"),
+                brief("briefs/done/10-old.md", "# no header\n"),
+                brief("briefs/done/007-older.md", "status: started\n"),
+            ]),
+            &BTreeSet::new(),
+        );
         assert_eq!(
             shown(snapshot.briefs(None)),
             [
@@ -598,14 +779,78 @@ mod tests {
             ]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Status::Started))),
+            shown(snapshot.briefs(Some(Shown::Status(Status::Started)))),
             ["5 started started", "9 started started"]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Status::Filed))),
+            shown(snapshot.briefs(Some(Shown::Status(Status::Filed)))),
             ["7 filed older", "10 filed old"]
         );
-        assert_eq!(shown(snapshot.briefs(Some(Status::Blocked))).len(), 1);
+        assert_eq!(
+            shown(snapshot.briefs(Some(Shown::Status(Status::Blocked)))).len(),
+            1
+        );
+        assert_eq!(shown(snapshot.briefs(Some(Shown::Unpushed))).len(), 0);
+    }
+
+    /// A filed brief with unpushed commits is among the open ones, after
+    /// what waits for the planner and before what waits for the worker; an
+    /// open brief in the set is not labelled (only a filed one is), and a
+    /// number that names no brief changes nothing.
+    #[test]
+    fn an_unpushed_brief_is_listed_with_the_open_ones() {
+        let snapshot = Snapshot::of(
+            &project(vec![
+                brief("briefs/2-queued.md", "status: queued\n"),
+                brief("briefs/3-reported.md", "status: reported\n"),
+                brief("briefs/5-started.md", "status: started\n"),
+                brief("briefs/done/10-old.md", "status: filed\n"),
+                brief("briefs/done/12-newer.md", "status: filed\n"),
+                brief("briefs/done/120-other.md", "status: filed\n"),
+            ]),
+            &[2, 12, 99].map(BriefId::new).into(),
+        );
+        assert_eq!(
+            shown(snapshot.briefs(None)),
+            [
+                "5 started started",
+                "3 reported reported",
+                "12 unpushed newer",
+                "2 queued queued"
+            ]
+        );
+        assert_eq!(
+            shown(snapshot.briefs(Some(Shown::Unpushed))),
+            ["12 unpushed newer"]
+        );
+        assert_eq!(
+            shown(snapshot.briefs(Some(Shown::Status(Status::Filed)))),
+            ["10 filed old", "120 filed other"]
+        );
+        assert_eq!(
+            shown(snapshot.briefs(Some(Shown::Status(Status::Queued)))),
+            ["2 queued queued"]
+        );
+    }
+
+    #[test]
+    fn a_trailer_names_a_brief_on_a_line_of_its_own() {
+        let named = |message: &str| -> Vec<u32> {
+            trailers(message.as_bytes()).map(BriefId::get).collect()
+        };
+        assert_eq!(named("Fix\n\nBrief: 12\n"), [12]);
+        assert_eq!(named("Brief: 12 \t\r\nBrief: 3"), [12, 3]);
+        for not_one in [
+            "Brief: 012",
+            "Brief:12",
+            " Brief: 12",
+            "Brief: 12a",
+            "Brief: 1 2",
+            "See Brief: 12",
+            "Brief: ",
+        ] {
+            assert_eq!(named(not_one), Vec::<u32>::new(), "{not_one:?}");
+        }
     }
 
     #[test]
@@ -647,6 +892,7 @@ mod tests {
                 any_status_line(),
                 0..12,
             ),
+            unpushed in prop::collection::btree_set(0u32..40, 0..6),
         ) {
             let files: Vec<BriefFile> = briefs
                 .iter()
@@ -655,17 +901,32 @@ mod tests {
                     brief(&format!("briefs/{done}{number}-x.md"), status)
                 })
                 .collect();
-            let snapshot = Snapshot::of(&project(files));
+            let set: BTreeSet<BriefId> = unpushed.iter().copied().map(BriefId::new).collect();
+            let snapshot = Snapshot::of(&project(files), &set);
 
             let numbers = |rows: Vec<&BriefRow>| -> Vec<u32> {
                 rows.iter().map(|row| row.number.get()).collect()
             };
             let mut open = numbers(snapshot.briefs(None).collect());
-            let filed = numbers(snapshot.briefs(Some(Status::Filed)).collect());
+            let filed = numbers(snapshot.briefs(Some(Shown::Status(Status::Filed))).collect());
+            // Open: outside `briefs/done/`, or in it and unpushed.
             let expected = |want: bool| -> Vec<u32> {
-                briefs.keys().filter(|(_, filed)| *filed == want).map(|(n, _)| *n).collect()
+                briefs
+                    .keys()
+                    .filter(|(n, filed)| (!*filed || unpushed.contains(n)) != want)
+                    .map(|(n, _)| *n)
+                    .collect()
             };
             prop_assert_eq!(&filed, &expected(true));
+            let labelled = numbers(snapshot.briefs(Some(Shown::Unpushed)).collect());
+            let want: Vec<u32> = briefs
+                .keys()
+                .filter(|(n, filed)| *filed && unpushed.contains(n))
+                .map(|(n, _)| *n)
+                .collect();
+            let mut got = labelled.clone();
+            got.sort_unstable();
+            prop_assert_eq!(got, want);
 
             // In board order: by rank, then by number.
             let keys: Vec<(u8, u32)> = snapshot
@@ -676,20 +937,20 @@ mod tests {
             open.sort_unstable();
             prop_assert_eq!(&open, &expected(false));
 
-            // The statuses split the open briefs; what none of them lists
-            // is shown as unknown.
-            let mut by_status = 0;
+            // The statuses and `unpushed` split the open briefs; what none
+            // of them lists is shown as unknown.
+            let mut by_status = labelled.len();
             for status in Status::ALL {
-                let rows: Vec<&BriefRow> = snapshot.briefs(Some(status)).collect();
-                prop_assert!(rows.iter().all(|row| row.status == Some(status)));
+                let rows: Vec<&BriefRow> = snapshot.briefs(Some(Shown::Status(status))).collect();
+                prop_assert!(rows.iter().all(|row| row.status == Some(status) && !row.unpushed));
                 if status != Status::Filed {
                     by_status += rows.len();
                 }
             }
             let unknown = snapshot.briefs(None).filter(|row| row.status.is_none()).count();
             prop_assert_eq!(by_status + unknown, open.len());
-            prop_assert!(snapshot.open.iter().all(|row| row.status != Some(Status::Filed)));
-            prop_assert!(snapshot.filed.iter().all(|row| row.status == Some(Status::Filed)));
+            prop_assert!(snapshot.open.iter().all(|row| row.status != Some(Status::Filed) || row.unpushed));
+            prop_assert!(snapshot.filed.iter().all(|row| row.status == Some(Status::Filed) && !row.unpushed));
         }
     }
 }

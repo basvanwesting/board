@@ -37,6 +37,8 @@ draft → queued → started ⇄ blocked → reported → filed
 | `reported` | Done: the worker's report is the last section. | worker | `board report <id>` |
 | `filed` | Checked and closed; the file moves to `briefs/done/`. | planner | `board file <id>` |
 
+`reported` waits for the planner's read, not for you: the planner files a reported brief at the start of its next turn, turning the report's leftovers into chores and backlog items. What waits for you is the push: a filed brief whose commits are not pushed yet (a commit with its trailer in the project repository's `@{upstream}..HEAD`) is listed with the open ones as `unpushed`, in yellow in the TUI, until you push. It is a label from git, not a status: nothing stores it, and `board ls briefs --status unpushed` lists those briefs.
+
 `board queue <id> --closes b41,b52` names the backlog items the brief resolves. `board file <id>` checks the repository it runs in, also when the board is named (`board file <id> --board shop`), for commits carrying the trailer `Brief: <id>` on a line of their own (a rebase keeps it, where it would change every SHA), refuses a brief with none (`board file <id> --no-commits` for one that changed no code, such as an investigation), deletes the backlog items it closes and moves the brief to `briefs/done/`. `board amend <id>` adds to a queued, started or blocked brief without changing who has it; only on a blocked one does it resume the work.
 
 ## Install and setup
@@ -89,7 +91,7 @@ $ board done c1
 done c1
 ```
 
-The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones, and Filed), Chores by group, Backlog in order, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
+The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones and the unpushed, and Filed), Chores by group, Backlog in order, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
 
 - `j`/`k` move, `1` `2` `3` or Tab focus a panel, `0` or Enter scrolls the preview, `/` filters the panel.
 - `d` marks a chore done, `x` drops a backlog item (each asks once), `J`/`K` reorder, `e` opens the item in `$EDITOR`.
