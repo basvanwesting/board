@@ -167,6 +167,7 @@ fn key() -> impl Strategy<Value = Key> {
         BackTab,
         Char('['),
         Char(']'),
+        Char('0'),
         Enter,
         Enter,
         Esc,
@@ -1581,13 +1582,19 @@ fn the_traces_get_deep() {
 
 /// Where the focus is after each key, and whether in the preview.
 fn focus_along(keys: &[Key]) -> Vec<(Panel, bool)> {
-    let files = Files {
-        open: vec![(1, None, 1)],
-        filed: Vec::new(),
-        chores: vec![ChoreLine::Item(Some(1), 0)],
-        backlog: vec![(Some(1), 0)],
-    };
-    let (mut state, _) = start(&files, 1_000_000).unwrap();
+    focus_along_in(
+        &Files {
+            open: vec![(1, None, 1)],
+            filed: Vec::new(),
+            chores: vec![ChoreLine::Item(Some(1), 0)],
+            backlog: vec![(Some(1), 0)],
+        },
+        keys,
+    )
+}
+
+fn focus_along_in(files: &Files, keys: &[Key]) -> Vec<(Panel, bool)> {
+    let (mut state, _) = start(files, 1_000_000).unwrap();
     let mut seen = Vec::new();
     for key in keys {
         state = state.step(Event::Key(*key)).0;
@@ -1620,4 +1627,64 @@ fn shift_tab_leaves_the_preview_for_the_previous_panel() {
             (Panel::Briefs, false),
         ]
     );
+}
+
+/// `0` is Enter's twin: into the preview from each panel, with an item
+/// under the cursor.
+#[test]
+fn zero_enters_the_preview_from_each_panel() {
+    use Key::Char;
+    assert_eq!(
+        focus_along(&[Char('0'), Char('2'), Char('0'), Char('3'), Char('0')]),
+        [
+            (Panel::Briefs, true),
+            (Panel::Chores, false),
+            (Panel::Chores, true),
+            (Panel::Backlog, false),
+            (Panel::Backlog, true),
+        ]
+    );
+}
+
+/// Without an item under the cursor `0` does nothing, as Enter: a panel
+/// with only a heading, an empty one. In the preview it does nothing either.
+#[test]
+fn zero_needs_an_item_and_does_nothing_in_the_preview() {
+    use Key::Char;
+    let files = Files {
+        open: vec![(1, None, 1)],
+        filed: Vec::new(),
+        chores: vec![ChoreLine::Group(0)],
+        backlog: Vec::new(),
+    };
+    assert_eq!(
+        focus_along_in(&files, &[Char('2'), Char('0'), Char('3'), Char('0')]),
+        [
+            (Panel::Chores, false),
+            (Panel::Chores, false),
+            (Panel::Backlog, false),
+            (Panel::Backlog, false),
+        ]
+    );
+    assert_eq!(
+        focus_along(&[Char('0'), Char('0')]),
+        [(Panel::Briefs, true), (Panel::Briefs, true)]
+    );
+}
+
+/// While a filter is typed, `0` is filter text.
+#[test]
+fn zero_typed_into_a_filter_is_filter_text() {
+    let files = Files {
+        open: vec![(1, None, 1)],
+        filed: Vec::new(),
+        chores: Vec::new(),
+        backlog: Vec::new(),
+    };
+    let (state, _) = start(&files, 1_000_000).unwrap();
+    let state = [Key::Char('/'), Key::Char('1'), Key::Char('0')]
+        .into_iter()
+        .fold(state, |state, key| state.step(Event::Key(key)).0);
+    assert_eq!(state.filter(Panel::Briefs), Some("10"));
+    assert!(!state.in_preview());
 }

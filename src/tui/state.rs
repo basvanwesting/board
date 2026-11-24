@@ -529,7 +529,11 @@ impl State {
                     Tab::Filed => Tab::Open,
                 };
             }
-            Key::Enter if !self.in_preview && self.cursor(self.source()).key.is_some() => {
+            // `0` is the preview's number in its title, as `1` `2` `3` are the
+            // panels': the number names a key that is there (SPEC.md, TUI).
+            Key::Char('0') | Key::Enter
+                if !self.in_preview && self.cursor(self.source()).key.is_some() =>
+            {
                 self.in_preview = true;
             }
             Key::Char('/') if !self.in_preview => {

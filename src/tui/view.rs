@@ -18,7 +18,7 @@ const HELP: [(&str, &str); 19] = [
     ("1 2 3", "Briefs, Chores, Backlog"),
     ("h l S-Tab Tab", "previous, next panel"),
     ("[ ]", "the Briefs tabs: Briefs, Filed"),
-    ("Enter", "into the preview, to scroll; h back"),
+    ("0 Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
     ("d", "done: delete the chore, asked first (y/n)"),
     ("x", "drop: delete the backlog item, asked first (y/n)"),
@@ -90,6 +90,13 @@ fn status_style(status: Status) -> Style {
     }
 }
 
+/// The `─[1]─` a title starts with: the key that gives the block the keys,
+/// green when it has them. One function for the panels and the preview, so
+/// the four cannot drift.
+fn key_span(key: &str, focused: bool) -> Span<'static> {
+    Span::styled(format!("─[{key}]─"), border(focused))
+}
+
 /// A panel's title as LazyGit draws it: `─[1]─Briefs - Filed`, the jump key
 /// in brackets, then the tabs; the panel's name is its first tab. The tab
 /// shown is bold, and green with the border when the panel has the focus.
@@ -105,7 +112,7 @@ fn panel_title(state: &State, panel: Panel, focused: bool) -> Line<'static> {
     // The block draws its title in the border's style; plain is said
     // outright, or a focused panel's whole title would be green.
     let plain = Style::new().fg(Color::Reset);
-    let mut title = vec![Span::styled(format!("─[{key}]─"), border(focused))];
+    let mut title = vec![key_span(key, focused)];
     for (at, (name, tab)) in tabs.iter().enumerate() {
         if at > 0 {
             title.push(Span::styled(" - ", plain));
@@ -227,19 +234,19 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
 }
 
 fn draw_preview(frame: &mut Frame, state: &State, area: Rect) {
-    let block = block(state.in_preview());
+    // The number names the pane, not its content: it shows with nothing to
+    // preview too.
+    let focused = state.in_preview();
+    let block = block(focused);
     let Some(preview) = state.preview_content() else {
-        frame.render_widget(block, area);
+        frame.render_widget(block.title(key_span("0", focused)), area);
         return;
     };
     let scroll = u16::try_from(state.preview_scroll()).unwrap_or(u16::MAX);
-    frame.render_widget(
-        preview
-            .paragraph()
-            .scroll((scroll, 0))
-            .block(block.title(preview.title)),
-        area,
-    );
+    let paragraph = preview.paragraph().scroll((scroll, 0));
+    let mut title = preview.title;
+    title.spans.insert(0, key_span("0", focused));
+    frame.render_widget(paragraph.block(block.title(title)), area);
 }
 
 /// How long, the way the status line says it: `<1m`, `42m`, `5h`, `3d`.
@@ -499,7 +506,7 @@ mod tests {
         assert_eq!(
             screen(&state(100, 12)),
             [
-                "╭─[1]─Briefs - Filed────────────────────────╮╭128 some-slug────────────────────────────────────────╮",
+                "╭─[1]─Briefs - Filed────────────────────────╮╭─[0]─128 some-slug───────────────────────────────────╮",
                 "│▶128 started   some-slug                42m││id: 128                                              │",
                 "│ 127 reported  other-slug                  ││status: started                                      │",
                 "│                                           ││                                                     │",
@@ -545,7 +552,7 @@ mod tests {
             "{}",
             lines[0]
         );
-        assert!(lines[0].contains("╭100 old──"), "{}", lines[0]);
+        assert!(lines[0].contains("╭─[0]─100 old──"), "{}", lines[0]);
         assert!(
             lines[1].starts_with("│▶100 filed     old  "),
             "{}",
@@ -776,8 +783,39 @@ mod tests {
             styles(&buffer, "## deploy"),
             all("## deploy", (Color::Reset, true))
         );
-        let (x, y) = find(&buffer, "╭c12");
-        assert_eq!(buffer[(x + 1, y)].fg, Color::Cyan);
+        let (x, y) = find(&buffer, "╭─[0]─c12");
+        assert_eq!(buffer[(x + 6, y)].fg, Color::Cyan);
+    }
+
+    /// The preview is `[0]` as the panels are `[1]` `[2]` `[3]`: green with
+    /// the keys, plain without, and there with nothing to preview.
+    #[test]
+    fn the_preview_is_titled_0_like_a_panel() {
+        let right = |state: &State| {
+            let line = screen(state).remove(0);
+            line.chars().skip(45).collect::<String>()
+        };
+        let plain = state(100, 12);
+        assert_eq!(
+            right(&plain),
+            "╭─[0]─128 some-slug───────────────────────────────────╮"
+        );
+        assert_eq!(
+            styles(&cells(&plain), "─[0]─"),
+            all("─[0]─", (Color::Reset, false))
+        );
+        let inside = press(state(100, 12), "0");
+        assert_eq!(right(&inside), right(&plain));
+        assert_eq!(
+            styles(&cells(&inside), "─[0]─"),
+            all("─[0]─", (Color::Green, false))
+        );
+        // A filter that matches nothing: an empty panel, no content.
+        let empty = press(state(100, 12), "/zz");
+        assert_eq!(
+            right(&empty),
+            "╭─[0]─────────────────────────────────────────────────╮"
+        );
     }
 
     #[test]
