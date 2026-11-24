@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 08773072d61ad9ee566e1aa9b5ab9b6de21c9af3edd0a48505a7d22f3f7eaeef # shrinks to [Cmd { who: A, op: AddBacklog, fault: Some(WindowOp(Drop(Index(10345090333)))) }, Cmd { who: A, op: File { pick: Index(190854505515160713), trailer: false }, fault: None }]
+cc eb06ba743a04b7a2dd22ab4d39a192ad727cc9f30556dde458bb2cbdd9890651 # shrinks to [Cmd { who: B, op: AddChore { group: false }, fault: Some(WindowOp(Move { backlog: false, item: Index(33182835), target: Index(1518873116071148875), after: false })) }, Cmd { who: B, op: NewBrief, fault: None }, HandEdit { who: B, edit: BodyLine(Index(15645502493614774929)) }, Sync { who: A }, Cmd { who: A, op: AddChore { group: false }, fault: Some(WindowEdit(BodyLine(Index(16503378521241209316)))) }]
+cc adc3700e92c89e3be6eaddfa937b54733f09b6fa7d36bf28f03255352e35343e # shrinks to [Cmd { who: A, op: AddWithBody { backlog: false }, fault: Some(WindowOp(Queue { pick: Index(150053207), write: true, closes: Some(Index(3835106573147583208)) })) }]

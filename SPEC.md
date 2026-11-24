@@ -124,7 +124,7 @@ No `import` command. Each project's old planner folders (one per machine: `backl
 The owner's rules (global CLAUDE.md) apply: guarantees over prose, commit when green, fresh-eyes review.
 
 - Tests run the real thing: temp dirs, a bare repo as the remote, two clones.
-- Trace-test the sync: random interleavings of the writing commands on two clones (with pushes failing and going offline in between); after every step: no item lost, no duplicate ID, both clones converge after a sync. Prove the check is not vacuous by breaking the lock or the retry once.
+- Trace-test the sync: random interleavings of the writing commands on two clones (with pushes failing and going offline in between); after every step: no item lost, no duplicate ID, an item's body under it and one side's whole (never a mix, never left behind, a lone write never lost), both clones converge after a sync. Prove the check is not vacuous by breaking the lock or the retry once.
 - No sleeps in tests.
 - Parser round-trip: reading and writing a list file changes nothing but what the command changed (hand edits survive).
 

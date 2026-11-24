@@ -18,6 +18,21 @@
 //! - I6: a brief's status on the remote moves only along the edges of the
 //!   state machine and its number keeps its file there; in every place a
 //!   number is on one file, open or filed;
+//! - I7: a body line is directly below the item it was written under, in
+//!   that item's block as `list::is_continuation` reads it, or nowhere:
+//!   never under another item, never loose after a blank line, a heading or
+//!   free text; so it never outlives its item;
+//! - I8: an item's body in a place is one a place had before, or one the
+//!   step's writes (`add --body`, `amend`, `--replace`, a line typed or
+//!   deleted by hand) make of one: one side's body whole, never a mix of
+//!   two sides' lines, no line applied twice;
+//! - I9: a body line leaves an item that stays only for another write of
+//!   that body that did not come before it and could drop it: a replace, a
+//!   delete of that line, or a write made without the line, which the
+//!   merge keeps whole over it (SPEC.md, Sync: the clone's side when it
+//!   changed the body, else the remote's). A lone write is never lost.
+//!   With I7 and I8 the bodies never touch the items, which I1 to I5 hold
+//!   to with bodies in the files;
 //! - every id a command printed or assigned is on the remote with its token,
 //!   and nothing refused or never pushed is anywhere; a brief `new brief`
 //!   printed is on the remote under its number, and the remote has as many
@@ -33,8 +48,9 @@
 //!   into a brief, by hand or by a command, is in the brief or in a
 //!   conflict copy of the clone that wrote it.
 //!
-//! Every item's text and every free-text line carries a token (`t7`) used
-//! once, so a line applied twice, lost or given two ids shows.
+//! Every item's text, every free-text line and every body line carries a
+//! token (`t7`) used once, so a line applied twice, lost, mixed, given two
+//! ids or put under another item shows.
 
 mod common;
 
@@ -79,6 +95,19 @@ enum Op {
         group: bool,
     },
     AddBacklog,
+    /// `add chore|backlog … --body`: an item with a body of a line or two.
+    AddWithBody {
+        backlog: bool,
+    },
+    /// `amend <c-id|b-id>` of an item of the clone or the remote, picked
+    /// when the step runs: these lines after its body, or with `replace`
+    /// in its place (none: the body removed).
+    Body {
+        backlog: bool,
+        item: Index,
+        replace: bool,
+        lines: u8,
+    },
     /// A chore of the clone or the remote, picked when the step runs.
     Done(Index),
     /// A backlog item of the clone or the remote, picked when the step runs.
@@ -157,8 +186,12 @@ enum Edit {
     Change(Index),
     /// An item's line moved within its file.
     Move(Index, Index),
-    /// An item's line deleted.
+    /// An item's line deleted, with its body.
     Delete(Index),
+    /// A body line typed below an item with an id, after its body.
+    BodyLine(Index),
+    /// A body line deleted.
+    DeleteBodyLine(Index),
     /// A line added to a brief's body, after the planner's sections when it
     /// has none yet.
     Brief(BriefPick),
@@ -211,6 +244,9 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => any::<bool>().prop_map(|group| Op::AddChore { group }),
         3 => Just(Op::AddBacklog),
+        1 => any::<bool>().prop_map(|backlog| Op::AddWithBody { backlog }),
+        2 => (any::<bool>(), any::<Index>(), any::<bool>(), 0u8..3)
+            .prop_map(|(backlog, item, replace, lines)| Op::Body { backlog, item, replace, lines }),
         2 => any::<Index>().prop_map(Op::Done),
         2 => any::<Index>().prop_map(Op::Drop),
         3 => (any::<bool>(), any::<Index>(), any::<Index>(), any::<bool>())
@@ -245,6 +281,8 @@ fn edit() -> impl Strategy<Value = Edit> {
         2 => any::<Index>().prop_map(Edit::Change),
         2 => (any::<Index>(), any::<Index>()).prop_map(|(from, to)| Edit::Move(from, to)),
         2 => any::<Index>().prop_map(Edit::Delete),
+        1 => any::<Index>().prop_map(Edit::BodyLine),
+        1 => any::<Index>().prop_map(Edit::DeleteBodyLine),
         5 => brief_pick().prop_map(Edit::Brief),
     ]
 }
@@ -372,12 +410,20 @@ enum Line {
     Item { id: Option<Id>, token: String },
     /// `note <token>`
     Text { token: String },
+    /// `  - <token>`: a line of an item's body, indented below it; `owner`
+    /// is the token of the item it continues, as `list::is_continuation`
+    /// reads it, `None` when it continues none (after a blank line, a
+    /// heading or free text).
+    Body {
+        token: String,
+        owner: Option<String>,
+    },
 }
 
 impl Line {
     fn token(&self) -> &str {
         match self {
-            Line::Item { token, .. } | Line::Text { token } => token,
+            Line::Item { token, .. } | Line::Text { token } | Line::Body { token, .. } => token,
         }
     }
 }
@@ -391,12 +437,34 @@ fn id_of(prefix: char, word: &str) -> Option<Id> {
     .flatten()
 }
 
+/// Whether a line of a list file continues the item above it: indented and
+/// not blank, as `list::is_continuation` reads it.
+fn is_body(line: &str) -> bool {
+    line.starts_with([' ', '\t']) && !line.trim().is_empty()
+}
+
+/// A body's lines as stdin gives them to `--body` and `amend`; the tool
+/// indents them.
+fn body_text(tokens: &[String]) -> String {
+    tokens.iter().map(|token| format!("- {token}\n")).collect()
+}
+
 fn parse(prefix: char, bytes: &[u8]) -> Vec<Line> {
     let text = String::from_utf8(bytes.to_vec()).expect("the trace writes UTF-8");
     let token = |word: Option<&str>| word.unwrap_or_default().trim_end_matches('.').to_owned();
+    let mut owner: Option<String> = None;
     text.lines()
         .filter_map(|line| {
-            if let Some(item) = line.strip_prefix("- ") {
+            // Indented and not blank: it continues the item above, or none.
+            if line.starts_with([' ', '\t']) && !line.trim().is_empty() {
+                let rest = line.trim_start();
+                let rest = rest.strip_prefix("- ").unwrap_or(rest);
+                return Some(Line::Body {
+                    token: token(rest.split(' ').next()),
+                    owner: owner.clone(),
+                });
+            }
+            let parsed = if let Some(item) = line.strip_prefix("- ") {
                 let mut words = item.split(' ');
                 let first = words.next();
                 Some(match first.and_then(|word| id_of(prefix, word)) {
@@ -413,7 +481,12 @@ fn parse(prefix: char, bytes: &[u8]) -> Vec<Line> {
                 line.strip_prefix("note ").map(|rest| Line::Text {
                     token: token(rest.split(' ').next()),
                 })
-            }
+            };
+            owner = match &parsed {
+                Some(Line::Item { token, .. }) => Some(token.clone()),
+                Some(Line::Text { .. } | Line::Body { .. }) | None => None,
+            };
+            parsed
         })
         .collect()
 }
@@ -430,7 +503,10 @@ struct Run {
 /// What a step's command is about: the token it adds, or the id it closes.
 #[derive(Debug, Clone)]
 enum Subject {
-    Add(String),
+    /// The item's token, and its body's.
+    Add(String, Vec<String>),
+    /// `amend` of an item: its id, the body's new lines, `--replace`.
+    Body(Id, Vec<String>, bool),
     Close(Id),
     /// The item, whether it goes after the target, and the target.
     Move(Id, bool, Id),
@@ -458,7 +534,8 @@ impl Subject {
             Subject::Block(number, token) => Some((*number, token, "block")),
             Subject::Amend(number, token) => Some((*number, token, "amend")),
             Subject::Report(number, token) => Some((*number, token, "report")),
-            Subject::Add(_)
+            Subject::Add(..)
+            | Subject::Body(..)
             | Subject::Close(_)
             | Subject::Move(..)
             | Subject::Retitle(..)
@@ -473,8 +550,10 @@ impl Subject {
     fn input(&self) -> Option<String> {
         match self {
             Subject::Amend(_, token) | Subject::Report(_, token) => Some(format!("body {token}\n")),
+            Subject::Add(_, body) if !body.is_empty() => Some(body_text(body)),
+            Subject::Body(_, lines, _) => Some(body_text(lines)),
             Subject::Block(..)
-            | Subject::Add(_)
+            | Subject::Add(..)
             | Subject::Close(_)
             | Subject::Move(..)
             | Subject::Retitle(..)
@@ -497,6 +576,8 @@ struct Effect {
     brief: Option<(String, u32)>,
     /// A line deleted or moved while its id is being published.
     published: bool,
+    /// Body lines typed below an item.
+    body_added: Vec<String>,
 }
 
 /// Counts of what the trace went through, for the depth check.
@@ -530,6 +611,19 @@ struct Depth {
     items_moved: u32,
     moves_not_pushed: u32,
     items_retitled: u32,
+    /// `add … --body`, `amend`, `amend --replace` with lines and without,
+    /// that succeeded.
+    bodies_added: u32,
+    bodies_appended: u32,
+    bodies_replaced: u32,
+    bodies_removed: u32,
+    /// Body lines one clone wrote, dropped for the other clone's write of
+    /// that body, made without them: the merge kept one side whole.
+    body_conflicts: u32,
+    /// Body lines gone for a later write of their item's body (I9).
+    body_lines_superseded: u32,
+    /// Body lines typed or deleted by hand.
+    body_lines_by_hand: u32,
 }
 
 impl Depth {
@@ -562,6 +656,13 @@ impl Depth {
         self.items_moved += other.items_moved;
         self.moves_not_pushed += other.moves_not_pushed;
         self.items_retitled += other.items_retitled;
+        self.bodies_added += other.bodies_added;
+        self.bodies_appended += other.bodies_appended;
+        self.bodies_replaced += other.bodies_replaced;
+        self.bodies_removed += other.bodies_removed;
+        self.body_conflicts += other.body_conflicts;
+        self.body_lines_superseded += other.body_lines_superseded;
+        self.body_lines_by_hand += other.body_lines_by_hand;
     }
 }
 
@@ -571,7 +672,69 @@ struct Place {
     ids: BTreeSet<Id>,
     /// Ids that were here and then were not (I3).
     gone: BTreeSet<Id>,
+    /// Item and free-text tokens (I4); body lines go by I7 to I9.
     tokens: BTreeSet<String>,
+    /// Body tokens, for I9.
+    body_tokens: BTreeSet<String>,
+}
+
+/// A write of an item's body, as the oracle knows it for I9.
+#[derive(Debug, Clone)]
+struct BodyWrite {
+    /// In the order the trace made them.
+    id: usize,
+    who: Who,
+    change: BodyChange,
+    /// The item's body lines its writer had: on the clone, and for a
+    /// command, on the remote it pulls.
+    seen: BTreeSet<String>,
+    /// The body writes its writer knew of: its clone's, and for a command
+    /// online, the remote's, which it pulls first.
+    knew: BTreeSet<usize>,
+}
+
+impl BodyWrite {
+    /// Whether `other`'s writer knew of this write: it came before.
+    fn before(&self, other: &BodyWrite) -> bool {
+        other.knew.contains(&self.id)
+    }
+
+    /// Whether this write may take `token` out of the body: a replace, a
+    /// delete of that line, or a write made without the line, which the
+    /// merge keeps whole over the one with it (SPEC.md, Sync: the clone's
+    /// side when it changed the body, else the remote's).
+    fn may_drop(&self, token: &str) -> bool {
+        match &self.change {
+            BodyChange::Replace(_) => true,
+            // A delete by hand is the clone's file, written without the
+            // lines it had not seen: the merge keeps it whole as well.
+            BodyChange::Remove(removed) => removed == token || !self.seen.contains(token),
+            BodyChange::Append(_) => !self.seen.contains(token),
+        }
+    }
+}
+
+/// A write of an item's body, by a command or by hand, as the oracle
+/// expects it to change the body it is applied to.
+#[derive(Debug, Clone)]
+enum BodyChange {
+    /// These lines after the body: `add --body`, `amend`, a line typed by
+    /// hand below the item.
+    Append(Vec<String>),
+    /// These lines in place of the body: `amend --replace` (none: removed).
+    Replace(Vec<String>),
+    /// This line deleted by hand.
+    Remove(String),
+}
+
+impl BodyChange {
+    fn apply(&self, body: &[String]) -> Vec<String> {
+        match self {
+            BodyChange::Append(lines) => [body, lines].concat(),
+            BodyChange::Replace(lines) => lines.clone(),
+            BodyChange::Remove(token) => body.iter().filter(|t| *t != token).cloned().collect(),
+        }
+    }
 }
 
 struct Oracle<'w> {
@@ -609,6 +772,28 @@ struct Oracle<'w> {
     /// A clone whose command was killed after its push landed: the next
     /// command there has to work.
     healing: [bool; 2],
+    /// Per body token, the item it was written under (I7).
+    body_owner: BTreeMap<String, String>,
+    /// Per body token, the write that made it (I9).
+    body_step: BTreeMap<String, usize>,
+    /// Per item token, the writes of its body.
+    body_writes: BTreeMap<String, Vec<BodyWrite>>,
+    /// Body writes so far, to number them.
+    body_write_count: usize,
+    /// Per item token, every body seen in any place so far (I8).
+    bodies_seen: BTreeMap<String, BTreeSet<Vec<String>>>,
+    /// The writes of bodies in this step.
+    body_changes: Vec<(String, BodyChange)>,
+    /// The body writes each place knows of: A, B, the remote. A clone
+    /// learns the remote's when a command or a sync there pulls, the remote
+    /// the clone's when it pushes; when that is unsure (a kill, a refusal),
+    /// nothing is learned, which only lets I9 excuse more.
+    knows: [BTreeSet<usize>; 3],
+    /// Per clone, body writes saved into its files during a push of its
+    /// own (a window edit): after that push's commit, so they reach the
+    /// remote only with the clone's next push; `true` once that push may
+    /// carry them.
+    late: [(BTreeSet<usize>, bool); 2],
     depth: Depth,
 }
 
@@ -631,8 +816,94 @@ impl<'w> Oracle<'w> {
             online: [true; 2],
             unpushed: [false; 2],
             healing: [false; 2],
+            body_owner: BTreeMap::new(),
+            body_step: BTreeMap::new(),
+            body_writes: BTreeMap::new(),
+            body_write_count: 0,
+            bodies_seen: BTreeMap::new(),
+            body_changes: Vec::new(),
+            knows: Default::default(),
+            late: Default::default(),
             depth: Depth::default(),
         }
+    }
+
+    /// A write of `item`'s body by `who`, as it will be tried: refused or
+    /// not, it may be the change the places show next. `pulls`: a command,
+    /// which writes on what the remote has as well as the clone; a hand
+    /// edit writes on the clone's file alone.
+    fn body_write(&mut self, who: Who, item: &str, change: BodyChange, pulls: bool) {
+        self.body_write_late(who, item, change, pulls, false);
+    }
+
+    /// [`Oracle::body_write`]; `late`: a hand edit saved during the clone's
+    /// own push, which that push does not carry.
+    fn body_write_late(
+        &mut self,
+        who: Who,
+        item: &str,
+        change: BodyChange,
+        pulls: bool,
+        late: bool,
+    ) {
+        let tokens = match &change {
+            BodyChange::Append(lines) | BodyChange::Replace(lines) => lines.clone(),
+            BodyChange::Remove(_) => Vec::new(),
+        };
+        let pulls = pulls && self.online[who.slot()];
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let places = if pulls {
+            vec![who.slot(), 2]
+        } else {
+            vec![who.slot()]
+        };
+        for place in places {
+            seen.extend(self.bodies(place).remove(item).unwrap_or_default());
+        }
+        let id = self.body_write_count;
+        self.body_write_count += 1;
+        let mut knew = self.knows[who.slot()].clone();
+        if pulls {
+            knew.extend(self.knows[2].iter().copied());
+        }
+        self.knows[who.slot()].insert(id);
+        if late {
+            self.late[who.slot()] = (BTreeSet::from([id]), false);
+        }
+        for token in &tokens {
+            self.body_owner.insert(token.clone(), item.to_owned());
+            self.body_step.insert(token.clone(), id);
+        }
+        self.body_writes
+            .entry(item.to_owned())
+            .or_default()
+            .push(BodyWrite {
+                id,
+                who,
+                change: change.clone(),
+                seen,
+                knew,
+            });
+        self.body_changes.push((item.to_owned(), change));
+    }
+
+    /// A command or a sync of `who` pulled the remote, and pushed if
+    /// `pushed`: the body writes each side knew of, the other knows now.
+    fn learned(&mut self, who: Who, pushed: bool) {
+        let remote = self.knows[2].clone();
+        self.knows[who.slot()].extend(remote);
+        if pushed {
+            let (late, carried) = &mut self.late[who.slot()];
+            let clone: BTreeSet<usize> = if *carried {
+                late.clear();
+                self.knows[who.slot()].clone()
+            } else {
+                self.knows[who.slot()].difference(late).copied().collect()
+            };
+            self.knows[2].extend(clone);
+        }
+        // The next push of this clone carries what was saved during this one.
+        self.late[who.slot()].1 = true;
     }
 
     fn machine(&self, who: Who) -> Machine<'w> {
@@ -672,7 +943,7 @@ impl<'w> Oracle<'w> {
                 Line::Item {
                     id: Some((p, n)), ..
                 } if p == prefix => Some(n),
-                Line::Item { .. } | Line::Text { .. } => None,
+                Line::Item { .. } | Line::Text { .. } | Line::Body { .. } => None,
             })
             .collect()
     }
@@ -793,12 +1064,56 @@ impl<'w> Oracle<'w> {
                 let group = if *group { "Home" } else { "Work" };
                 (
                     owned(&["add", "chore", &token, "--group", group, "--check", "x"]),
-                    Subject::Add(token),
+                    Subject::Add(token, Vec::new()),
                 )
             }
             Op::AddBacklog => {
                 let token = self.token();
-                (owned(&["add", "backlog", &token]), Subject::Add(token))
+                (
+                    owned(&["add", "backlog", &token]),
+                    Subject::Add(token, Vec::new()),
+                )
+            }
+            Op::AddWithBody { backlog } => {
+                let token = self.token();
+                let body = vec![self.token(), self.token()];
+                self.body_write(who, &token, BodyChange::Append(body.clone()), true);
+                let mut args = if *backlog {
+                    owned(&["add", "backlog", &token])
+                } else {
+                    owned(&["add", "chore", &token, "--group", "Home", "--check", "x"])
+                };
+                args.push("--body".to_owned());
+                (args, Subject::Add(token, body))
+            }
+            Op::Body {
+                backlog,
+                item,
+                replace,
+                lines,
+            } => {
+                let prefix = if *backlog { 'b' } else { 'c' };
+                let id = pick(self, prefix, item);
+                // An append of no line is a usage error: one at least.
+                let count = if *replace { *lines } else { (*lines).max(1) };
+                let lines: Vec<String> = (0..count).map(|_| self.token()).collect();
+                if let Some(item) = self.owners.get(&id).cloned() {
+                    let change = if *replace {
+                        BodyChange::Replace(lines.clone())
+                    } else {
+                        BodyChange::Append(lines.clone())
+                    };
+                    self.body_write(who, &item, change, true);
+                } else {
+                    for token in &lines {
+                        self.body_owner.insert(token.clone(), "no item".to_owned());
+                    }
+                }
+                let mut args = owned(&["amend", &format!("{prefix}{}", id.1)]);
+                if *replace {
+                    args.push("--replace".to_owned());
+                }
+                (args, Subject::Body(id, lines, *replace))
             }
             Op::Done(index) => {
                 let id = pick(self, 'c', index);
@@ -1066,7 +1381,7 @@ impl<'w> Oracle<'w> {
                                 publishing.push((file, at));
                             }
                             Some(Line::Item { id: None, .. }) => candidates.push((file, at)),
-                            Some(Line::Text { .. }) | None => {}
+                            Some(Line::Text { .. } | Line::Body { .. }) | None => {}
                         }
                     }
                 }
@@ -1081,21 +1396,97 @@ impl<'w> Oracle<'w> {
                 let (path, prefix) = FILES[file];
                 let mut lines = lines_of(path);
                 let token = parse(prefix, lines[at].as_bytes())[0].token().to_owned();
+                // An item is its line and its body, as in an editor: moved
+                // or deleted whole.
+                let end = at
+                    + 1
+                    + lines[at + 1..]
+                        .iter()
+                        .take_while(|line| is_body(line))
+                        .count();
                 match edit {
                     Edit::Change(_) => {
                         let mark = self.token();
                         lines[at] = format!("{} {mark}", lines[at]);
                     }
                     Edit::Move(_, to) => {
-                        let line = lines.remove(at);
-                        lines.insert(to.index(lines.len() + 1), line);
+                        let block: Vec<String> = lines.drain(at..end).collect();
+                        // Between blocks, never inside another item's body.
+                        let places: Vec<usize> = (0..=lines.len())
+                            .filter(|place| lines.get(*place).is_none_or(|line| !is_body(line)))
+                            .collect();
+                        let place = places[to.index(places.len())];
+                        lines.splice(place..place, block);
                     }
                     _ => {
-                        lines.remove(at);
+                        lines.drain(at..end);
                         effect.deleted.push(token);
                     }
                 }
                 (path.to_owned(), lines)
+            }
+            Edit::BodyLine(index) => {
+                // An item with an id of the clone: the merge keeps an item's
+                // body by its id.
+                let mut candidates = Vec::new();
+                for (file, (path, prefix)) in FILES.iter().enumerate() {
+                    for (at, line) in lines_of(path).iter().enumerate() {
+                        if let Some(Line::Item { id: Some(_), token }) =
+                            parse(*prefix, line.as_bytes()).first()
+                        {
+                            candidates.push((file, at, token.clone()));
+                        }
+                    }
+                }
+                if candidates.is_empty() {
+                    return None;
+                }
+                let (file, at, item) = index.get(&candidates).clone();
+                let mut lines = lines_of(FILES[file].0);
+                let end = at
+                    + 1
+                    + lines[at + 1..]
+                        .iter()
+                        .take_while(|line| is_body(line))
+                        .count();
+                let token = self.token();
+                lines.insert(end, format!("  - {token}"));
+                effect.body_added.push(token.clone());
+                self.body_write_late(who, &item, BodyChange::Append(vec![token]), false, window);
+                self.depth.body_lines_by_hand += 1;
+                (FILES[file].0.to_owned(), lines)
+            }
+            Edit::DeleteBodyLine(index) => {
+                let mut candidates = Vec::new();
+                for (file, (path, prefix)) in FILES.iter().enumerate() {
+                    let lines = lines_of(path);
+                    let parsed = parse(*prefix, lines.join("\n").as_bytes());
+                    // `parse` drops lines it does not read: match by text.
+                    for (at, line) in lines.iter().enumerate() {
+                        if !is_body(line) {
+                            continue;
+                        }
+                        let found = parsed.iter().find(|parsed| {
+                            matches!(parsed, Line::Body { token, .. } if line.trim_start() == format!("- {token}"))
+                        });
+                        if let Some(Line::Body {
+                            token,
+                            owner: Some(item),
+                        }) = found
+                        {
+                            candidates.push((file, at, token.clone(), item.clone()));
+                        }
+                    }
+                }
+                if candidates.is_empty() {
+                    return None;
+                }
+                let (file, at, token, item) = index.get(&candidates).clone();
+                let mut lines = lines_of(FILES[file].0);
+                lines.remove(at);
+                self.body_write_late(who, &item, BodyChange::Remove(token), false, window);
+                self.depth.body_lines_by_hand += 1;
+                (FILES[file].0.to_owned(), lines)
             }
             Edit::Brief(pick) => {
                 let briefs = self.briefs(who.slot());
@@ -1167,6 +1558,11 @@ impl<'w> Oracle<'w> {
         self.places[who.slot()]
             .tokens
             .extend(effect.added.iter().cloned());
+        // In the clone's file from then on, seen or not: a write that lost
+        // them breaks I9.
+        self.places[who.slot()]
+            .body_tokens
+            .extend(effect.body_added.iter().cloned());
         self.added.extend(effect.added);
         self.closed.extend(effect.deleted);
         if effect.published {
@@ -1178,6 +1574,10 @@ impl<'w> Oracle<'w> {
     }
 
     fn step(&mut self, step: &Step) -> Result<(), TestCaseError> {
+        // A step's body writes stand for all of its checks: the commands a
+        // step runs first (to bring a brief or an item there) check the
+        // places too, before the write they prepare has run.
+        self.body_changes.clear();
         match step {
             Step::RejectPushes(pushes) => {
                 self.world.reject_pushes(u32::from(*pushes));
@@ -1221,6 +1621,7 @@ impl<'w> Oracle<'w> {
             Some(0) => {
                 self.depth.succeeded += 1;
                 prop_assert_eq!(&run.stdout, "synced\n");
+                self.learned(who, true);
             }
             Some(3) => {
                 self.depth.not_pushed += 1;
@@ -1300,12 +1701,13 @@ impl<'w> Oracle<'w> {
             Op::File { .. } => &["reported"],
             Op::AddChore { .. }
             | Op::AddBacklog
+            | Op::AddWithBody { .. }
             | Op::Done(_)
             | Op::Drop(_)
             | Op::NewBrief
             | Op::Queue { .. }
             | Op::Next => return Ok(()),
-            Op::Move { backlog, .. } | Op::Retitle { backlog, .. } => {
+            Op::Move { backlog, .. } | Op::Retitle { backlog, .. } | Op::Body { backlog, .. } => {
                 return self.prepare_list(who, *backlog);
             }
         };
@@ -1524,7 +1926,7 @@ impl<'w> Oracle<'w> {
         }
         if run.code.is_none()
             && matches!(fault, Some(Fault::KillAfterPush))
-            && matches!(&subject, Subject::Add(token) if self.added.contains(token))
+            && matches!(&subject, Subject::Add(token, _) if self.added.contains(token))
         {
             self.healing[slot] = true;
         }
@@ -1611,6 +2013,7 @@ impl<'w> Oracle<'w> {
                     matches!(
                         subject,
                         Subject::Close(_)
+                            | Subject::Body(..)
                             | Subject::Move(..)
                             | Subject::Retitle(..)
                             | Subject::Queue(_)
@@ -1631,7 +2034,7 @@ impl<'w> Oracle<'w> {
                 prop_assert!(
                     matches!(
                         subject,
-                        Subject::Add(_) | Subject::NewBrief(_) | Subject::Next
+                        Subject::Add(..) | Subject::NewBrief(_) | Subject::Next
                     ),
                     "{run:?}"
                 );
@@ -1643,8 +2046,11 @@ impl<'w> Oracle<'w> {
             self.notes(who, run)?;
         }
         let pushed = run.code == Some(0) && !run.stderr.contains("board: not pushed: ");
+        if run.code == Some(0) && !offline {
+            self.learned(who, pushed);
+        }
         match subject {
-            Subject::Add(token) => {
+            Subject::Add(token, body) => {
                 let on_remote: Vec<Id> = self
                     .read(2)
                     .into_iter()
@@ -1652,7 +2058,7 @@ impl<'w> Oracle<'w> {
                     .filter(|line| line.token() == token)
                     .filter_map(|line| match line {
                         Line::Item { id, .. } => id,
-                        Line::Text { .. } => None,
+                        Line::Text { .. } | Line::Body { .. } => None,
                     })
                     .collect();
                 match run.code {
@@ -1664,6 +2070,14 @@ impl<'w> Oracle<'w> {
                             on_remote.iter().map(|(p, n)| format!("{p}{n}")).collect();
                         prop_assert_eq!(&shown, &vec![printed.to_owned()], "{:?}", run);
                         self.added.insert(token.clone());
+                        if !body.is_empty() {
+                            self.depth.bodies_added += 1;
+                        }
+                        // Written, so in the clone and on the remote: a loss
+                        // breaks I9 at once.
+                        for place in [who.slot(), 2] {
+                            self.places[place].body_tokens.extend(body.iter().cloned());
+                        }
                     }
                     None if matches!(fault, Some(Fault::KillAfterPush))
                         && !on_remote.is_empty() =>
@@ -1672,9 +2086,42 @@ impl<'w> Oracle<'w> {
                     }
                     Some(_) | None => {
                         self.never.insert(token.clone());
+                        self.never.extend(body.iter().cloned());
                     }
                 }
             }
+            Subject::Body(id, lines, replace) => match run.code {
+                Some(0) => {
+                    prop_assert_eq!(&run.stdout, &format!("amended {}{}\n", id.0, id.1));
+                    let places = if pushed {
+                        vec![who.slot(), 2]
+                    } else {
+                        vec![who.slot()]
+                    };
+                    for place in places {
+                        self.places[place].body_tokens.extend(lines.iter().cloned());
+                    }
+                    match (replace, lines.is_empty()) {
+                        (false, _) => self.depth.bodies_appended += 1,
+                        (true, false) => self.depth.bodies_replaced += 1,
+                        (true, true) => self.depth.bodies_removed += 1,
+                    }
+                }
+                Some(1) => {
+                    let last = run.stderr.lines().last().unwrap_or_default();
+                    prop_assert!(
+                        last.starts_with(&format!("board: amend {}{}: ", id.0, id.1))
+                            && (last.ends_with("no such chore")
+                                || last.ends_with("no such backlog item")),
+                        "{:?}",
+                        run
+                    );
+                    prop_assert!(!self.ids_in(who.slot(), id.0).contains(&id.1), "{:?}", run);
+                    self.never.extend(lines.iter().cloned());
+                }
+                // Killed: written or not.
+                Some(_) | None => {}
+            },
             Subject::Close(id) => {
                 let token = self.owners.get(id).cloned();
                 let here = self.ids_in(who.slot(), id.0).contains(&id.1);
@@ -1845,13 +2292,15 @@ impl<'w> Oracle<'w> {
             _ => self.world.remote_file(path),
         };
         // Line by line, so that a heading or a blank line is a line too:
-        // the moved item has to be next to its target, nothing between.
+        // the moved item has to be next to its target, nothing between but
+        // the target's body, which an item has below it wherever it is.
         String::from_utf8(bytes.unwrap_or_default())
             .unwrap()
             .lines()
+            .filter(|line| !is_body(line))
             .map(|line| match parse(prefix, line.as_bytes()).first() {
                 Some(Line::Item { id, .. }) => *id,
-                Some(Line::Text { .. }) | None => None,
+                Some(Line::Text { .. } | Line::Body { .. }) | None => None,
             })
             .collect()
     }
@@ -1934,13 +2383,13 @@ impl<'w> Oracle<'w> {
                         id: Some(found),
                         token,
                     } if found == id => Some(token),
-                    Line::Item { .. } | Line::Text { .. } => None,
+                    Line::Item { .. } | Line::Text { .. } | Line::Body { .. } => None,
                 })
         })
     }
 
     /// A `move` run: what it printed, and the item next to its target in
-    /// the place it wrote to (directly: the trace writes no indented lines),
+    /// the place it wrote to (past the target's body, if it has one),
     /// which puts a chore into the target's group; refused only for an id
     /// that is not there.
     fn judge_move(
@@ -2195,7 +2644,58 @@ impl<'w> Oracle<'w> {
             self.check_briefs(place)?;
         }
         self.check_place(2)?;
-        self.check_briefs(2)
+        self.check_briefs(2)?;
+        for place in 0..3 {
+            for (item, body) in self.bodies(place) {
+                self.bodies_seen.entry(item).or_default().insert(body);
+            }
+        }
+        Ok(())
+    }
+
+    /// Per item of a place, by token, its body: the tokens of the lines
+    /// below it, in order.
+    fn bodies(&self, place: usize) -> BTreeMap<String, Vec<String>> {
+        let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (_, lines) in self.read(place) {
+            for line in lines {
+                match line {
+                    Line::Item { token, .. } => {
+                        bodies.entry(token).or_default();
+                    }
+                    Line::Body {
+                        token,
+                        owner: Some(owner),
+                    } => {
+                        bodies.entry(owner).or_default().push(token);
+                    }
+                    Line::Body { owner: None, .. } | Line::Text { .. } => {}
+                }
+            }
+        }
+        bodies
+    }
+
+    /// I8: the bodies an item may have now: one seen before, or one this
+    /// step's writes make of one, in any order. A body that is neither is
+    /// a mix of two sides' lines, or a line lost or applied twice.
+    fn bodies_allowed(&self, item: &str) -> BTreeSet<Vec<String>> {
+        let mut allowed = self.bodies_seen.get(item).cloned().unwrap_or_default();
+        allowed.insert(Vec::new());
+        let changes: Vec<&BodyChange> = self
+            .body_changes
+            .iter()
+            .filter(|(of, _)| of == item)
+            .map(|(_, change)| change)
+            .collect();
+        for _ in 0..changes.len().min(3) {
+            let more: Vec<Vec<String>> = allowed
+                .iter()
+                .flat_map(|body| changes.iter().map(move |change| change.apply(body)))
+                .collect();
+            allowed.extend(more);
+        }
+        allowed
     }
 
     /// I6, and no brief of a `new brief` that failed.
@@ -2276,7 +2776,9 @@ impl<'w> Oracle<'w> {
         let name = ["A", "B", "the remote"][place];
         let mut ids = BTreeSet::new();
         let mut tokens = BTreeSet::new();
+        let mut body_tokens = BTreeSet::new();
         for (file, lines) in self.read(place) {
+            let mut item_tokens = BTreeSet::new();
             let mut file_ids = BTreeSet::new();
             let mut file_tokens = BTreeSet::new();
             for line in &lines {
@@ -2294,6 +2796,23 @@ impl<'w> Oracle<'w> {
                     token,
                     name
                 );
+                if let Line::Body { token, owner } = line {
+                    // I7: below the item it was written under, or nowhere:
+                    // never under another, never loose.
+                    let written_under = self.body_owner.get(token);
+                    prop_assert!(
+                        written_under.is_some() && owner.as_ref() == written_under,
+                        "I7: body line {} is under {:?} in file {} of {}, written under {:?}",
+                        token,
+                        owner,
+                        file,
+                        name,
+                        written_under
+                    );
+                    body_tokens.insert(token.clone());
+                    continue;
+                }
+                item_tokens.insert(token.clone());
                 if let Line::Item { id, .. } = line {
                     match id {
                         Some(id) => {
@@ -2325,8 +2844,60 @@ impl<'w> Oracle<'w> {
                 }
             }
             ids.extend(file_ids);
-            tokens.extend(file_tokens);
+            tokens.extend(item_tokens);
         }
+        // I8: each item's body is one seen before, or this step's writes
+        // made of one.
+        let bodies = self.bodies(place);
+        for (item, body) in &bodies {
+            let allowed = self.bodies_allowed(item);
+            prop_assert!(
+                allowed.contains(body),
+                "I8: the body of {} in {} is {:?}, not a body any side had: {:?}",
+                item,
+                name,
+                body,
+                allowed
+            );
+        }
+        // I9: a body line leaves an item that stays only for another write
+        // of its body that did not come before it and could drop it (see
+        // `BodyWrite::may_drop`): a lone write is never lost.
+        for token in self.places[place].body_tokens.difference(&body_tokens) {
+            let item = &self.body_owner[token];
+            if !bodies.contains_key(item) {
+                continue;
+            }
+            let writes = &self.body_writes[item];
+            let made = writes
+                .iter()
+                .find(|write| write.id == self.body_step[token])
+                .expect("a body line comes from a write");
+            let droppers: Vec<&BodyWrite> = writes
+                .iter()
+                .filter(|write| write.id != made.id && !write.before(made) && write.may_drop(token))
+                .collect();
+            let dropped_by = !droppers.is_empty();
+            // The other clone's write, made without knowing of this one:
+            // the two met, and the merge kept one side whole.
+            if droppers
+                .iter()
+                .any(|write| write.who != made.who && !made.before(write))
+            {
+                self.depth.body_conflicts += 1;
+            }
+            prop_assert!(
+                dropped_by,
+                "I9: body line {} left {} in {} with no write that could drop it: {:?}, now {:?}",
+                token,
+                item,
+                name,
+                writes,
+                bodies.get(item)
+            );
+            self.depth.body_lines_superseded += 1;
+        }
+        self.places[place].body_tokens = body_tokens;
         let seen = &mut self.places[place];
         for id in seen.ids.difference(&ids) {
             seen.gone.insert(*id);
@@ -2367,6 +2938,7 @@ impl<'w> Oracle<'w> {
                 "{:?}",
                 run
             );
+            self.learned(who, true);
             self.notes(who, &run)?;
             if std::mem::take(&mut self.healing[who.slot()]) {
                 self.depth.kill_after_push_healed += 1;
@@ -2530,6 +3102,13 @@ fn the_traces_get_deep() {
     // has it.
     assert!(depth.items_moved > 0, "{depth:?}");
     assert!(depth.items_retitled > 0, "{depth:?}");
+    assert!(depth.bodies_added > 0, "{depth:?}");
+    assert!(depth.bodies_appended > 0, "{depth:?}");
+    assert!(depth.bodies_replaced > 0, "{depth:?}");
+    assert!(depth.bodies_removed > 0, "{depth:?}");
+    assert!(depth.body_conflicts > 0, "{depth:?}");
+    assert!(depth.body_lines_superseded > 0, "{depth:?}");
+    assert!(depth.body_lines_by_hand > 0, "{depth:?}");
     assert!(
         depth.succeeded * 10 >= depth.commands * 6,
         "fewer than 60% of the commands succeeded: {depth:?}"
@@ -2548,6 +3127,22 @@ fn first() -> Index {
         .expect("an Index strategy never rejects");
     while tree.simplify() {}
     tree.current()
+}
+
+/// [`run_example`], and the remote's backlog after it.
+fn run_example_backlog(steps: &[Step]) -> (Depth, String) {
+    let world = World::new();
+    let mut oracle = Oracle::new(&world);
+    let run = steps
+        .iter()
+        .try_for_each(|step| oracle.step(step))
+        .and_then(|()| oracle.quiesce());
+    if let Err(error) = run {
+        panic!("{error}");
+    }
+    let backlog =
+        String::from_utf8(world.remote_file("proj/backlog.md").unwrap_or_default()).unwrap();
+    (oracle.depth, backlog)
 }
 
 fn run_example(steps: &[Step]) -> Depth {
@@ -2702,4 +3297,93 @@ fn a_move_made_offline_meets_the_remote_s() {
     assert!(depth.moves_not_pushed >= 2, "{depth:?}");
     assert!(depth.items_moved >= 3, "{depth:?}");
     assert!(depth.merged_by_line > 0, "{depth:?}");
+}
+
+/// Both clones write one item's body before either has the other's: A
+/// offline, B online, then A syncs. The merge keeps one side's body whole,
+/// the clone's, which changed it: A's; B's lines are gone, nothing is
+/// mixed.
+#[test]
+fn a_body_written_on_both_clones_keeps_one_side_whole() {
+    let cmd = |who, op| Step::Cmd {
+        who,
+        op,
+        fault: None,
+    };
+    let amend = |replace, lines| Op::Body {
+        backlog: true,
+        item: first(),
+        replace,
+        lines,
+    };
+    // Tokens in the order made: b1 is t1 with body t2 t3, b2 is t4; A's
+    // lines come next, then B's.
+    // B's lines lost to A's whole body: a conflict I9 excuses; B's empty
+    // replace loses no line.
+    for (a_writes, b_writes, want, lines_lost) in [
+        (
+            amend(false, 2),
+            amend(false, 1),
+            "  - t2\n  - t3\n  - t5\n  - t6\n",
+            true,
+        ),
+        (amend(true, 2), amend(false, 2), "  - t5\n  - t6\n", true),
+        (
+            amend(false, 1),
+            amend(true, 0),
+            "  - t2\n  - t3\n  - t5\n",
+            false,
+        ),
+    ] {
+        let (depth, backlog) = run_example_backlog(&[
+            cmd(Who::A, Op::AddWithBody { backlog: true }),
+            cmd(Who::A, Op::AddBacklog),
+            Step::Sync { who: Who::B },
+            Step::Net {
+                who: Who::A,
+                online: false,
+            },
+            cmd(Who::A, a_writes),
+            cmd(Who::B, b_writes),
+            Step::Net {
+                who: Who::A,
+                online: true,
+            },
+            Step::Sync { who: Who::A },
+        ]);
+        assert_eq!(backlog, format!("- b1 t1\n{want}- b2 t4\n"));
+        assert_eq!(depth.body_conflicts > 0, lines_lost, "{depth:?}");
+    }
+}
+
+/// A body line typed on A while A's own write pushes lands after that
+/// push's commit: B, replacing the body meanwhile, never had it, and A's
+/// sync keeps A's body whole with it (a review's case: the oracle must not
+/// take the line for pushed with A's write).
+#[test]
+fn a_body_line_saved_during_a_push_goes_out_with_the_next() {
+    run_example(&[
+        Step::Cmd {
+            who: Who::A,
+            op: Op::AddWithBody { backlog: true },
+            fault: None,
+        },
+        Step::Sync { who: Who::B },
+        Step::Cmd {
+            who: Who::A,
+            op: Op::AddChore { group: false },
+            fault: Some(Fault::WindowEdit(Edit::BodyLine(first()))),
+        },
+        Step::Cmd {
+            who: Who::B,
+            op: Op::Body {
+                backlog: true,
+                item: first(),
+                replace: true,
+                lines: 1,
+            },
+            fault: None,
+        },
+        Step::Sync { who: Who::A },
+    ]);
 }
