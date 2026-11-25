@@ -531,18 +531,9 @@ pub(crate) fn move_item(project: &mut Project, wanted: &Move) -> Result<String, 
             )),
         })?;
     for number in changed {
-        project.touched(list_id(kind, number));
+        project.touched(ListId::of(kind, number).expect("an item's id is past 0"));
     }
     Ok(format!("moved {wanted}"))
-}
-
-fn list_id(kind: ListKind, number: u32) -> ListId {
-    match kind {
-        ListKind::Chores => ListId::Chore(ChoreId::new(number).expect("an item's id is past 0")),
-        ListKind::Backlog => {
-            ListId::Backlog(BacklogId::new(number).expect("an item's id is past 0"))
-        }
-    }
 }
 
 /// `(command, past)`: the command names a refusal, the past tense what was

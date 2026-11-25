@@ -1243,8 +1243,9 @@ fn by_hand(id: &str, title: &str) -> String {
 
 /// Every write commits the board files changed by hand first, in every
 /// project: an edited item, a well-named file added by hand. The tool gives
-/// no id: a file's name is its id. What is not the board's (a misnamed file,
-/// a list file of the old kind, a copy) stays untracked.
+/// no id: a file's name is its id, and a list file of the old kind is
+/// committed too, for `migrate` to convert. What is not the board's (a
+/// misnamed file, a copy) stays untracked.
 #[test]
 fn hand_edits_are_committed_and_a_misnamed_file_is_not() {
     let world = World::new();
@@ -1254,7 +1255,7 @@ fn hand_edits_are_committed_and_a_misnamed_file_is_not() {
     a.write("proj/chores/c1.md", &edited);
     a.write("shop/backlog/b7.md", by_hand("b7", "typed"));
     a.write("proj/backlog/notes.md", "not an item\n");
-    a.write("proj/chores.md", "- c9 the old kind\n");
+    a.write("shop/chores.md", "- c9 the old kind\n");
     a.write("README.md", "notes\n");
     a.write("proj/briefs/128-x.md.local", "a copy\n");
     let ran = a.board(&["add", "backlog", "x"]);
@@ -1268,9 +1269,6 @@ fn hand_edits_are_committed_and_a_misnamed_file_is_not() {
         "board: lint: proj/backlog/notes.md: not named as the board names its files \
          (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is \
          not synced\n\
-         board: lint: proj/chores.md: a list file of the older storage, which this version \
-         does not read: its items are not listed, synced or closed until they are converted \
-         to chores/ and backlog/ files\n\
          board: lint: proj/briefs/128-x.md.local: unmerged local version of brief 128; \
          merge it by hand, then delete this file\n"
     );
@@ -1280,12 +1278,15 @@ fn hand_edits_are_committed_and_a_misnamed_file_is_not() {
         by_hand("b7", "typed")
     );
     assert_eq!(
+        text(world.remote_file("shop/chores.md")),
+        "- c9 the old kind\n"
+    );
+    assert_eq!(
         world.remote_log()[..2],
         ["proj: add b1", "board: hand edits"]
     );
     for untracked in [
         "README.md",
-        "proj/chores.md",
         "proj/backlog/notes.md",
         "proj/briefs/128-x.md.local",
     ] {
@@ -1294,8 +1295,7 @@ fn hand_edits_are_committed_and_a_misnamed_file_is_not() {
     assert_eq!(a.main(), world.remote_main());
     assert_eq!(
         a.status(),
-        "?? README.md\n?? proj/backlog/notes.md\n?? proj/briefs/128-x.md.local\n\
-         ?? proj/chores.md\n"
+        "?? README.md\n?? proj/backlog/notes.md\n?? proj/briefs/128-x.md.local\n"
     );
 }
 

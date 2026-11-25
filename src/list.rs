@@ -1,6 +1,6 @@
 //! The line grammar of the old list files (`chores.md`, `backlog.md`),
 //! kept for reading what they held: the ids ever used, counted from their
-//! history (`sync.rs`), and brief 18's conversion of a board to item files,
+//! history (`sync.rs`), and `migrate`'s conversion of a board to item files,
 //! which reads each line as the old writer wrote it. And the inputs the
 //! item commands share: a line of text, a move.
 //!
@@ -86,7 +86,6 @@ fn without_source(check: &[u8]) -> &[u8] {
 /// reading strips, [`has_check`]) or `(from 126)` on a backlog item, naming
 /// an id. The reference keeps its blanks, so it is written back as it was;
 /// empty when there is none, and a backlog text ending in `(126)` is text.
-#[allow(dead_code, reason = "brief 18's conversion reads old lines")]
 pub(crate) fn split_reference(kind: ListKind, text: &[u8]) -> (&[u8], &[u8]) {
     let found = text.strip_suffix(b")").and_then(|inside| {
         let open = inside.iter().rposition(|b| *b == b'(')?;
@@ -108,7 +107,6 @@ pub(crate) fn split_reference(kind: ListKind, text: &[u8]) -> (&[u8], &[u8]) {
 /// Where a chore's check starts, in its line without the reference: at the
 /// last `Check:`, as lint reads it, with the check after it. `None` when the
 /// line has no check lint would count.
-#[allow(dead_code, reason = "brief 18's conversion reads old lines")]
 pub(crate) fn split_check(head: &[u8]) -> Option<(usize, &[u8])> {
     if !has_check(head) {
         return None;
@@ -120,7 +118,6 @@ pub(crate) fn split_check(head: &[u8]) -> Option<(usize, &[u8])> {
 const CHECK: &[u8] = b"Check:";
 
 /// A line continues the item above it when it is indented and not blank.
-#[allow(dead_code, reason = "brief 18's conversion reads old lines")]
 pub(crate) fn is_continuation(content: &[u8]) -> bool {
     matches!(content.first(), Some(b' ' | b'\t')) && !raw::is_blank(content)
 }

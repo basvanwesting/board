@@ -12,6 +12,7 @@ use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
 use crate::item::{Body, Items, Row};
 use crate::lint::{Finding, lint};
 use crate::list::{FindError, Line, Move};
+use crate::migrate;
 use crate::ops::{self, CheckChange, Commits, Filed, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Fetched, Note};
@@ -80,8 +81,40 @@ impl Board {
         &self.root
     }
 
+    /// The project from the files, refused while it has a list file of the
+    /// older storage: every read goes through here.
     pub(crate) fn load(&self) -> Result<Project, Error> {
-        Project::load(&self.root, &self.project)
+        let project = Project::load(&self.root, &self.project)?;
+        project.refuse_old_lists()?;
+        Ok(project)
+    }
+
+    /// Converts the project's list files of the older storage to item
+    /// files, in one write; the one command a project with a list file
+    /// takes.
+    pub fn migrate(&self) -> Result<String, Error> {
+        let now = now()?;
+        let value = sync::write(
+            &self.root,
+            &self.project,
+            "migrate",
+            &*self.notes,
+            Some(&|tx| {
+                if tx.project.old_lists.is_empty() {
+                    return Ok(("nothing to migrate".to_owned(), String::new()));
+                }
+                let migrated = migrate::migrate(&mut tx.project, now).map_err(|unplaced| {
+                    let lines: Vec<String> =
+                        unplaced.iter().map(|line| format!("\n  {line}")).collect();
+                    Error::Refused(format!(
+                        "migrate: nothing converted; fix these lines by hand and run it again:{}",
+                        lines.concat()
+                    ))
+                })?;
+                Ok((migrated.to_string(), migrated.to_string()))
+            }),
+        )?;
+        Ok(value.expect("a write that runs a command gives its value"))
     }
 
     /// The TUI's background fetch, to run on a thread of its own.
@@ -374,13 +407,32 @@ impl Board {
     /// The write loop with no command: hand edits committed, and the clone
     /// and the remote on the same commit. Without the remote the commits
     /// stay on the clone and it is [`Error::NeedsRemote`].
+    ///
+    /// Refused, as every command but `migrate`, for a project with a list
+    /// file of the older storage, before and after: one the sync brought in
+    /// is said at once.
     pub fn sync(&self) -> Result<(), Error> {
-        sync::write::<()>(&self.root, &self.project, "sync", &*self.notes, None).map(drop)
+        self.load()?;
+        sync::write::<()>(&self.root, &self.project, "sync", &*self.notes, None)?;
+        self.load().map(drop)
     }
 
-    /// A write that runs a command; `what` names it in an error.
+    /// A write that runs a command; `what` names it in an error. Refused for
+    /// a project with a list file of the older storage, in the files and in
+    /// the commit it applies to: one can come in with the merge.
     fn command<T>(&self, what: &str, apply: sync::Apply<'_, T>) -> Result<T, Error> {
-        let value = sync::write(&self.root, &self.project, what, &*self.notes, Some(apply))?;
+        self.load()?;
+        let guarded = |tx: &mut sync::Tx| {
+            tx.project.refuse_old_lists()?;
+            apply(tx)
+        };
+        let value = sync::write(
+            &self.root,
+            &self.project,
+            what,
+            &*self.notes,
+            Some(&guarded),
+        )?;
         Ok(value.expect("a write that runs a command gives its value"))
     }
 }

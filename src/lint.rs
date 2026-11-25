@@ -44,10 +44,6 @@ pub enum Problem {
     /// An `.md` file below `briefs/`, `chores/` or `backlog/` that is not
     /// named as the board names its files.
     Misnamed,
-    /// A list file of the storage before item files (`chores.md`,
-    /// `backlog.md`), which is not read: its items are not listed, synced or
-    /// closed until it is converted.
-    OldList,
     /// The local version of a brief or item that lost to the remote's in a
     /// merge.
     LocalCopy(ItemId),
@@ -100,10 +96,6 @@ impl fmt::Display for Problem {
                 "not named as the board names its files (briefs/[done/]<number>-<slug>.md, \
                  chores/c<id>.md, backlog/b<id>.md), so it is not synced",
             ),
-            Problem::OldList => f.write_str(
-                "a list file of the older storage, which this version does not read: its items \
-                 are not listed, synced or closed until they are converted to chores/ and backlog/ files",
-            ),
             Problem::LocalCopy(ItemId::Brief(number)) => write!(
                 f,
                 "unmerged local version of brief {number}; merge it by hand, then delete this file"
@@ -120,8 +112,8 @@ const OPEN_STATUSES: &str =
     "a brief outside briefs/done/ is draft, queued, started, blocked or reported";
 
 /// Every finding of the project, in a fixed order: the chores and the
-/// backlog items by id, the briefs by number, the misnamed files, the old
-/// list files, then the conflict copies.
+/// backlog items by id, the briefs by number, the misnamed files, then the
+/// conflict copies.
 ///
 /// A conflict copy is reported on every lint, and so after every write in its
 /// project, until it is deleted: the merge says so once, and a local version
@@ -140,11 +132,6 @@ pub fn lint(project: &Project) -> Vec<Finding> {
         file: file.clone(),
         line: None,
         problem: Problem::Misnamed,
-    }));
-    findings.extend(project.old_lists.iter().map(|file| Finding {
-        file: file.clone(),
-        line: None,
-        problem: Problem::OldList,
     }));
     findings.extend(project.copies.iter().map(|(file, of)| Finding {
         file: file.clone(),
@@ -363,22 +350,6 @@ mod tests {
                 "shop/briefs/notes.md: not named as the board names its files \
                  (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), \
                  so it is not synced"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_list_file_of_the_older_storage_is_named() {
-        let project = Project {
-            old_lists: vec!["shop/backlog.md".to_owned()],
-            ..shop()
-        };
-        assert_eq!(
-            lines(&project),
-            [
-                "shop/backlog.md: a list file of the older storage, which this version does not \
-                 read: its items are not listed, synced or closed until they are converted to \
-                 chores/ and backlog/ files"
             ]
         );
     }

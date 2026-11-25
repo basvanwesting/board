@@ -133,6 +133,8 @@ enum Command {
     },
     /// Bring the board-data clone and the remote to the same commit
     Sync,
+    /// Convert the project's chores.md and backlog.md, the storage before item files, to a file per item, in one write; until then every other command is refused on the project
+    Migrate,
 }
 
 #[derive(Subcommand)]
@@ -328,6 +330,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::Move { id, place }) => Run::Move(place.of(id)?),
         Some(Command::Retitle { id, text, check }) => retitle(id, text, check)?,
         Some(Command::Sync) => Run::Sync,
+        Some(Command::Migrate) => Run::Migrate,
     };
     // A note is written as it comes, before the command goes on: `waiting
     // for lock` has to show while the command waits.
@@ -373,6 +376,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
             board.sync()?;
             line("synced".to_owned())
         }
+        Run::Migrate => line(board.migrate()?),
         Run::Lint => {
             let findings = board.lint()?;
             if findings.is_empty() {
@@ -409,6 +413,7 @@ enum Run {
     Move(Move),
     Retitle(ListId, Option<Line>, Option<CheckChange>),
     Sync,
+    Migrate,
 }
 
 /// `retitle`: what the command line alone rules out is a usage error, before
@@ -640,6 +645,7 @@ mod docs {
             "<text>" => vec!["Rotate the key"],
             "<group>" => vec!["deploy"],
             "<check>" => vec!["the key's date in the dashboard"],
+            "<name>" => vec!["shop"],
             placeholder if placeholder.starts_with('<') && placeholder.ends_with('>') => {
                 panic!("no sample value for {placeholder}: add one here")
             }

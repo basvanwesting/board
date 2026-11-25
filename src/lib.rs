@@ -11,6 +11,7 @@ pub mod item;
 pub mod lint;
 pub mod list;
 mod merge;
+mod migrate;
 mod ops;
 pub mod project;
 mod raw;

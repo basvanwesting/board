@@ -347,23 +347,6 @@ proj/chores/notes.md: not named as the board names its files (briefs/[done/]<num
     );
 }
 
-/// A board from before item files still has `chores.md` and `backlog.md`,
-/// which this version does not read: said, not shown as an empty board.
-#[test]
-fn lint_names_a_list_file_of_the_older_storage() {
-    let world = World::new();
-    let a = world.a();
-    a.write("proj/backlog.md", "- b1 An old item\n");
-    let found = a.board(&["lint"]).out(1);
-    assert_eq!(
-        found,
-        "proj/backlog.md: a list file of the older storage, which this version does not read: \
-         its items are not listed, synced or closed until they are converted to chores/ and \
-         backlog/ files\n"
-    );
-    assert_eq!(a.board(&["ls", "backlog"]).ok(), "");
-}
-
 #[test]
 fn lint_is_about_this_project_only() {
     let world = World::new();

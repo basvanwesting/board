@@ -47,7 +47,7 @@ use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListKind};
 use crate::lint::{Finding, lint};
 use crate::list::{Entry, IdsExhausted, parse_line};
 use crate::merge::{LocalCopy, merge_trees};
-use crate::project::{BoardPath, Project, ProjectName, copy_paths};
+use crate::project::{BoardPath, Project, ProjectName, copy_paths, is_old_list};
 use crate::raw;
 
 /// Pushes per write. An agent's command has to end rather than retry
@@ -276,7 +276,7 @@ fn item_mark(
 /// The highest id the kind's old list file (`chores.md`, `backlog.md`) ever
 /// held, in the history of `commit`; `None` when it held none.
 ///
-/// A board converted to item files (brief 18) has the ids of its items done
+/// A board converted to item files (`migrate`) has the ids of its items done
 /// before the conversion only there. An added or removed line is read by
 /// the one list-line parser, so "the id of a line" has one definition.
 fn list_mark(
@@ -710,13 +710,15 @@ fn check(root: &Path, git: &Git) -> Result<(), Error> {
 /// in it, and the fast-forward to the result could not bring that file up
 /// to date. Only the board's paths (the one grammar decides): a conflict
 /// copy, a note or a misnamed brief stays out, and nothing else that is
-/// staged is committed with them.
+/// staged is committed with them. And a list file of the older storage:
+/// `migrate` converts the commit, so a list fixed by hand after a refusal
+/// has to be in it.
 fn absorb(git: &Git) -> Result<(), Error> {
     let changed: Vec<String> = git
         .changed_paths()
         .map_err(git_error)?
         .into_iter()
-        .filter(|path| BoardPath::parse(path).is_some())
+        .filter(|path| BoardPath::parse(path).is_some() || is_old_list(path))
         .collect();
     if changed.is_empty() {
         return Ok(());
@@ -786,7 +788,7 @@ fn build<T>(
                 // A command that changed nothing (`next` on an empty queue)
                 // makes no commit: an empty one would be pushed and logged
                 // for every look at the queue.
-                Ok((value, _)) if tx.project.changed.is_empty() => (base, Some(Ok(value))),
+                Ok((value, _)) if !tx.project.has_changes() => (base, Some(Ok(value))),
                 Ok((value, subject)) => (
                     commit(
                         ctx.root,
@@ -875,6 +877,15 @@ fn commit(
             };
             Ok((path.to_string(), entry))
         })
+        .chain(
+            // The list files `migrate` converted: deleted in the same commit
+            // that adds their items.
+            project
+                .old_lists
+                .iter()
+                .filter(|list| list.converted)
+                .map(|list| Ok((list.path.clone(), None))),
+        )
         .collect::<Result<Vec<_>, Error>>()?;
     let tree = write_tree(root, git, base, &files)?;
     git.commit_tree(&tree, &[base], message).map_err(git_error)
@@ -990,7 +1001,9 @@ fn deleted_since_absorb(ctx: &Ctx<'_>) -> Result<bool, Error> {
         .changed_paths()
         .map_err(git_error)?
         .iter()
-        .any(|path| BoardPath::parse(path).is_some() && !ctx.root.join(path).exists()))
+        .any(|path| {
+            (BoardPath::parse(path).is_some() || is_old_list(path)) && !ctx.root.join(path).exists()
+        }))
 }
 
 fn git_error(failure: Failure) -> Error {

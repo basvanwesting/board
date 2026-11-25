@@ -49,6 +49,8 @@ cargo install --path .
 
 The boards live in a second git repository, `board-data`: private, with a remote every machine reaches over https, cloned once per machine at `$BOARD_ROOT` (default `~/Work/board-data`). The clone must be a full one, not shallow (`git clone --depth`): IDs are counted from its history. It must be on branch `main`, with its remote named `origin` and at least one commit; the tool creates everything inside it.
 
+Upgrading from a version that kept chores and backlog in `chores.md` and `backlog.md`: on the machine in use, rebuild and run `board migrate` once in each project's checkout (or `board migrate --board <name>`); keep every other machine closed until it is rebuilt. Until a project is migrated, every other command refuses it and says so, and so it does again if a machine still on the old version writes a list there: `board migrate` folds it in.
+
 A command finds its project's board from the directory it runs in: the path of the git checkout below `~/Work`, with `/` turned into `-` (`~/Work/shop` is `shop`, `~/Work/tools/shop` is `tools-shop`). Elsewhere, name the board yourself: `board ls --board shop`, or `BOARD=shop` in the environment. A project has no setup of its own: its first write creates its directory on the board.
 
 ```text
@@ -102,7 +104,7 @@ The TUI edits no text itself: every action is the CLI command of the same name, 
 
 ## Sync
 
-The tool is the only thing that runs git in the board-data clone, and it pushes: the board is shared data, not code waiting for review. Every write takes a lock, commits any hand edits, fetches and merges, applies the change, commits and pushes; reads never touch the network. Editing an item's or a brief's file in an editor is fine: the next write commits it. `board sync` brings the clone and the remote together without a change of its own; `board lint` checks the files (an item's ID or keys, a brief's number or status, a misnamed file, a leftover `chores.md` or `backlog.md` of the older storage) and is also run after every write. An item or a brief changed on two machines keeps the remote's version, and the other is saved beside it as `<file>.local` for you to merge; an item deleted on one machine is deleted, whatever the other did to it. A write that hands out an ID needs the network, and so does `board next`; other writes commit locally and go out with the next push.
+The tool is the only thing that runs git in the board-data clone, and it pushes: the board is shared data, not code waiting for review. Every write takes a lock, commits any hand edits, fetches and merges, applies the change, commits and pushes; reads never touch the network. Editing an item's or a brief's file in an editor is fine: the next write commits it. `board sync` brings the clone and the remote together without a change of its own; `board lint` checks the files (an item's ID or keys, a brief's number or status, a misnamed file) and is also run after every write. An item or a brief changed on two machines keeps the remote's version, and the other is saved beside it as `<file>.local` for you to merge; an item deleted on one machine is deleted, whatever the other did to it. A write that hands out an ID needs the network, and so does `board next`; other writes commit locally and go out with the next push.
 
 ## The planner skill
 

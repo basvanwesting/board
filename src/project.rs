@@ -13,7 +13,7 @@ use std::str::FromStr;
 use crate::brief::{BadStatus, Brief, Stamp, Status, Transition, TransitionError};
 use crate::error::Error;
 use crate::git::{self, Git, Oid};
-use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
+use crate::id::{BriefId, ItemId, ListId, ListKind};
 use crate::item::{Item, Items};
 use crate::list::FindError;
 
@@ -353,6 +353,17 @@ pub enum BoardPath {
     },
 }
 
+/// Whether `path` is `<project>/chores.md` or `<project>/backlog.md`, a list
+/// file of the storage before item files: outside the board's grammar, but
+/// committed when changed by hand and kept over a delete in a merge, so
+/// that the list `migrate` converts is the one in the files.
+pub(crate) fn is_old_list(path: &str) -> bool {
+    path.split_once('/').is_some_and(|(project, rest)| {
+        ProjectName::parse(project).is_some()
+            && ListKind::ALL.iter().any(|kind| rest == kind.file_name())
+    })
+}
+
 impl BoardPath {
     /// The single path grammar: the worktree scan, the commit of hand edits,
     /// the merge and lint all ask here whether a path is the board's.
@@ -372,7 +383,7 @@ impl BoardPath {
                 let number = kind.parse_id(name.strip_suffix(".md")?.as_bytes())?;
                 return Some(BoardPath::Item {
                     project,
-                    id: list_id(kind, number)?,
+                    id: ListId::of(kind, number)?,
                 });
             }
         }
@@ -509,10 +520,9 @@ pub struct Project {
     /// The tool does not sync them; lint says so.
     pub(crate) misnamed: Vec<String>,
     /// `<project>/chores.md` and `<project>/backlog.md`, the one file per
-    /// kind of the storage before item files, when one is still there: not
-    /// read, so lint says its items are not on the board until it is
-    /// converted.
-    pub(crate) old_lists: Vec<String>,
+    /// kind of the storage before item files, when one is there: only
+    /// `migrate` works on such a project ([`Project::refuse_old_lists`]).
+    pub(crate) old_lists: Vec<OldList>,
     /// The local versions of briefs and items that lost to the remote's in
     /// a merge (`<path>.local`, `.local2`, …), as paths relative to the
     /// board-data root with what they are of. Untracked, so only a load
@@ -522,7 +532,51 @@ pub struct Project {
     pub(crate) changed: BTreeSet<BoardPath>,
 }
 
+/// A list file of the storage before item files, as a load found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OldList {
+    pub(crate) kind: ListKind,
+    /// Relative to the board-data root.
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
+    /// Converted by `migrate`: the write deletes it.
+    pub(crate) converted: bool,
+}
+
+impl OldList {
+    fn new(kind: ListKind, path: String, bytes: Vec<u8>) -> OldList {
+        OldList {
+            kind,
+            path,
+            bytes,
+            converted: false,
+        }
+    }
+}
+
 impl Project {
+    /// Refused while the project has a list file of the older storage, for
+    /// every command but `migrate`, reads included: this version does not
+    /// read the lists, and a board that looks empty, or a write next to
+    /// items it cannot see, is what the refusal prevents. A list can also
+    /// come back after the migration, from a machine still on the old
+    /// binary; `migrate` then folds it in.
+    pub(crate) fn refuse_old_lists(&self) -> Result<(), Error> {
+        let Some(list) = self.old_lists.first() else {
+            return Ok(());
+        };
+        Err(Error::Refused(format!(
+            "{}: a list file of the older storage, which this version does not read; \
+             run `board migrate` to convert it to item files",
+            list.path
+        )))
+    }
+
+    /// Whether a write has something to commit.
+    pub(crate) fn has_changes(&self) -> bool {
+        !self.changed.is_empty() || self.old_lists.iter().any(|list| list.converted)
+    }
+
     /// A project without files, which is also what a project without a
     /// directory is: its board is empty, not missing.
     pub fn empty(name: ProjectName) -> Project {
@@ -669,9 +723,12 @@ impl Project {
             files_below(root, &Path::new(name.as_str()).join(dir), &mut files)?;
         }
         for kind in ListKind::ALL {
-            let old = format!("{name}/{}", kind.file_name());
-            if root.join(&old).is_file() {
-                project.old_lists.push(old);
+            let path = format!("{name}/{}", kind.file_name());
+            let file = root.join(&path);
+            match fs::read(&file) {
+                Ok(bytes) => project.old_lists.push(OldList::new(kind, path, bytes)),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(Error::io("read", &file, source)),
             }
         }
         for relative in files {
@@ -713,6 +770,7 @@ impl Project {
         let dirs = DIRS.map(|dir| format!("{name}/{dir}/"));
         let mut wanted = Vec::new();
         let mut ids = Vec::new();
+        let (mut old_lists, mut old_ids) = (Vec::new(), Vec::new());
         for (id, path) in git.files(commit, name.as_str()).map_err(unreadable)? {
             match BoardPath::parse(&path) {
                 Some(board_path) => {
@@ -722,18 +780,24 @@ impl Project {
                 None if dirs.iter().any(|dir| path.starts_with(dir.as_str())) => {
                     project.not_the_boards(&path);
                 }
-                None if ListKind::ALL
-                    .iter()
-                    .any(|kind| path == format!("{name}/{}", kind.file_name())) =>
+                None if let Some(kind) = ListKind::ALL
+                    .into_iter()
+                    .find(|kind| path == format!("{name}/{}", kind.file_name())) =>
                 {
-                    project.old_lists.push(path);
+                    old_lists.push((kind, path));
+                    old_ids.push(id);
                 }
                 None => {}
             }
         }
-        let blobs = git.blobs(&ids).map_err(unreadable)?;
+        ids.extend(old_ids);
+        let mut blobs = git.blobs(&ids).map_err(unreadable)?;
+        let old_blobs = blobs.split_off(wanted.len());
         for (path, bytes) in wanted.into_iter().zip(blobs) {
             project.add(path, &bytes);
+        }
+        for ((kind, path), bytes) in old_lists.into_iter().zip(old_blobs) {
+            project.old_lists.push(OldList::new(kind, path, bytes));
         }
         Ok(project.sorted())
     }
@@ -800,13 +864,6 @@ fn copy_of(path: &str) -> Option<ItemId> {
 /// board's when the path grammar says so, else misnamed.
 const DIRS: [&str; 3] = ["briefs", "chores", "backlog"];
 
-fn list_id(kind: ListKind, number: u32) -> Option<ListId> {
-    match kind {
-        ListKind::Chores => ChoreId::new(number).map(ListId::Chore),
-        ListKind::Backlog => BacklogId::new(number).map(ListId::Backlog),
-    }
-}
-
 /// Collects every file below `root/dir`, as paths relative to `root`. A
 /// directory that is not there has no files.
 fn files_below(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Error> {
@@ -834,6 +891,7 @@ fn files_below(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::ChoreId;
     use proptest::prelude::*;
 
     fn brief(path: &str) -> Option<(String, u32, String, bool)> {

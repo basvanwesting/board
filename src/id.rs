@@ -31,7 +31,7 @@ impl ListKind {
 
     /// The single file the kind's items were in before they were files of
     /// their own (2026-11-25): its history still holds ids ever used, and
-    /// lint names one still there, which is not read.
+    /// `migrate` converts one still there.
     pub const fn file_name(self) -> &'static str {
         match self {
             ListKind::Chores => "chores.md",
@@ -207,6 +207,14 @@ pub enum ListId {
 }
 
 impl ListId {
+    /// The id of item `number` of a kind; `None` for 0.
+    pub fn of(kind: ListKind, number: u32) -> Option<ListId> {
+        match kind {
+            ListKind::Chores => ChoreId::new(number).map(ListId::Chore),
+            ListKind::Backlog => BacklogId::new(number).map(ListId::Backlog),
+        }
+    }
+
     pub const fn kind(self) -> ListKind {
         match self {
             ListId::Chore(_) => ListKind::Chores,
@@ -218,6 +226,15 @@ impl ListId {
         match self {
             ListId::Chore(id) => id.get(),
             ListId::Backlog(id) => id.get(),
+        }
+    }
+}
+
+impl From<ListId> for ItemId {
+    fn from(id: ListId) -> ItemId {
+        match id {
+            ListId::Chore(id) => ItemId::Chore(id),
+            ListId::Backlog(id) => ItemId::Backlog(id),
         }
     }
 }

@@ -129,7 +129,11 @@ struct Files {
 
 impl Files {
     fn load(&self) -> Event {
-        match Project::load(&self.root, &self.project) {
+        // A list file of the older storage that comes in while the TUI runs
+        // (a sync, a write elsewhere): refused as at the start.
+        match Project::load(&self.root, &self.project)
+            .and_then(|project| project.refuse_old_lists().map(|()| project))
+        {
             Ok(project) => Event::Loaded(Box::new(Data::of(&project))),
             Err(error) => Event::LoadFailed(error.to_string()),
         }
@@ -138,6 +142,7 @@ impl Files {
 
 /// Runs the TUI on the terminal until it quits.
 pub fn run(board: Board) -> Result<(), Error> {
+    board.load()?;
     let (messages, inbox) = mpsc::channel();
     let files = Files {
         root: board.root().to_owned(),
@@ -186,6 +191,7 @@ pub fn run(board: Board) -> Result<(), Error> {
 /// once the worker has ended: nothing of the TUI runs on after it.
 #[doc(hidden)]
 pub fn run_headless(board: Board, keys: &str) -> Result<Vec<u8>, Error> {
+    board.load()?;
     let (messages, inbox) = mpsc::channel();
     let files = Files {
         root: board.root().to_owned(),

@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::id::{BriefId, ItemId, ListId};
-use crate::project::{BoardPath, ProjectName};
+use crate::project::{BoardPath, ProjectName, is_old_list};
 
 /// A tree as path to entry; `B` is what git has for a path (its mode and
 /// blob), compared for equality only.
@@ -36,6 +36,8 @@ enum Key {
     Item(ProjectName, ListId),
     /// Open or filed, under any slug.
     Brief(ProjectName, BriefId),
+    /// A list file of the storage before item files.
+    OldList(String),
     /// Not the board's.
     Other(String),
 }
@@ -44,6 +46,7 @@ fn key(path: &str) -> Key {
     match BoardPath::parse(path) {
         Some(BoardPath::Item { project, id }) => Key::Item(project, id),
         Some(BoardPath::Brief { project, name, .. }) => Key::Brief(project, name.number()),
+        None if is_old_list(path) => Key::OldList(path.to_owned()),
         None => Key::Other(path.to_owned()),
     }
 }
@@ -85,7 +88,9 @@ pub struct LocalCopy<B> {
 ///
 /// A path that is not the board's and that both sides changed keeps the
 /// remote's too, without a copy: the board does not own it, and the clone's
-/// version stays in its history.
+/// version stays in its history. A list file of the older storage the same,
+/// but for a delete: the remote's delete (a migration) loses to the clone's
+/// change, which `migrate` then folds in.
 pub fn merge_trees<B: Clone + Eq>(base: &Tree<B>, ours: &Tree<B>, theirs: &Tree<B>) -> Merge<B> {
     let (base_keys, our_keys, their_keys) = (by_key(base), by_key(ours), by_key(theirs));
     let none = BTreeMap::new();
@@ -135,21 +140,27 @@ pub fn merge_trees<B: Clone + Eq>(base: &Tree<B>, ours: &Tree<B>, theirs: &Tree<
                         merge.tree.remove(path);
                     }
                 } else {
-                    merge.copies.extend(copies(item_id(*id)));
+                    merge.copies.extend(copies(ItemId::from(*id)));
                 }
             }
             Key::Brief(_, number) => merge.copies.extend(copies(ItemId::Brief(*number))),
+            // Deleted by the remote (a migration) and changed on the clone
+            // (a machine on the old binary, offline): the clone's list
+            // stays, so the refusal and `migrate`'s fold-in take it up, not
+            // a silent delete. Changed on both: the remote's, as `Other`.
+            Key::OldList(_) => {
+                if ours.is_empty() {
+                    merge.tree.extend(
+                        theirs
+                            .iter()
+                            .map(|(path, entry)| (path.clone(), entry.clone())),
+                    );
+                }
+            }
             Key::Other(_) => {}
         }
     }
     merge
-}
-
-fn item_id(id: ListId) -> ItemId {
-    match id {
-        ListId::Chore(id) => ItemId::Chore(id),
-        ListId::Backlog(id) => ItemId::Backlog(id),
-    }
 }
 
 fn by_key<B: Clone>(tree: &Tree<B>) -> BTreeMap<Key, BTreeMap<String, B>> {
@@ -249,6 +260,21 @@ mod tests {
     }
 
     #[test]
+    fn an_old_list_changed_on_the_clone_stays_over_the_remote_s_delete() {
+        let base = tree(&[("shop/chores.md", "v0"), ("x/backlog.md", "w0")]);
+        // shop: the remote migrated, the clone changed the list; x: the
+        // other way round.
+        let ours = tree(&[("x/backlog.md", "w1")]);
+        let theirs = tree(&[("shop/chores.md", "v1")]);
+        let merge = merge_trees(&base, &ours, &theirs);
+        assert_eq!(
+            merge.tree,
+            tree(&[("shop/chores.md", "v1"), ("x/backlog.md", "w1")])
+        );
+        assert_eq!(merge.copies, vec![]);
+    }
+
+    #[test]
     fn an_item_deleted_on_one_side_and_changed_on_the_other_is_gone_without_a_copy() {
         let base = tree(&[("shop/backlog/b1.md", "v0"), ("x/backlog/b2.md", "w0")]);
         // b1: the remote deleted it, the clone edited it; b2 the other way.
@@ -315,6 +341,7 @@ mod tests {
             "shop/briefs/1-a.md",
             "shop/briefs/done/1-a.md",
             "shop/briefs/2-b.md",
+            "shop/chores.md",
             "README.md",
         ]);
         prop::collection::btree_map(path.prop_map(str::to_owned), "[xyz]", 0..6)
@@ -323,7 +350,8 @@ mod tests {
     proptest! {
         /// Whatever the trees: an unchanged side never wins over a changed
         /// one, the remote's version of every key is kept or replaced whole
-        /// by the clone's (or, for an item deleted on either side, gone), and
+        /// by the clone's (or, for an item deleted on either side, gone; for
+        /// an old list the remote deleted, the clone's), and
         /// a copy comes only from a key both sides changed.
         #[test]
         fn each_key_comes_from_one_side(base in side(), ours in side(), theirs in side()) {
@@ -340,6 +368,8 @@ mod tests {
                     prop_assert_eq!(&m, &t);
                 } else if both_changed && deleted && matches!(key, Key::Item(..)) {
                     prop_assert!(m.is_empty());
+                } else if both_changed && o.is_empty() && matches!(key, Key::OldList(_)) {
+                    prop_assert_eq!(&m, &t);
                 } else {
                     prop_assert_eq!(&m, &o);
                 }
@@ -347,7 +377,7 @@ mod tests {
                 let kept = match key {
                     Key::Brief(..) => true,
                     Key::Item(..) => !deleted,
-                    Key::Other(_) => false,
+                    Key::OldList(_) | Key::Other(_) => false,
                 };
                 prop_assert_eq!(
                     copied,
