@@ -63,8 +63,8 @@ enum Command {
         question: Text,
     },
     /// Append stdin under a brief's ## Amendments (a blocked brief resumes),
-    /// or to a chore's or backlog item's body, stored indented and without
-    /// its blank lines
+    /// or to a chore's or backlog item's body after a blank line: Markdown,
+    /// stored as given
     Amend {
         /// Like 128, c12 or b41
         id: ItemId,
