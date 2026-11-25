@@ -9,9 +9,10 @@ use crate::brief::{EntryText, Stamp, Status, Text};
 use crate::error::Error;
 use crate::git::{Failure, Git, Oid};
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
+use crate::item::{Body, Items, Row};
 use crate::lint::{Finding, lint};
-use crate::list::{Body, Entry, Line, ListFile, Move};
-use crate::ops::{self, Commits, Filed, NewChore};
+use crate::list::{FindError, Line, Move};
+use crate::ops::{self, CheckChange, Commits, Filed, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Fetched, Note};
 
@@ -112,8 +113,8 @@ impl Board {
     }
 
     /// What `show` prints: a brief's file as it is, open or filed, or an
-    /// item's line without the `- ` and the indented lines below it, which
-    /// are its own, as they are in the file.
+    /// item's line as `ls` prints it and, when it has a body, a blank line
+    /// and the body as its file has it.
     pub fn show(&self, id: ItemId) -> Result<Vec<u8>, Error> {
         let project = self.load()?;
         let refused = |why: String| Error::Refused(format!("show {id}: {why}"));
@@ -123,10 +124,10 @@ impl Board {
                 .map(|file| file.brief.to_bytes())
                 .map_err(|why| refused(ops::no_brief(number, why))),
             ItemId::Chore(chore) => {
-                item(project.list(ListKind::Chores), chore.get()).map_err(refused)
+                shown(project.list(ListKind::Chores), chore.get()).map_err(refused)
             }
             ItemId::Backlog(backlog) => {
-                item(project.list(ListKind::Backlog), backlog.get()).map_err(refused)
+                shown(project.list(ListKind::Backlog), backlog.get()).map_err(refused)
             }
         }
     }
@@ -138,9 +139,10 @@ impl Board {
 
     /// Adds a chore under its group; gives its new id.
     pub fn add_chore(&self, new: &NewChore) -> Result<ChoreId, Error> {
+        let now = now()?;
         self.command("add chore", &|tx| {
             let id = tx.alloc_chore()?;
-            ops::add_chore(&mut tx.project, id, new)?;
+            ops::add_chore(&mut tx.project, id, new, now);
             Ok((id, format!("add {id}")))
         })
     }
@@ -153,15 +155,16 @@ impl Board {
         from: Option<ItemId>,
         body: &Body,
     ) -> Result<BacklogId, Error> {
+        let now = now()?;
         self.command("add backlog", &|tx| {
             let id = tx.alloc_backlog()?;
-            ops::add_backlog(&mut tx.project, id, text, from, body);
+            ops::add_backlog(&mut tx.project, id, text, from, body, now);
             Ok((id, format!("add {id}")))
         })
     }
 
-    /// Changes a chore's or backlog item's line: its text, a chore's check,
-    /// or both; gives what it did, as `retitled c12`.
+    /// Changes a chore's or backlog item's title, a chore's check (set or
+    /// removed), or both; gives what it did, as `retitled c12`.
     ///
     /// # Panics
     ///
@@ -171,7 +174,7 @@ impl Board {
         &self,
         id: ListId,
         text: Option<&Line>,
-        check: Option<&Line>,
+        check: Option<&CheckChange>,
     ) -> Result<String, Error> {
         self.command("retitle", &|tx| {
             let retitled = ops::retitle(&mut tx.project, id, text, check)?;
@@ -188,7 +191,7 @@ impl Board {
         })
     }
 
-    /// Deletes chores' lines, all or none; gives what it did, as `done c12
+    /// Deletes chores' files, all or none; gives what it did, as `done c12
     /// c13`.
     pub fn done(&self, ids: &[ChoreId]) -> Result<String, Error> {
         self.command("done", &|tx| {
@@ -197,7 +200,7 @@ impl Board {
         })
     }
 
-    /// Deletes backlog items' lines, all or none; gives what it did, as
+    /// Deletes backlog items' files, all or none; gives what it did, as
     /// `dropped b41`.
     pub fn drop_items(&self, ids: &[BacklogId]) -> Result<String, Error> {
         self.command("drop", &|tx| {
@@ -477,24 +480,13 @@ fn entry(text: &Text, what: &str) -> Result<EntryText, Error> {
     EntryText::new(text.clone()).map_err(|why| Error::Refused(format!("{what}: {why}")))
 }
 
-/// The line of the one item with this id, else why the id names no single
-/// item.
-fn item(list: &ListFile, number: u32) -> Result<Vec<u8>, String> {
-    list.find_with_indented(number)
-        .map(|(text, indented)| shown_item(text, indented))
-        .map_err(|why| ops::not_one(list.kind(), number, why))
-}
-
-/// A chore or backlog item as `show` prints it: its line without the `- `,
-/// then its body's lines as the file has them. The TUI's `yy` yanks the
-/// same, from this code.
-pub(crate) fn shown_item<'a>(text: &[u8], body: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
-    let mut shown = [text, b"\n"].concat();
-    for line in body {
-        shown.extend_from_slice(line);
-        shown.push(b'\n');
-    }
-    shown
+/// The item with this id as `show` prints it ([`crate::item::Item::shown`]),
+/// else why the id names none.
+fn shown(items: &Items, number: u32) -> Result<Vec<u8>, String> {
+    items
+        .get(number)
+        .map(|item| item.shown(items.kind(), number))
+        .ok_or_else(|| ops::not_one(items.kind(), number, FindError::Missing))
 }
 
 /// What the board shows of a project: the briefs, the chores by group, the
@@ -623,14 +615,14 @@ impl BriefRow {
     }
 }
 
-/// A line of a list that the board shows: free text between the items is
-/// the file's, not the board's.
+/// A row of a kind's listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListRow {
-    /// A `## group` heading, as its name.
+    /// A chores' group, as its name: `ls` prints `## <name>` above its
+    /// chores.
     Group(Vec<u8>),
-    /// An item, as its line without the `- `: the id, when it has one, is
-    /// the first word.
+    /// An item, as its line ([`crate::item::Item::line`]): the id is the
+    /// first word.
     Item(Vec<u8>),
 }
 
@@ -708,12 +700,13 @@ impl Snapshot {
     }
 }
 
-fn list_rows(list: &ListFile) -> Vec<ListRow> {
-    list.entries()
-        .filter_map(|entry| match entry {
-            Entry::Heading(name) => Some(ListRow::Group(name.to_vec())),
-            Entry::Item { text, .. } => Some(ListRow::Item(text.to_vec())),
-            Entry::Text(_) => None,
+fn list_rows(items: &Items) -> Vec<ListRow> {
+    items
+        .rows()
+        .into_iter()
+        .map(|row| match row {
+            Row::Group(name) => ListRow::Group(name.to_vec()),
+            Row::Item(listed) => ListRow::Item(listed.item.line(items.kind(), listed.number)),
         })
         .collect()
 }
@@ -859,18 +852,38 @@ mod tests {
     }
 
     #[test]
-    fn a_list_shows_its_groups_and_items() {
-        let chores = ListFile::parse(
-            ListKind::Chores,
-            b"# Chores\n\nfree text\n##  Home \n- c1 one. Check: x\n  continued\n- no id\n-\n",
-        );
+    fn a_kind_lists_its_groups_by_name_and_its_items_by_order() {
+        let mut chores = Items::new(ListKind::Chores);
+        for (number, text) in [
+            (1, "id: c1\ngroup: Work\norder: 1000\n\n# one\n"),
+            (
+                2,
+                "id: c2\ngroup: Home\norder: 2000\ncheck: x\nfrom: 126\n\n# two.\n",
+            ),
+            (3, "id: c3\ngroup: Home\norder: 1000\n\n# three\n\nbody\n"),
+            (4, "id: c4\ngroup: Home\norder: 1000\n\n# four, tied\n"),
+        ] {
+            chores.insert(number, crate::item::Item::parse(text.as_bytes()));
+        }
         assert_eq!(
             list_rows(&chores),
             [
                 ListRow::Group(b"Home".to_vec()),
-                ListRow::Item(b"c1 one. Check: x".to_vec()),
-                ListRow::Item(b"no id".to_vec()),
+                ListRow::Item(b"c3 three".to_vec()),
+                ListRow::Item(b"c4 four, tied".to_vec()),
+                ListRow::Item(b"c2 two. Check: x  (126)".to_vec()),
+                ListRow::Group(b"Work".to_vec()),
+                ListRow::Item(b"c1 one".to_vec()),
             ]
+        );
+        let mut backlog = Items::new(ListKind::Backlog);
+        backlog.insert(
+            41,
+            crate::item::Item::parse(b"id: b41\norder: 1\nfrom: 126\n\n# Later\n"),
+        );
+        assert_eq!(
+            list_rows(&backlog),
+            [ListRow::Item(b"b41 Later  (from 126)".to_vec())]
         );
     }
 

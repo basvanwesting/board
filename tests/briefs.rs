@@ -723,7 +723,7 @@ fn file_counts_the_trailer_closes_the_backlog_and_moves_the_brief() {
     assert_eq!(header(&world, file, "status").as_deref(), Some("filed"));
     a_stamp(header(&world, file, "filed"));
     assert!(text(world.remote_file(file)).ends_with("## Report\nDone.\n"));
-    assert_eq!(text(world.remote_file("proj/backlog.md")), "- b2 two\n");
+    assert_eq!(world.remote_files("proj/backlog"), ["proj/backlog/b2.md"]);
     // One commit.
     assert_eq!(world.remote_log()[..2], ["proj: filed 1", &log[0][..]]);
     in_step(&world, &a);
@@ -836,13 +836,12 @@ fn file_offline_waits_on_the_clone() {
     let ran = a.board(&["sync"]);
     assert_eq!(ran.code, 0, "{ran:?}");
     assert!(
-        ran.stderr
-            .starts_with("board: merged 1 local commit (by line: proj/backlog.md)"),
+        ran.stderr.starts_with("board: merged 1 local commit\n"),
         "{ran:?}"
     );
     assert_eq!(world.remote_file("proj/briefs/1-x.md"), None);
     assert!(world.remote_file("proj/briefs/done/1-x.md").is_some());
-    assert_eq!(text(world.remote_file("proj/backlog.md")), "- b2 two\n");
+    assert_eq!(world.remote_files("proj/backlog"), ["proj/backlog/b2.md"]);
     in_step(&world, &a);
 }
 
@@ -868,7 +867,7 @@ fn an_item_dropped_while_file_pushes_is_skipped() {
     let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
     assert_eq!(window("window.code"), "0\n");
     assert_eq!(window("window.out"), "dropped b1\n");
-    assert_eq!(text(world.remote_file("proj/backlog.md")), "");
+    assert_eq!(world.remote_files("proj/backlog"), Vec::<String>::new());
     assert!(world.remote_file("proj/briefs/done/1-x.md").is_some());
     in_step(&world, &a);
 }

@@ -21,6 +21,17 @@ impl ListKind {
         }
     }
 
+    /// The directory of a project its items' files are in.
+    pub const fn dir_name(self) -> &'static str {
+        match self {
+            ListKind::Chores => "chores",
+            ListKind::Backlog => "backlog",
+        }
+    }
+
+    /// The single file the kind's items were in before they were files of
+    /// their own (2026-11-25): its history still holds ids ever used, and
+    /// lint names one still there, which is not read.
     pub const fn file_name(self) -> &'static str {
         match self {
             ListKind::Chores => "chores.md",
@@ -32,9 +43,8 @@ impl ListKind {
     /// most `u32::MAX`.
     ///
     /// Leading zeros and overflow are not ids, so every number has one
-    /// spelling and an id is found by searching for it. A word that fails
-    /// here (`c012`, `b41` in `chores.md`) leaves its line without an id, and
-    /// the line gets a fresh one.
+    /// spelling and an id is found by searching for it. A file name that
+    /// fails here (`chores/c012.md`, `chores/b41.md`) is no item's.
     pub fn parse_id(self, word: &[u8]) -> Option<u32> {
         match word {
             [prefix, digits @ ..] if *prefix == self.prefix() as u8 => match digits {

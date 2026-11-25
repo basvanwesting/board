@@ -197,6 +197,86 @@ impl World {
             .collect()
     }
 
+    /// The files below `dir` in the remote's `main` with their bytes, by
+    /// path: two git processes however many files, for a test that reads a
+    /// whole board after every step.
+    pub fn remote_blobs(&self, dir: &str) -> Vec<(String, Vec<u8>)> {
+        let listed = self.git_output(
+            &self.remote(),
+            ["ls-tree", "-r", "main", "--", &format!("{dir}/")],
+        );
+        assert!(listed.status.success());
+        let entries: Vec<(String, String)> = String::from_utf8(listed.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (meta, path) = line.split_once('\t').expect("<mode> <type> <id>\t<path>");
+                let id = meta.split(' ').nth(2).expect("an object id");
+                (path.to_owned(), id.to_owned())
+            })
+            .collect();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the harness reads the remote around the product, not through it"
+        )]
+        let mut command = Command::new("git");
+        self.surroundings(&mut command, &self.root);
+        let mut child = command
+            .current_dir(self.remote())
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("run git");
+        let input: String = entries.iter().map(|(_, id)| format!("{id}\n")).collect();
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        // Written from a thread: git answers as it reads, and an answer
+        // larger than the pipe would stop it before it read the rest.
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child.wait_with_output().expect("wait for git");
+        writer.join().unwrap().expect("write to git");
+        assert!(output.status.success());
+        // `<id> blob <size>\n<bytes>\n` per object, in the order asked.
+        let mut rest = output.stdout.as_slice();
+        entries
+            .into_iter()
+            .map(|(path, _)| {
+                let end = rest
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .expect("a header line");
+                let header = String::from_utf8(rest[..end].to_vec()).unwrap();
+                let size: usize = header.rsplit(' ').next().unwrap().parse().expect("a size");
+                let bytes = rest[end + 1..end + 1 + size].to_vec();
+                rest = &rest[end + 1 + size + 1..];
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    /// The files the remote's commit `rev` changed, from its first parent.
+    pub fn remote_changed(&self, rev: &str) -> Vec<String> {
+        let output = self.git_output(
+            &self.remote(),
+            [
+                "diff",
+                "--name-only",
+                "--no-renames",
+                &format!("{rev}^"),
+                rev,
+            ],
+        );
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The subjects of the remote's commits, newest first.
     pub fn remote_log(&self) -> Vec<String> {
         let output = self.git_output(&self.remote(), ["log", "--format=%s", "main"]);

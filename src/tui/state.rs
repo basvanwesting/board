@@ -15,10 +15,10 @@ use std::fmt;
 use super::data::{BriefItem, Data, ListEntry};
 use super::layout::{self, Areas};
 use super::moves;
-use crate::board::{self, Shown};
+use crate::board::Shown;
 use crate::brief::{Stamp, Status};
-use crate::id::{BacklogId, BriefId, ChoreId, ListKind};
-use crate::list::{self, Move, Side};
+use crate::id::{BacklogId, BriefId, ChoreId, ListId, ListKind};
+use crate::list::{Move, Side};
 use crate::project::BoardPath;
 use crate::sync::{Counts, Fetched};
 
@@ -240,7 +240,6 @@ impl Row {
         match &self.key.as_ref()?.ident {
             Ident::Brief(number, _) => Some(number.to_string()),
             Ident::Id(_) => self.id_word(source.list()?),
-            Ident::Text(_) => None,
         }
     }
 
@@ -256,10 +255,9 @@ impl Row {
 /// What makes a row the same item across reloads: the cursor stays on its
 /// item, not its row (SPEC.md, TUI).
 ///
-/// The id where there is one; an item typed by hand without one is its
-/// text until a write gives it an id. `nth` tells apart rows with one
-/// ident (a hand-typed duplicate id, which lint reports), so the cursor can
-/// still reach the second.
+/// A chore's or backlog item's id, a brief's number and slug. `nth` tells
+/// apart rows with one ident (a brief number on two files, which lint
+/// reports), so the cursor can still reach the second.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ItemKey {
     ident: Ident,
@@ -267,12 +265,11 @@ pub(crate) struct ItemKey {
 }
 
 impl ItemKey {
-    /// The number of a list item's id; `None` for a brief and for an item
-    /// without an id.
+    /// The number of a list item's id; `None` for a brief.
     pub fn id(&self) -> Option<u32> {
         match self.ident {
             Ident::Id(number) => Some(number),
-            Ident::Brief(..) | Ident::Text(_) => None,
+            Ident::Brief(..) => None,
         }
     }
 }
@@ -282,7 +279,6 @@ enum Ident {
     /// Number and slug: the file name.
     Brief(BriefId, String),
     Id(u32),
-    Text(String),
 }
 
 /// Where a list's cursor is.
@@ -1021,17 +1017,26 @@ impl State {
             self.say("the item is gone: nothing to edit".to_owned(), true);
             return Vec::new();
         };
-        let (path, line) = match source.list() {
-            None => (self.brief(source, &row).path.clone(), None),
-            Some(kind) => (
-                BoardPath::List {
+        let path = match source.list() {
+            None => self.brief(source, &row).path.clone(),
+            Some(kind) => {
+                let ListEntry::Item { id, .. } = self.data.list(kind)[row.at].entry else {
+                    unreachable!("an item's row");
+                };
+                BoardPath::Item {
                     project: self.data.project.clone(),
-                    kind,
-                },
-                Some(self.data.list(kind)[row.at].line),
-            ),
+                    id: match kind {
+                        ListKind::Chores => {
+                            ListId::Chore(ChoreId::new(id).expect("an item's id is past 0"))
+                        }
+                        ListKind::Backlog => {
+                            ListId::Backlog(BacklogId::new(id).expect("an item's id is past 0"))
+                        }
+                    },
+                }
+            }
         };
-        vec![Command::Edit { path, line }]
+        vec![Command::Edit { path, line: None }]
     }
 
     fn brief(&self, source: Source, row: &Row) -> &BriefItem {
@@ -1085,9 +1090,8 @@ impl State {
     }
 
     /// `yy`: the whole item, as `board show` prints it, from the same code: a
-    /// brief's file, a chore's or backlog item's line with its body; also an
-    /// item without an id, whose text is there all the same. The bottom
-    /// line says what was taken, never the text.
+    /// brief's file, a chore's or backlog item's line with its body. The
+    /// bottom line says what was taken, never the text.
     fn yank_whole(&mut self) -> Vec<Command> {
         let Some((source, row)) = self.cursor_item() else {
             return Vec::new();
@@ -1098,20 +1102,17 @@ impl State {
                 (brief.text.clone(), brief.row.number.to_string())
             }
             Some(kind) => {
-                let ListEntry::Item { text, indented, .. } = &self.data.list(kind)[row.at].entry
+                let ListEntry::Item { shown, body, .. } = &self.data.list(kind)[row.at].entry
                 else {
                     return Vec::new();
                 };
                 let name = row.id_word(kind).unwrap_or_else(|| "the item".to_owned());
-                let what = if indented.is_empty() {
-                    name
-                } else {
+                let what = if *body {
                     format!("{name} with its body")
+                } else {
+                    name
                 };
-                (
-                    board::shown_item(text, indented.iter().map(Vec::as_slice)),
-                    what,
-                )
+                (shown.clone(), what)
             }
         };
         let text = String::from_utf8_lossy(&text).into_owned();
@@ -1146,40 +1147,6 @@ impl State {
         commands
     }
 
-    /// After a reload, before anything looks for what it holds: the items
-    /// a write gave an id keep their cursor, their preview, their place as
-    /// a run's neighbour and the edit waited for on them ([`follow`]).
-    fn follow_ids(&mut self, before: &Data) {
-        for source in [Source::Chores, Source::Backlog] {
-            let kind = source.list().expect("a list");
-            let rows = all_rows(&self.data, source);
-            let before = all_rows(before, source);
-            let keep = |key: &mut ItemKey| {
-                if let Some(found) = follow(kind, &rows, &before, key) {
-                    *key = found;
-                }
-            };
-            if let Some(key) = &mut self.cursors[source as usize].key {
-                keep(key);
-            }
-            if let Some((shown, key)) = &mut self.preview.shown
-                && *shown == source
-            {
-                keep(key);
-            }
-            if let Some(moving) = &mut self.moving
-                && moving.source == source
-            {
-                keep(&mut moving.place.1);
-            }
-            if let Some((wanted, key)) = &mut self.edit_wanted
-                && *wanted == source
-            {
-                keep(key);
-            }
-        }
-    }
-
     /// Asks which briefs are unpushed, unless an answer is still out: it
     /// answers for now soon enough.
     fn ask_unpushed(&mut self) -> Vec<Command> {
@@ -1207,8 +1174,7 @@ impl State {
     /// New data, from the files or from a new set of unpushed briefs: the
     /// cursors stay on their items, wherever the rows went.
     fn relabel(&mut self, data: Data) {
-        let before = std::mem::replace(&mut self.data, data);
-        self.follow_ids(&before);
+        self.data = data;
     }
 
     /// After a reload: a run of `J`/`K` whose item or neighbour is gone is
@@ -1559,60 +1525,12 @@ impl State {
     }
 }
 
-/// How a note names a list item: its id, else its text.
+/// How a note names a list item: its id.
 fn name_of(kind: ListKind, key: &ItemKey) -> String {
     match &key.ident {
         Ident::Id(number) => format!("{}{number}", kind.prefix()),
-        Ident::Text(text) => text.clone(),
         Ident::Brief(number, _) => number.to_string(),
     }
-}
-
-/// Where `key`'s item is among `rows`, a list's rows after a reload, in
-/// file order: its own row, or, for an item typed by hand that a write has
-/// given an id since, the row with that id. `None` when it is gone.
-///
-/// The key of such an item is its text, and the id changes the text: the
-/// sync that commits a hand-typed line (the one after `e`, say) would
-/// otherwise make it look gone to whatever holds on to it, though it is
-/// still there. A given id is spelled as [`list::with_id`] spells it, the
-/// one spelling the merge relies on too, and is one that `before` (the
-/// rows before the reload) did not have: `b1 X` that was there all along
-/// is not the `X` typed by hand. The `nth` line of one text, with a given
-/// id or without, is the `nth` it was: a sync gives every item without an
-/// id one at once, in file order.
-fn follow(kind: ListKind, rows: &[Row], before: &[Row], key: &ItemKey) -> Option<ItemKey> {
-    if rows.iter().any(|row| row.key.as_ref() == Some(key)) {
-        return Some(key.clone());
-    }
-    let Ident::Text(text) = &key.ident else {
-        return None;
-    };
-    let given = |id: u32| {
-        !before
-            .iter()
-            .any(|row| row.key.as_ref().and_then(ItemKey::id) == Some(id))
-    };
-    let line = format!("- {text}");
-    rows.iter()
-        .filter_map(|row| {
-            let found = row.key.as_ref()?;
-            let spells = match found.ident {
-                Ident::Text(ref other) => other == text,
-                Ident::Id(id) => {
-                    given(id)
-                        && list::with_id(kind, line.as_bytes(), id)
-                            == format!("- {}", row.text).as_bytes()
-                }
-                Ident::Brief(..) => false,
-            };
-            spells.then_some(found)
-        })
-        .nth(key.nth)
-        // A line still without an id is another item: this one would have
-        // its own key still.
-        .filter(|found| found.id().is_some())
-        .cloned()
 }
 
 fn cursor_row(cursor: &Cursor, rows: &[Row]) -> Option<usize> {
@@ -1687,7 +1605,7 @@ fn list_rows(kind: ListKind, data: &Data) -> Vec<Row> {
                 let text = String::from_utf8_lossy(text).into_owned();
                 Row {
                     key: Some(ItemKey {
-                        ident: id.map_or_else(|| Ident::Text(text.clone()), Ident::Id),
+                        ident: Ident::Id(*id),
                         nth: 0,
                     }),
                     text,

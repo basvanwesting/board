@@ -4,8 +4,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use board::{
-    BacklogId, Board, Body, BriefId, BriefRow, ChoreId, CommitCheck, EmptyText, Env, Error, Exit,
-    ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Shown, Side, Slug, Snapshot, Text,
+    BacklogId, Board, Body, BriefId, BriefRow, CheckChange, ChoreId, CommitCheck, EmptyText, Env,
+    Error, Exit, ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Shown, Side, Slug,
+    Snapshot, Text,
 };
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
@@ -105,8 +106,8 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<BacklogId>,
     },
-    /// Change a chore's or backlog item's line: its text, a chore's check, or
-    /// both. Its id, place, reference and body stay
+    /// Change a chore's or backlog item's title, a chore's check, or both.
+    /// Its id, place, reference, body and other keys stay
     // The group alone would print `<TEXT|--check <CHECK>> <ID>`, as if
     // the text came first.
     #[command(
@@ -116,11 +117,11 @@ enum Command {
     Retitle {
         /// Like c12 or b41
         id: ItemId,
-        /// The new text
+        /// The new title
         text: Option<Line>,
-        /// A chore's new check: how to see that it is done
+        /// A chore's new check, how to see that it is done; "" removes it
         #[arg(long)]
-        check: Option<Line>,
+        check: Option<String>,
     },
     /// Put a chore or a backlog item before or after another item of its
     /// list; a chore goes into the group of that item
@@ -145,20 +146,20 @@ enum NewItem {
 
 #[derive(Subcommand)]
 enum AddItem {
-    /// An action of the user's, with how to see that it is done
+    /// An action of the user's, in a group, with how to see that it is done
+    /// when its title does not show it
     Chore {
         text: Line,
-        /// The `## group` heading it goes under; made when missing
+        /// The group it is listed under; a new name makes a new group
         #[arg(long)]
         group: Line,
-        /// How to see that it is done
+        /// How to see that it is done, when the title does not show it
         #[arg(long)]
-        check: Line,
+        check: Option<Line>,
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
-        /// Read the chore's body from stdin, stored indented below its line
-        /// and without its blank lines
+        /// Read the chore's body from stdin: Markdown, stored as given
         #[arg(long)]
         body: bool,
     },
@@ -168,8 +169,7 @@ enum AddItem {
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
-        /// Read the item's body from stdin, stored indented below its line
-        /// and without its blank lines
+        /// Read the item's body from stdin: Markdown, stored as given
         #[arg(long)]
         body: bool,
     },
@@ -182,7 +182,7 @@ struct Place {
     /// Directly above this item
     #[arg(long, value_name = "ID")]
     before: Option<ListId>,
-    /// Directly below this item and the indented lines under it
+    /// Directly below this item
     #[arg(long, value_name = "ID")]
     after: Option<ListId>,
 }
@@ -407,14 +407,25 @@ enum Run {
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
     Move(Move),
-    Retitle(ListId, Option<Line>, Option<Line>),
+    Retitle(ListId, Option<Line>, Option<CheckChange>),
     Sync,
 }
 
 /// `retitle`: what the command line alone rules out is a usage error, before
 /// the board is read.
-fn retitle(id: ItemId, text: Option<Line>, check: Option<Line>) -> Result<Run, Error> {
+fn retitle(id: ItemId, text: Option<Line>, check: Option<String>) -> Result<Run, Error> {
     let what = format!("retitle {id}");
+    let check = check
+        .map(|check| {
+            if check.trim().is_empty() {
+                Ok(CheckChange::Remove)
+            } else {
+                Line::new(&check)
+                    .map(CheckChange::Set)
+                    .map_err(|why| Error::Usage(format!("{what}: --check: {why}")))
+            }
+        })
+        .transpose()?;
     match id {
         ItemId::Brief(_) => Err(Error::Usage(format!(
             "{what}: a brief's title is in its file and its slug in the file name; \
@@ -519,7 +530,8 @@ fn path_line(path: &Path) -> Vec<u8> {
     [path.as_os_str().as_bytes(), b"\n"].concat()
 }
 
-/// Bytes, not text: a list line is shown as the file has it, UTF-8 or not.
+/// Bytes, not text: an item's line is shown as its file has it, UTF-8 or
+/// not.
 fn list_lines(rows: &[ListRow]) -> Vec<u8> {
     let mut lines = Vec::new();
     for row in rows {

@@ -5,52 +5,57 @@
 //! after the next round's fetch, and a command killed before or after its
 //! push.
 //!
-//! An oracle reads the list files of the three places (clone A's files,
-//! clone B's, the remote's `main`) after every step and checks:
+//! An oracle reads the item files, their conflict copies and the briefs of
+//! the three places (clone A's files, clone B's, the remote's `main`) after
+//! every step and checks:
 //!
-//! - I1: no id and no token on two lines of a file;
-//! - I2: an id never carries two tokens, in any place, over the whole trace;
+//! - I1: one file per id, with that id inside; in a place a token is in
+//!   one item's file, and a content token (a body line, a `mark:` value)
+//!   in one item;
+//! - I2: an id never carries two tokens, in any place or copy, over the
+//!   whole trace;
 //! - I3: an id that was in a place and then was not never comes back there;
-//! - I4: a token that left a place was closed (`done`, `drop`, a line
-//!   deleted by hand); free text never leaves;
-//! - I5: the remote has no item without an id, no run exits 4, and both
-//!   clones stay on `main`;
+//! - I4: a token that left a place was closed (`done`, `drop`, `file`, a
+//!   file deleted by hand): no item is lost but by a delete, and a delete
+//!   wins over an edit made on the other side;
+//! - I5: no run exits 4, both clones stay on `main`, and nothing the board
+//!   does not commit (a misnamed file, a conflict copy) is on the remote;
 //! - I6: a brief's status on the remote moves only along the edges of the
 //!   state machine and its number keeps its file there; in every place a
 //!   number is on one file, open or filed;
-//! - I7: a body line is directly below the item it was written under, in
-//!   that item's block as `list::is_continuation` reads it, or nowhere:
-//!   never under another item, never loose after a blank line, a heading or
-//!   free text; so it never outlives its item;
-//! - I8: an item's body in a place is one a place had before, or one the
-//!   step's writes (`add --body`, `amend`, `--replace`, a line typed or
-//!   deleted by hand) make of one: one side's body whole, never a mix of
-//!   two sides' lines, no line applied twice;
-//! - I9: a body line leaves an item that stays only for another write of
-//!   that body that did not come before it and could drop it: a replace, a
-//!   delete of that line, or a write made without the line, which the
-//!   merge keeps whole over it (SPEC.md, Sync: the clone's side when it
-//!   changed the body, else the remote's). A lone write is never lost.
-//!   With I7 and I8 the bodies never touch the items, which I1 to I5 hold
-//!   to with bodies in the files;
-//! - every id a command printed or assigned is on the remote with its token,
-//!   and nothing refused or never pushed is anywhere; a brief `new brief`
+//! - I7: a content token is in the file of the item it was written for, or
+//!   nowhere;
+//! - I8: an item's body in a place or a copy is one a place had before, or
+//!   one the step's writes (`add --body`, `amend`, `--replace`, a line
+//!   typed or deleted by hand) make of one: one writer's body whole, never
+//!   a mix of two clones' writes, no line applied twice;
+//! - I9: a content token leaves an item that stays only for a write that
+//!   saw it and takes it out (`amend --replace`, the line or the `mark:`
+//!   changed by hand), or into a `.local` copy of that item in the clone
+//!   whose version lost: an item both sides changed keeps the remote's
+//!   version (SPEC.md, Sync);
+//! - a conflict note names a copy that is there, of that item, and the item
+//!   stays: a delete that won leaves no copy;
+//! - every id a command printed is on the remote with its token, and
+//!   nothing refused or never pushed is anywhere; a brief `new brief`
 //!   printed is on the remote under its number, and the remote has as many
 //!   more claimed briefs as `next` printed paths; the line `block`, `amend`
 //!   or `report` wrote is in its brief, and one they refused is in none; a
 //!   brief `file` printed is in `done/` there, without the items it says it
-//!   closed; an item `move` moved is directly before or after its target
-//!   where the move was written, and a refused move named an id not there;
-//!   a move never needs the remote (no exit 3);
+//!   closed; after a move that no other write met, the item stands directly
+//!   before or after its target, in its group, in the listing where the
+//!   move was written, and a refused move named an id not there; a move
+//!   never needs the remote (no exit 3);
 //! - convergence, at `Quiesce` and at the end: after `sync` on A, B and A,
-//!   both clones are on the remote's commit with no board file changed,
-//!   every token added and not closed is there once, and every line written
-//!   into a brief, by hand or by a command, is in the brief or in a
-//!   conflict copy of the clone that wrote it.
+//!   both clones are on the remote's commit with nothing changed but the
+//!   copies and the misnamed files, which stay as they were; every token
+//!   added and not closed is there once, and every line written into a
+//!   brief, by hand or by a command, is in the brief or in a conflict copy
+//!   of the clone that wrote it.
 //!
-//! Every item's text, every free-text line and every body line carries a
-//! token (`t7`) used once, so a line applied twice, lost, mixed, given two
-//! ids or put under another item shows.
+//! Every item's title, every body line and every `mark:` carries a token
+//! (`t7`) used once, so a line applied twice, lost, mixed, given two ids or
+//! put into another item shows.
 
 mod common;
 
@@ -95,7 +100,7 @@ enum Op {
         group: bool,
     },
     AddBacklog,
-    /// `add chore|backlog … --body`: an item with a body of a line or two.
+    /// `add chore|backlog … --body`: an item with a body of two lines.
     AddWithBody {
         backlog: bool,
     },
@@ -113,15 +118,15 @@ enum Op {
     /// A backlog item of the clone or the remote, picked when the step runs.
     Drop(Index),
     /// An item of the clone or the remote put before or after another of
-    /// its list, both picked when the step runs.
+    /// its kind, both picked when the step runs.
     Move {
         backlog: bool,
         item: Index,
         target: Index,
         after: bool,
     },
-    /// An item's line changed by `retitle`, its token kept: its text, a
-    /// chore's check, or both (a backlog item's text only).
+    /// An item's title or check changed by `retitle`, its token kept: its
+    /// text, a chore's check, or both (a backlog item's text only).
     Retitle {
         backlog: bool,
         item: Index,
@@ -176,22 +181,21 @@ enum BriefPick {
 /// A change made in an editor, to a clone's files.
 #[derive(Debug, Clone)]
 enum Edit {
-    /// An item without an id.
-    AddIdLess { backlog: bool },
-    /// A line of free text.
-    AddText { backlog: bool },
-    /// An item with an id typed by hand, past every id there is.
-    AddTyped { backlog: bool },
-    /// An item's text changed, its token kept.
-    Change(Index),
-    /// An item's line moved within its file.
-    Move(Index, Index),
-    /// An item's line deleted, with its body.
-    Delete(Index),
-    /// A body line typed below an item with an id, after its body.
+    /// A line typed at the end of an item's body.
     BodyLine(Index),
-    /// A body line deleted.
+    /// A line of an item's body deleted.
     DeleteBodyLine(Index),
+    /// An item's `order:` set to another number, or its `mark:`, a key the
+    /// tool does not know, set to a fresh token.
+    Key { item: Index, order: bool },
+    /// An item's file deleted.
+    Delete(Index),
+    /// A well-named item file with a body line, its id past every id
+    /// there is.
+    AddFile { backlog: bool },
+    /// A file below `chores/` or `backlog/` that is not named as the board
+    /// names its files.
+    AddMisnamed { backlog: bool },
     /// A line added to a brief's body, after the planner's sections when it
     /// has none yet.
     Brief(BriefPick),
@@ -201,9 +205,8 @@ enum Edit {
 enum Fault {
     /// The other clone runs this while the command's first push waits.
     WindowOp(Op),
-    /// A file of the clone is saved while the command's first push waits.
-    /// A delete or a move hits an item without an id that the write
-    /// publishes, added by hand before the write when the clone has none.
+    /// A file of the clone is saved or deleted while the command's first
+    /// push waits.
     WindowEdit(Edit),
     LostAck,
     /// The first push lands only after the second round's fetch.
@@ -244,7 +247,7 @@ fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => any::<bool>().prop_map(|group| Op::AddChore { group }),
         3 => Just(Op::AddBacklog),
-        1 => any::<bool>().prop_map(|backlog| Op::AddWithBody { backlog }),
+        2 => any::<bool>().prop_map(|backlog| Op::AddWithBody { backlog }),
         2 => (any::<bool>(), any::<Index>(), any::<bool>(), 0u8..3)
             .prop_map(|(backlog, item, replace, lines)| Op::Body { backlog, item, replace, lines }),
         2 => any::<Index>().prop_map(Op::Done),
@@ -275,14 +278,12 @@ fn brief_pick() -> impl Strategy<Value = BriefPick> {
 
 fn edit() -> impl Strategy<Value = Edit> {
     prop_oneof![
-        3 => any::<bool>().prop_map(|backlog| Edit::AddIdLess { backlog }),
-        1 => any::<bool>().prop_map(|backlog| Edit::AddText { backlog }),
-        1 => any::<bool>().prop_map(|backlog| Edit::AddTyped { backlog }),
-        2 => any::<Index>().prop_map(Edit::Change),
-        2 => (any::<Index>(), any::<Index>()).prop_map(|(from, to)| Edit::Move(from, to)),
-        2 => any::<Index>().prop_map(Edit::Delete),
-        1 => any::<Index>().prop_map(Edit::BodyLine),
+        2 => any::<Index>().prop_map(Edit::BodyLine),
         1 => any::<Index>().prop_map(Edit::DeleteBodyLine),
+        2 => (any::<Index>(), any::<bool>()).prop_map(|(item, order)| Edit::Key { item, order }),
+        2 => any::<Index>().prop_map(Edit::Delete),
+        2 => any::<bool>().prop_map(|backlog| Edit::AddFile { backlog }),
+        1 => any::<bool>().prop_map(|backlog| Edit::AddMisnamed { backlog }),
         5 => brief_pick().prop_map(Edit::Brief),
     ]
 }
@@ -299,9 +300,61 @@ fn fault() -> impl Strategy<Value = Option<Fault>> {
     ]
 }
 
+/// A move and a write of the same item, one the step's command and the
+/// other the other clone's run in its push's window: picked by one index
+/// from lists the two clones mostly share, so mostly the same item. Left
+/// to `fault()`, the two seldom meet on one item.
+fn met_move() -> impl Strategy<Value = (Op, Op)> {
+    (
+        any::<bool>(),
+        any::<Index>(),
+        any::<Index>(),
+        any::<bool>(),
+        0..3u8,
+    )
+        .prop_map(|(backlog, item, target, after, write)| {
+            let moving = Op::Move {
+                backlog,
+                item,
+                target,
+                after,
+            };
+            let writing = match write {
+                0 => Op::Body {
+                    backlog,
+                    item,
+                    replace: after,
+                    lines: 1,
+                },
+                1 => Op::Retitle {
+                    backlog,
+                    item,
+                    text: true,
+                    check: after,
+                },
+                _ => Op::Move {
+                    backlog,
+                    item,
+                    target,
+                    after: !after,
+                },
+            };
+            if after {
+                (moving, writing)
+            } else {
+                (writing, moving)
+            }
+        })
+}
+
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         10 => (who(), op(), fault()).prop_map(|(who, op, fault)| Step::Cmd { who, op, fault }),
+        1 => (who(), met_move()).prop_map(|(who, (op, window))| Step::Cmd {
+            who,
+            op,
+            fault: Some(Fault::WindowOp(window)),
+        }),
         5 => (who(), edit()).prop_map(|(who, edit)| Step::HandEdit { who, edit }),
         3 => (who(), prop::bool::weighted(0.65)).prop_map(|(who, online)| Step::Net { who, online }),
         2 => who().prop_map(|who| Step::Sync { who }),
@@ -312,12 +365,86 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
-fn steps() -> impl Strategy<Value = Vec<Step>> {
-    prop::collection::vec(step(), 1..=30)
+/// A hand edit of an item on one clone, the other clone's write or delete
+/// of the same item, and the first clone's sync, which merges the two:
+/// a copy where both changed the item, a delete that wins where one
+/// deleted it. Picked by one index, from lists the clones mostly share.
+/// Left to chance, the clones pull too often for their changes to meet.
+fn scene() -> impl Strategy<Value = Vec<Step>> {
+    (
+        who(),
+        any::<bool>(),
+        any::<Index>(),
+        0..3u8,
+        0..4u8,
+        any::<bool>(),
+        any::<Index>(),
+    )
+        .prop_map(|(who, backlog, item, edit, write, flag, target)| {
+            let edit = match edit {
+                0 => Edit::BodyLine(item),
+                1 => Edit::Key { item, order: flag },
+                _ => Edit::Delete(item),
+            };
+            let write = match write {
+                0 => Op::Body {
+                    backlog,
+                    item,
+                    replace: flag,
+                    lines: u8::from(!flag),
+                },
+                1 => Op::Retitle {
+                    backlog,
+                    item,
+                    text: true,
+                    check: flag,
+                },
+                2 => Op::Move {
+                    backlog,
+                    item,
+                    target,
+                    after: flag,
+                },
+                _ if backlog => Op::Drop(item),
+                _ => Op::Done(item),
+            };
+            vec![
+                Step::HandEdit { who, edit },
+                Step::Cmd {
+                    who: who.other(),
+                    op: write,
+                    fault: None,
+                },
+                Step::Sync { who },
+            ]
+        })
 }
 
-/// The list files, with the prefix of their ids.
-const FILES: [(&str, char); 2] = [("proj/chores.md", 'c'), ("proj/backlog.md", 'b')];
+fn steps() -> impl Strategy<Value = Vec<Step>> {
+    prop::collection::vec(
+        prop_oneof![
+            12 => step().prop_map(|step| vec![step]),
+            1 => scene(),
+        ],
+        1..=30,
+    )
+    .prop_map(|scenes| scenes.into_iter().flatten().collect())
+}
+
+/// The item directories, with the prefix of their ids.
+const KINDS: [(&str, char); 2] = [("proj/chores", 'c'), ("proj/backlog", 'b')];
+
+/// The directories of a clone the oracle reads.
+const DIRS: [&str; 4] = [
+    "proj/chores",
+    "proj/backlog",
+    "proj/briefs",
+    "proj/briefs/done",
+];
+
+/// The stamp of a file made by hand: lint wants a `created:`, not a
+/// particular one.
+const CREATED: &str = "created: 2026-11-25T00:00:00Z";
 
 /// What the planner writes below a brief's header before it queues it.
 const SECTIONS: &str = "# By hand\n\n## Task\nt\n## Design\nd\n## Premises\np\n\
@@ -402,35 +529,10 @@ fn brief_seen(path: &str, text: String) -> Option<BriefSeen> {
     })
 }
 
-/// A list id: `('c', 12)`.
+/// An item id: `('c', 12)`.
 type Id = (char, u32);
 
-/// One line of a list file as the oracle reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Line {
-    /// `- [<id> ]<token>[ …]`
-    Item { id: Option<Id>, token: String },
-    /// `note <token>`
-    Text { token: String },
-    /// `  - <token>`: a line of an item's body, indented below it; `owner`
-    /// is the token of the item it continues, as `list::is_continuation`
-    /// reads it, `None` when it continues none (after a blank line, a
-    /// heading or free text).
-    Body {
-        token: String,
-        owner: Option<String>,
-    },
-}
-
-impl Line {
-    fn token(&self) -> &str {
-        match self {
-            Line::Item { token, .. } | Line::Text { token } | Line::Body { token, .. } => token,
-        }
-    }
-}
-
-/// The id a word is in the file of `prefix`, as the tool reads it.
+/// The id a word is, with `prefix`, as the tool reads it.
 fn id_of(prefix: char, word: &str) -> Option<Id> {
     let digits = word.strip_prefix(prefix)?;
     (digits.starts_with(|c: char| ('1'..='9').contains(&c))
@@ -439,58 +541,174 @@ fn id_of(prefix: char, word: &str) -> Option<Id> {
     .flatten()
 }
 
-/// Whether a line of a list file continues the item above it: indented and
-/// not blank, as `list::is_continuation` reads it.
-fn is_body(line: &str) -> bool {
-    line.starts_with([' ', '\t']) && !line.trim().is_empty()
+fn show(id: Id) -> String {
+    format!("{}{}", id.0, id.1)
 }
 
-/// A body's lines as stdin gives them to `--body` and `amend`; the tool
-/// indents them.
+fn item_path(id: Id) -> String {
+    let (dir, _) = KINDS.iter().find(|(_, p)| *p == id.0).expect("a kind");
+    format!("{dir}/{}.md", show(id))
+}
+
+/// A header line as the tool reads one: `^[a-z]+:( |$)`.
+fn is_key_line(line: &str) -> bool {
+    let key = line.bytes().take_while(u8::is_ascii_lowercase).count();
+    key > 0 && matches!(&line.as_bytes()[key..], [b':'] | [b':', b' ', ..])
+}
+
+/// An item's file as the oracle reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ItemSeen {
+    /// From the file name.
+    id: Id,
+    /// The value of `id:`.
+    header_id: Option<String>,
+    /// The title's first word.
+    token: String,
+    title: String,
+    group: Option<String>,
+    /// `None` for no `order:`, or one that is no number.
+    order: Option<i64>,
+    check: Option<String>,
+    /// The value of `mark:`, the key only hand edits write.
+    mark: Option<String>,
+    /// The tokens of the body's `- <token>` lines, in order.
+    body: Vec<String>,
+    /// Lines after the title that no write of the trace makes.
+    odd: Vec<String>,
+    bytes: Vec<u8>,
+}
+
+impl ItemSeen {
+    /// The tokens written into the item besides its title.
+    fn content(&self) -> impl Iterator<Item = &String> {
+        self.body.iter().chain(self.mark.iter())
+    }
+}
+
+fn item_seen(id: Id, bytes: Vec<u8>) -> ItemSeen {
+    let text = String::from_utf8(bytes.clone()).expect("the trace writes UTF-8");
+    let lines: Vec<&str> = text.lines().collect();
+    let header = lines.iter().take_while(|line| is_key_line(line)).count();
+    let mut keys: BTreeMap<&str, &str> = BTreeMap::new();
+    for line in &lines[..header] {
+        let (key, value) = line.split_once(':').expect("a key line");
+        keys.entry(key).or_insert(value.trim());
+    }
+    let after = &lines[header..];
+    let title_at = after.iter().position(|line| !line.trim().is_empty());
+    let title = title_at
+        .and_then(|at| after[at].strip_prefix("# "))
+        .unwrap_or_default()
+        .to_owned();
+    let (mut body, mut odd) = (Vec::new(), Vec::new());
+    for line in title_at.map_or(&[][..], |at| &after[at + 1..]) {
+        match line.strip_prefix("- ") {
+            Some(token) if token.starts_with('t') && !token.contains(' ') => {
+                body.push(token.to_owned());
+            }
+            _ if line.trim().is_empty() => {}
+            _ => odd.push((*line).to_owned()),
+        }
+    }
+    let key = |name: &str| keys.get(name).map(|value| (*value).to_owned());
+    ItemSeen {
+        id,
+        header_id: key("id"),
+        token: title
+            .split(' ')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.')
+            .to_owned(),
+        title,
+        group: key("group"),
+        order: key("order").and_then(|order| order.parse().ok()),
+        check: key("check"),
+        mark: key("mark"),
+        body,
+        odd,
+        bytes,
+    }
+}
+
+/// The ids of a kind's items in the board's order, each with its group:
+/// chores by group name (byte order), then `order`, ties by id; written out
+/// here rather than taken from the tool.
+fn listing(items: &BTreeMap<Id, ItemSeen>, prefix: char) -> Vec<(String, Id)> {
+    let mut listed: Vec<(String, i64, u32)> = items
+        .values()
+        .filter(|item| item.id.0 == prefix)
+        .map(|item| {
+            let group = match prefix {
+                'c' => item.group.clone().unwrap_or_default(),
+                _ => String::new(),
+            };
+            (group, item.order.unwrap_or(i64::MAX), item.id.1)
+        })
+        .collect();
+    listed.sort();
+    listed
+        .into_iter()
+        .map(|(group, _, number)| (group, (prefix, number)))
+        .collect()
+}
+
+/// A body's lines as stdin gives them to `--body` and `amend`.
 fn body_text(tokens: &[String]) -> String {
     tokens.iter().map(|token| format!("- {token}\n")).collect()
 }
 
-fn parse(prefix: char, bytes: &[u8]) -> Vec<Line> {
-    let text = String::from_utf8(bytes.to_vec()).expect("the trace writes UTF-8");
-    let token = |word: Option<&str>| word.unwrap_or_default().trim_end_matches('.').to_owned();
-    let mut owner: Option<String> = None;
-    text.lines()
-        .filter_map(|line| {
-            // Indented and not blank: it continues the item above, or none.
-            if line.starts_with([' ', '\t']) && !line.trim().is_empty() {
-                let rest = line.trim_start();
-                let rest = rest.strip_prefix("- ").unwrap_or(rest);
-                return Some(Line::Body {
-                    token: token(rest.split(' ').next()),
-                    owner: owner.clone(),
-                });
-            }
-            let parsed = if let Some(item) = line.strip_prefix("- ") {
-                let mut words = item.split(' ');
-                let first = words.next();
-                Some(match first.and_then(|word| id_of(prefix, word)) {
-                    Some(id) => Line::Item {
-                        id: Some(id),
-                        token: token(words.next()),
-                    },
-                    None => Line::Item {
-                        id: None,
-                        token: token(first),
-                    },
-                })
-            } else {
-                line.strip_prefix("note ").map(|rest| Line::Text {
-                    token: token(rest.split(' ').next()),
-                })
-            };
-            owner = match &parsed {
-                Some(Line::Item { token, .. }) => Some(token.clone()),
-                Some(Line::Text { .. } | Line::Body { .. }) | None => None,
-            };
-            parsed
-        })
-        .collect()
+/// A file's text with a line added at the end of its body.
+fn with_body_line(bytes: &[u8], token: &str) -> Vec<u8> {
+    let mut text = String::from_utf8(bytes.to_vec()).unwrap();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    // A file that ends at its title gets the blank line that sets a body
+    // off.
+    if text
+        .lines()
+        .last()
+        .is_some_and(|line| line.starts_with("# "))
+    {
+        text.push('\n');
+    }
+    text.push_str(&format!("- {token}\n"));
+    text.into_bytes()
+}
+
+/// A file's text without the body line of `token`.
+fn without_body_line(bytes: &[u8], token: &str) -> Vec<u8> {
+    let line = format!("- {token}");
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .lines()
+        .filter(|l| *l != line)
+        .map(|l| format!("{l}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// A file's text with `key:` set to `value`, in its place, or at the end
+/// of the header.
+fn with_key(bytes: &[u8], key: &str, value: &str) -> Vec<u8> {
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let header = lines.iter().take_while(|line| is_key_line(line)).count();
+    let new = format!("{key}: {value}");
+    match lines[..header]
+        .iter()
+        .position(|line| line.starts_with(&format!("{key}:")))
+    {
+        Some(at) => lines[at] = new,
+        None => lines.insert(header, new),
+    }
+    lines
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>()
+        .into_bytes()
 }
 
 /// What one `board` run did.
@@ -507,13 +725,14 @@ struct Run {
 enum Subject {
     /// The item's token, and its body's.
     Add(String, Vec<String>),
-    /// `amend` of an item: its id, the body's new lines, `--replace`.
-    Body(Id, Vec<String>, bool),
+    /// `amend` of an item: its id, the body's new lines, `--replace`, and
+    /// the write as the oracle recorded it, when it knew the item.
+    Body(Id, Vec<String>, bool, Option<usize>),
     Close(Id),
     /// The item, whether it goes after the target, and the target.
     Move(Id, bool, Id),
-    /// The item, and what its line holds once retitled: the start of its
-    /// text after the id, and a chore's check when one was given.
+    /// The item, and what it holds once retitled: the start of its title,
+    /// and a chore's check when one was given.
     Retitle(Id, String, Option<String>),
     /// The slug, a token.
     NewBrief(String),
@@ -548,12 +767,47 @@ impl Subject {
         }
     }
 
+    /// The item whose file the command changes, and no other's but for a
+    /// renumbering.
+    fn item(&self) -> Option<Id> {
+        match self {
+            Subject::Body(id, ..) | Subject::Move(id, ..) | Subject::Retitle(id, ..) => Some(*id),
+            Subject::Add(..)
+            | Subject::Close(_)
+            | Subject::NewBrief(_)
+            | Subject::Queue(_)
+            | Subject::Next
+            | Subject::Block(..)
+            | Subject::Amend(..)
+            | Subject::Report(..)
+            | Subject::File(..) => None,
+        }
+    }
+
+    /// The items the command deletes.
+    fn closes(&self) -> Vec<Id> {
+        match self {
+            Subject::Close(id) => vec![*id],
+            Subject::File(_, closes) => closes.clone(),
+            Subject::Add(..)
+            | Subject::Body(..)
+            | Subject::Move(..)
+            | Subject::Retitle(..)
+            | Subject::NewBrief(_)
+            | Subject::Queue(_)
+            | Subject::Next
+            | Subject::Block(..)
+            | Subject::Amend(..)
+            | Subject::Report(..) => Vec::new(),
+        }
+    }
+
     /// What the command reads from stdin: the text of `amend` and `report`.
     fn input(&self) -> Option<String> {
         match self {
             Subject::Amend(_, token) | Subject::Report(_, token) => Some(format!("body {token}\n")),
             Subject::Add(_, body) if !body.is_empty() => Some(body_text(body)),
-            Subject::Body(_, lines, _) => Some(body_text(lines)),
+            Subject::Body(_, lines, ..) => Some(body_text(lines)),
             Subject::Block(..)
             | Subject::Add(..)
             | Subject::Close(_)
@@ -567,19 +821,58 @@ impl Subject {
     }
 }
 
+/// A hand edit's change to a clone's files.
+#[derive(Debug, Clone)]
+enum Change {
+    Write(String, Vec<u8>),
+    Remove(String),
+}
+
+/// Which kind of hand edit, for the depth check.
+#[derive(Debug, Clone, Copy)]
+enum Hand {
+    Body,
+    Key,
+    Delete,
+    Add,
+    Misnamed,
+    Brief,
+}
+
+/// A write of an item's content as a hand edit makes it: the item's token,
+/// the content tokens it writes, those it takes out having seen them, and
+/// its change of the body.
+type HandWrite = (String, Vec<String>, BTreeSet<String>, Option<BodyChange>);
+
 /// What a hand edit does, for the oracle to record once it is made.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Effect {
-    /// Tokens added to a list.
-    added: Vec<String>,
-    /// Tokens of lines deleted.
-    deleted: Vec<String>,
+    hand: Hand,
+    /// The token of an item file added.
+    added: Option<String>,
+    /// An item file deleted, and its token.
+    deleted: Option<(Id, String)>,
+    writes: Vec<HandWrite>,
+    /// The item whose file changed or was added.
+    changed: Option<Id>,
     /// A token written into a brief, and the brief's number.
     brief: Option<(String, u32)>,
-    /// A line deleted or moved while its id is being published.
-    published: bool,
-    /// Body lines typed below an item.
-    body_added: Vec<String>,
+    /// A misnamed file made: its path and bytes.
+    misnamed: Option<(String, Vec<u8>)>,
+}
+
+impl Effect {
+    fn new(hand: Hand) -> Effect {
+        Effect {
+            hand,
+            added: None,
+            deleted: None,
+            writes: Vec::new(),
+            changed: None,
+            brief: None,
+            misnamed: None,
+        }
+    }
 }
 
 /// Whether a write tried all eight rounds and none was pushed: the last
@@ -601,10 +894,10 @@ struct Depth {
     refused: u32,
     offline_refused: u32,
     not_pushed_then_pushed: u32,
-    merged_by_line: u32,
-    assigned: u32,
+    /// A write that merged the clone's own commits with the remote's.
+    merged: u32,
     window_edit_settled: u32,
-    published_line_edited: u32,
+    window_delete_of_written: u32,
     brief_conflicts: u32,
     lost_ack_recognised: u32,
     late_landing_recognised: u32,
@@ -620,6 +913,11 @@ struct Depth {
     closed_by_file: u32,
     items_moved: u32,
     moves_not_pushed: u32,
+    /// A move and a write of the same item by the other clone, neither
+    /// knowing of the other: in one push's window, or met at a merge.
+    move_met: u32,
+    /// A move judged that put the item between two of its group.
+    moved_between: u32,
     items_retitled: u32,
     /// `add … --body`, `amend`, `amend --replace` with lines and without,
     /// that succeeded.
@@ -627,13 +925,19 @@ struct Depth {
     bodies_appended: u32,
     bodies_replaced: u32,
     bodies_removed: u32,
-    /// Body lines one clone wrote, dropped for the other clone's write of
-    /// that body, made without them: the merge kept one side whole.
-    body_conflicts: u32,
-    /// Body lines gone for a later write of their item's body (I9).
-    body_lines_superseded: u32,
-    /// Body lines typed or deleted by hand.
+    /// Conflict notes of an item, each with its `.local` copy.
+    local_copies: u32,
+    /// An item deleted on one side and changed on the other, gone.
+    delete_won: u32,
+    /// Content tokens gone for a write that saw them (I9).
+    content_dropped: u32,
+    /// Content tokens gone into a `.local` copy (I9).
+    content_kept_in_copy: u32,
     body_lines_by_hand: u32,
+    keys_by_hand: u32,
+    files_deleted_by_hand: u32,
+    files_added_by_hand: u32,
+    misnamed_by_hand: u32,
 }
 
 impl Depth {
@@ -647,10 +951,9 @@ impl Depth {
         self.refused += other.refused;
         self.offline_refused += other.offline_refused;
         self.not_pushed_then_pushed += other.not_pushed_then_pushed;
-        self.merged_by_line += other.merged_by_line;
-        self.assigned += other.assigned;
+        self.merged += other.merged;
         self.window_edit_settled += other.window_edit_settled;
-        self.published_line_edited += other.published_line_edited;
+        self.window_delete_of_written += other.window_delete_of_written;
         self.brief_conflicts += other.brief_conflicts;
         self.lost_ack_recognised += other.lost_ack_recognised;
         self.late_landing_recognised += other.late_landing_recognised;
@@ -666,14 +969,22 @@ impl Depth {
         self.closed_by_file += other.closed_by_file;
         self.items_moved += other.items_moved;
         self.moves_not_pushed += other.moves_not_pushed;
+        self.move_met += other.move_met;
+        self.moved_between += other.moved_between;
         self.items_retitled += other.items_retitled;
         self.bodies_added += other.bodies_added;
         self.bodies_appended += other.bodies_appended;
         self.bodies_replaced += other.bodies_replaced;
         self.bodies_removed += other.bodies_removed;
-        self.body_conflicts += other.body_conflicts;
-        self.body_lines_superseded += other.body_lines_superseded;
+        self.local_copies += other.local_copies;
+        self.delete_won += other.delete_won;
+        self.content_dropped += other.content_dropped;
+        self.content_kept_in_copy += other.content_kept_in_copy;
         self.body_lines_by_hand += other.body_lines_by_hand;
+        self.keys_by_hand += other.keys_by_hand;
+        self.files_deleted_by_hand += other.files_deleted_by_hand;
+        self.files_added_by_hand += other.files_added_by_hand;
+        self.misnamed_by_hand += other.misnamed_by_hand;
     }
 }
 
@@ -683,56 +994,35 @@ struct Place {
     ids: BTreeSet<Id>,
     /// Ids that were here and then were not (I3).
     gone: BTreeSet<Id>,
-    /// Item and free-text tokens (I4); body lines go by I7 to I9.
+    /// Item tokens (I4).
     tokens: BTreeSet<String>,
-    /// Body tokens, for I9.
-    body_tokens: BTreeSet<String>,
+    /// Content tokens (I9).
+    content: BTreeSet<String>,
+    /// Each item's file.
+    files: BTreeMap<Id, Vec<u8>>,
 }
 
-/// A write of an item's body, as the oracle knows it for I9.
+/// A write of an item's content, by a command or by hand, as I9 needs it.
 #[derive(Debug, Clone)]
-struct BodyWrite {
+struct ContentWrite {
     /// In the order the trace made them.
     id: usize,
-    who: Who,
-    change: BodyChange,
-    /// The item's body lines its writer had: on the clone, and for a
-    /// command, on the remote it pulls.
-    seen: BTreeSet<String>,
-    /// The body writes its writer knew of: its clone's, and for a command
-    /// online, the remote's, which it pulls first.
-    knew: BTreeSet<usize>,
+    /// The item's token.
+    item: String,
+    /// The content tokens it may take out, having seen them: every body
+    /// line a replace saw, the one line or `mark:` a hand edit changes.
+    drops: BTreeSet<String>,
 }
 
-impl BodyWrite {
-    /// Whether `other`'s writer knew of this write: it came before.
-    fn before(&self, other: &BodyWrite) -> bool {
-        other.knew.contains(&self.id)
-    }
-
-    /// Whether this write may take `token` out of the body: a replace, a
-    /// delete of that line, or a write made without the line, which the
-    /// merge keeps whole over the one with it (SPEC.md, Sync: the clone's
-    /// side when it changed the body, else the remote's).
-    fn may_drop(&self, token: &str) -> bool {
-        match &self.change {
-            BodyChange::Replace(_) => true,
-            // A delete by hand is the clone's file, written without the
-            // lines it had not seen: the merge keeps it whole as well.
-            BodyChange::Remove(removed) => removed == token || !self.seen.contains(token),
-            BodyChange::Append(_) => !self.seen.contains(token),
-        }
-    }
-}
-
-/// A write of an item's body, by a command or by hand, as the oracle
-/// expects it to change the body it is applied to.
+/// A write of an item's body, as the oracle expects it to change the body
+/// it is applied to (I8).
 #[derive(Debug, Clone)]
 enum BodyChange {
     /// These lines after the body: `add --body`, `amend`, a line typed by
-    /// hand below the item.
+    /// hand.
     Append(Vec<String>),
-    /// These lines in place of the body: `amend --replace` (none: removed).
+    /// These lines in place of the body: `amend --replace` (none: removed),
+    /// a file added by hand.
     Replace(Vec<String>),
     /// This line deleted by hand.
     Remove(String),
@@ -748,6 +1038,52 @@ impl BodyChange {
     }
 }
 
+/// What the oracle reads of one place.
+#[derive(Debug, Default)]
+struct Snapshot {
+    items: BTreeMap<Id, ItemSeen>,
+    /// Conflict copies: the path, and the copy as read, of its item's id.
+    copies: Vec<(String, ItemSeen)>,
+    /// Files below `chores/` and `backlog/` that are neither.
+    other: Vec<String>,
+    briefs: Vec<BriefSeen>,
+}
+
+impl Snapshot {
+    fn read(files: Vec<(String, Vec<u8>)>) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        'files: for (path, bytes) in files {
+            for (dir, prefix) in KINDS {
+                let Some(name) = path.strip_prefix(&format!("{dir}/")) else {
+                    continue;
+                };
+                if let Some(id) = name.strip_suffix(".md").and_then(|n| id_of(prefix, n)) {
+                    snapshot.items.insert(id, item_seen(id, bytes));
+                } else if let Some((stem, suffix)) = name.split_once(".md.local")
+                    && let Some(id) = id_of(prefix, stem)
+                    && suffix.bytes().all(|b| b.is_ascii_digit())
+                {
+                    snapshot.copies.push((path.clone(), item_seen(id, bytes)));
+                } else {
+                    snapshot.other.push(path.clone());
+                }
+                continue 'files;
+            }
+            let text = String::from_utf8(bytes).expect("the trace writes UTF-8");
+            snapshot.briefs.extend(brief_seen(&path, text));
+        }
+        snapshot
+            .briefs
+            .sort_by_key(|brief| (brief.number, brief.filed, brief.name.clone()));
+        snapshot
+    }
+
+    /// An item by its token.
+    fn by_token(&self, token: &str) -> Option<&ItemSeen> {
+        self.items.values().find(|item| item.token == token)
+    }
+}
+
 struct Oracle<'w> {
     world: &'w World,
     tokens: u32,
@@ -755,14 +1091,14 @@ struct Oracle<'w> {
     places: [Place; 3],
     /// Every id ever seen, with its token (I2).
     owners: BTreeMap<Id, String>,
-    /// Tokens added to a list by a command that succeeded or by hand.
+    /// Tokens of items added by a command that succeeded or by hand.
     added: BTreeSet<String>,
     /// Tokens of adds that were refused, not pushed or killed before their
-    /// push: never anywhere.
+    /// push, and of content a refused command wrote: never anywhere.
     never: BTreeSet<String>,
-    /// Tokens whose line was deleted, by `done`, `drop` or by hand.
+    /// Tokens of items deleted, by `done`, `drop`, `file` or by hand.
     closed: BTreeSet<String>,
-    /// Tokens of a `done` or `drop` that was killed: closed or not.
+    /// Tokens of a `done`, `drop` or `file` that was killed: closed or not.
     maybe_closed: BTreeSet<String>,
     /// Lines written into briefs: token, writer, brief number.
     brief_lines: Vec<(String, Who, u32)>,
@@ -775,7 +1111,7 @@ struct Oracle<'w> {
     /// Tokens of lines `block`, `amend` or `report` were refused to write:
     /// in no brief anywhere.
     lines_never: BTreeSet<String>,
-    /// The highest id typed by hand so far, per list.
+    /// The highest id given by hand so far, per kind.
     typed: BTreeMap<char, u32>,
     online: [bool; 2],
     /// A clone with commits a write said it did not push.
@@ -783,28 +1119,35 @@ struct Oracle<'w> {
     /// A clone whose command was killed after its push landed: the next
     /// command there has to work.
     healing: [bool; 2],
-    /// Per body token, the item it was written under (I7).
-    body_owner: BTreeMap<String, String>,
-    /// Per body token, the write that made it (I9).
-    body_step: BTreeMap<String, usize>,
-    /// Per item token, the writes of its body.
-    body_writes: BTreeMap<String, Vec<BodyWrite>>,
-    /// Body writes so far, to number them.
-    body_write_count: usize,
-    /// Per item token, every body seen in any place so far (I8).
+    /// Per content token, the token of the item it was written for (I7).
+    content_owner: BTreeMap<String, String>,
+    /// Per content token, the write that made it (I9).
+    content_made: BTreeMap<String, usize>,
+    writes: Vec<ContentWrite>,
+    /// Per item token, every body seen in any place or copy so far (I8).
     bodies_seen: BTreeMap<String, BTreeSet<Vec<String>>>,
     /// The writes of bodies in this step.
     body_changes: Vec<(String, BodyChange)>,
-    /// The body writes each place knows of: A, B, the remote. A clone
-    /// learns the remote's when a command or a sync there pulls, the remote
-    /// the clone's when it pushes; when that is unsure (a kill, a refusal),
-    /// nothing is learned, which only lets I9 excuse more.
-    knows: [BTreeSet<usize>; 3],
-    /// Per clone, body writes saved into its files during a push of its
-    /// own (a window edit): after that push's commit, so they reach the
-    /// remote only with the clone's next push; `true` once that push may
-    /// carry them.
-    late: [(BTreeSet<usize>, bool); 2],
+    /// The clone whose command or sync runs: a delete of the remote's item
+    /// in its step is its push.
+    actor: Option<Who>,
+    /// Per clone, the items it changed that its pushes have not carried
+    /// yet, and the same at the start of the step: a merge in the step
+    /// deletes them only for a delete of the other side.
+    pending: [BTreeSet<Id>; 2],
+    pending_at_step: [BTreeSet<Id>; 2],
+    /// Per clone, the items it deleted and has not pushed, with the
+    /// remote's file as it was then.
+    deletes_pending: [BTreeMap<Id, Vec<u8>>; 2],
+    /// Per clone, the items it moved and has not pushed.
+    moves_pending: [BTreeSet<Id>; 2],
+    /// Per clone, the items the other clone moved and pushed since this
+    /// one last pulled.
+    moves_unseen: [BTreeSet<Id>; 2],
+    /// Per clone, the item tokens it closed in this step.
+    closed_in_step: [BTreeSet<String>; 2],
+    /// Misnamed files made by hand: the clone, the path, the bytes.
+    misnamed: Vec<(Who, String, Vec<u8>)>,
     depth: Depth,
 }
 
@@ -827,94 +1170,66 @@ impl<'w> Oracle<'w> {
             online: [true; 2],
             unpushed: [false; 2],
             healing: [false; 2],
-            body_owner: BTreeMap::new(),
-            body_step: BTreeMap::new(),
-            body_writes: BTreeMap::new(),
-            body_write_count: 0,
+            content_owner: BTreeMap::new(),
+            content_made: BTreeMap::new(),
+            writes: Vec::new(),
             bodies_seen: BTreeMap::new(),
             body_changes: Vec::new(),
-            knows: Default::default(),
-            late: Default::default(),
+            actor: None,
+            pending: Default::default(),
+            pending_at_step: Default::default(),
+            deletes_pending: Default::default(),
+            moves_pending: Default::default(),
+            moves_unseen: Default::default(),
+            closed_in_step: Default::default(),
+            misnamed: Vec::new(),
             depth: Depth::default(),
         }
     }
 
-    /// A write of `item`'s body by `who`, as it will be tried: refused or
-    /// not, it may be the change the places show next. `pulls`: a command,
-    /// which writes on what the remote has as well as the clone; a hand
-    /// edit writes on the clone's file alone.
-    fn body_write(&mut self, who: Who, item: &str, change: BodyChange, pulls: bool) {
-        self.body_write_late(who, item, change, pulls, false);
-    }
-
-    /// [`Oracle::body_write`]; `late`: a hand edit saved during the clone's
-    /// own push, which that push does not carry.
-    fn body_write_late(
+    /// A write of `item`'s content, as it will be tried: refused or not, it
+    /// may be the change the places show next.
+    fn content_write(
         &mut self,
-        who: Who,
         item: &str,
-        change: BodyChange,
-        pulls: bool,
-        late: bool,
-    ) {
-        let tokens = match &change {
-            BodyChange::Append(lines) | BodyChange::Replace(lines) => lines.clone(),
-            BodyChange::Remove(_) => Vec::new(),
-        };
-        let pulls = pulls && self.online[who.slot()];
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let places = if pulls {
-            vec![who.slot(), 2]
-        } else {
-            vec![who.slot()]
-        };
-        for place in places {
-            seen.extend(self.bodies(place).remove(item).unwrap_or_default());
+        tokens: &[String],
+        drops: BTreeSet<String>,
+        change: Option<BodyChange>,
+    ) -> usize {
+        let id = self.writes.len();
+        for token in tokens {
+            self.content_owner.insert(token.clone(), item.to_owned());
+            self.content_made.insert(token.clone(), id);
         }
-        let id = self.body_write_count;
-        self.body_write_count += 1;
-        let mut knew = self.knows[who.slot()].clone();
-        if pulls {
-            knew.extend(self.knows[2].iter().copied());
+        self.writes.push(ContentWrite {
+            id,
+            item: item.to_owned(),
+            drops,
+        });
+        if let Some(change) = change {
+            self.body_changes.push((item.to_owned(), change));
         }
-        self.knows[who.slot()].insert(id);
-        if late {
-            self.late[who.slot()] = (BTreeSet::from([id]), false);
-        }
-        for token in &tokens {
-            self.body_owner.insert(token.clone(), item.to_owned());
-            self.body_step.insert(token.clone(), id);
-        }
-        self.body_writes
-            .entry(item.to_owned())
-            .or_default()
-            .push(BodyWrite {
-                id,
-                who,
-                change: change.clone(),
-                seen,
-                knew,
-            });
-        self.body_changes.push((item.to_owned(), change));
+        id
     }
 
-    /// A command or a sync of `who` pulled the remote, and pushed if
-    /// `pushed`: the body writes each side knew of, the other knows now.
-    fn learned(&mut self, who: Who, pushed: bool) {
-        let remote = self.knows[2].clone();
-        self.knows[who.slot()].extend(remote);
-        if pushed {
-            let (late, carried) = &mut self.late[who.slot()];
-            let clone: BTreeSet<usize> = if *carried {
-                late.clear();
-                self.knows[who.slot()].clone()
-            } else {
-                self.knows[who.slot()].difference(late).copied().collect()
-            };
-            self.knows[2].extend(clone);
+    /// The body lines of an item a command of `who` sees: the clone's, and
+    /// online the remote's, which it pulls. More than it may see (a merge
+    /// keeps one of the two), which only lets I9 excuse more.
+    fn seen_body(&self, who: Who, id: Id) -> BTreeSet<String> {
+        let mut places = vec![who.slot()];
+        if self.online[who.slot()] {
+            places.push(2);
         }
-        // The next push of this clone carries what was saved during this one.
-        self.late[who.slot()].1 = true;
+        places
+            .into_iter()
+            .flat_map(|place| {
+                self.read(place)
+                    .items
+                    .get(&id)
+                    .map(|item| item.body.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     fn machine(&self, who: Who) -> Machine<'w> {
@@ -929,81 +1244,48 @@ impl<'w> Oracle<'w> {
         format!("t{}", self.tokens)
     }
 
-    /// The lines of a place's list files: 0 and 1 are the clones' files, 2
-    /// the remote's `main`.
-    fn read(&self, place: usize) -> Vec<(usize, Vec<Line>)> {
-        FILES
-            .iter()
-            .enumerate()
-            .map(|(file, (path, prefix))| {
-                let bytes = match place {
-                    0 => self.world.a().file(path),
-                    1 => self.world.b().file(path),
-                    _ => self.world.remote_file(path),
-                };
-                (file, parse(*prefix, &bytes.unwrap_or_default()))
-            })
-            .collect()
-    }
-
-    fn ids_in(&self, place: usize, prefix: char) -> Vec<u32> {
-        self.read(place)
-            .into_iter()
-            .flat_map(|(_, lines)| lines)
-            .filter_map(|line| match line {
-                Line::Item {
-                    id: Some((p, n)), ..
-                } if p == prefix => Some(n),
-                Line::Item { .. } | Line::Text { .. } | Line::Body { .. } => None,
-            })
-            .collect()
-    }
-
-    /// The brief files of a place: 0 and 1 are the clones' files, 2 the
-    /// remote's `main`.
-    fn briefs(&self, place: usize) -> Vec<BriefSeen> {
-        let files: Vec<(String, String)> = match place {
+    /// The files of a place: 0 and 1 are the clones' files, 2 the remote's
+    /// `main`.
+    fn read(&self, place: usize) -> Snapshot {
+        let files = match place {
             0 | 1 => {
                 let machine = if place == 0 {
                     self.world.a()
                 } else {
                     self.world.b()
                 };
-                ["proj/briefs", "proj/briefs/done"]
-                    .into_iter()
+                DIRS.into_iter()
                     .flat_map(|dir| {
-                        let entries = fs::read_dir(machine.data().join(dir));
-                        entries
+                        fs::read_dir(machine.data().join(dir))
                             .into_iter()
                             .flatten()
                             .map(|entry| entry.unwrap())
                             .filter(|entry| entry.file_type().unwrap().is_file())
                             .map(move |entry| {
-                                format!("{dir}/{}", entry.file_name().to_string_lossy())
+                                let path = format!("{dir}/{}", entry.file_name().to_string_lossy());
+                                (path, fs::read(entry.path()).unwrap())
                             })
-                    })
-                    .map(|path| {
-                        let text = String::from_utf8(machine.file(&path).unwrap()).unwrap();
-                        (path, text)
                     })
                     .collect()
             }
-            _ => self
-                .world
-                .remote_files("proj/briefs")
-                .into_iter()
-                .map(|path| {
-                    let text = String::from_utf8(self.world.remote_file(&path).unwrap()).unwrap();
-                    (path, text)
-                })
-                .collect(),
+            _ => self.world.remote_blobs("proj"),
         };
-        let mut briefs: Vec<BriefSeen> = files
-            .into_iter()
-            .filter_map(|(path, text)| brief_seen(&path, text))
-            .collect();
-        briefs.sort_by_key(|brief| (brief.number, brief.filed, brief.name.clone()));
-        briefs
+        Snapshot::read(files)
+    }
+
+    fn ids_in(&self, place: usize, prefix: char) -> Vec<u32> {
+        self.read(place)
+            .items
+            .keys()
+            .filter(|(p, _)| *p == prefix)
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
+    /// The brief files of a place: 0 and 1 are the clones' files, 2 the
+    /// remote's `main`.
+    fn briefs(&self, place: usize) -> Vec<BriefSeen> {
+        self.read(place).briefs
     }
 
     /// The numbers of the drafts of the clone and the remote, the ones the
@@ -1088,7 +1370,12 @@ impl<'w> Oracle<'w> {
             Op::AddWithBody { backlog } => {
                 let token = self.token();
                 let body = vec![self.token(), self.token()];
-                self.body_write(who, &token, BodyChange::Append(body.clone()), true);
+                self.content_write(
+                    &token,
+                    &body,
+                    BTreeSet::new(),
+                    Some(BodyChange::Append(body.clone())),
+                );
                 let mut args = if *backlog {
                     owned(&["add", "backlog", &token])
                 } else {
@@ -1108,31 +1395,36 @@ impl<'w> Oracle<'w> {
                 // An append of no line is a usage error: one at least.
                 let count = if *replace { *lines } else { (*lines).max(1) };
                 let lines: Vec<String> = (0..count).map(|_| self.token()).collect();
-                if let Some(item) = self.owners.get(&id).cloned() {
-                    let change = if *replace {
-                        BodyChange::Replace(lines.clone())
-                    } else {
-                        BodyChange::Append(lines.clone())
-                    };
-                    self.body_write(who, &item, change, true);
-                } else {
-                    for token in &lines {
-                        self.body_owner.insert(token.clone(), "no item".to_owned());
+                let write = match self.owners.get(&id).cloned() {
+                    Some(item) => {
+                        let (change, drops) = if *replace {
+                            (BodyChange::Replace(lines.clone()), self.seen_body(who, id))
+                        } else {
+                            (BodyChange::Append(lines.clone()), BTreeSet::new())
+                        };
+                        Some(self.content_write(&item, &lines, drops, Some(change)))
                     }
-                }
-                let mut args = owned(&["amend", &format!("{prefix}{}", id.1)]);
+                    None => {
+                        for token in &lines {
+                            self.content_owner
+                                .insert(token.clone(), "no item".to_owned());
+                        }
+                        None
+                    }
+                };
+                let mut args = owned(&["amend", &show(id)]);
                 if *replace {
                     args.push("--replace".to_owned());
                 }
-                (args, Subject::Body(id, lines, *replace))
+                (args, Subject::Body(id, lines, *replace, write))
             }
             Op::Done(index) => {
                 let id = pick(self, 'c', index);
-                (owned(&["done", &format!("c{}", id.1)]), Subject::Close(id))
+                (owned(&["done", &show(id)]), Subject::Close(id))
             }
             Op::Drop(index) => {
                 let id = pick(self, 'b', index);
-                (owned(&["drop", &format!("b{}", id.1)]), Subject::Close(id))
+                (owned(&["drop", &show(id)]), Subject::Close(id))
             }
             Op::Move {
                 backlog,
@@ -1159,12 +1451,7 @@ impl<'w> Oracle<'w> {
                 };
                 let side = if *after { "--after" } else { "--before" };
                 (
-                    owned(&[
-                        "move",
-                        &format!("{prefix}{}", item.1),
-                        side,
-                        &format!("{prefix}{}", target.1),
-                    ]),
+                    owned(&["move", &show(item), side, &show(target)]),
                     Subject::Move(item, *after, target),
                 )
             }
@@ -1180,7 +1467,7 @@ impl<'w> Oracle<'w> {
                 // every invariant; a fresh mark after it is the change.
                 let token = self.token_of(who, id).unwrap_or_else(|| self.token());
                 let mark = self.token();
-                let mut args = owned(&["retitle", &format!("{prefix}{}", id.1)]);
+                let mut args = owned(&["retitle", &show(id)]);
                 let check = (*check && !*backlog).then(|| format!("x {mark}"));
                 let text = (*text || check.is_none()).then(|| format!("{token} {mark}"));
                 args.extend(text.clone());
@@ -1320,187 +1607,127 @@ impl<'w> Oracle<'w> {
         numbers.into_iter().collect()
     }
 
-    /// A hand edit of `who`'s files: the file and its new bytes, and what
-    /// the edit does. `None` when there is nothing to edit. `window`: the
-    /// edit is made while the clone's own write runs.
-    fn edit(&mut self, who: Who, edit: &Edit, window: bool) -> Option<(String, Vec<u8>, Effect)> {
-        let machine = self.machine(who);
-        let mut effect = Effect::default();
-        let list = |backlog: bool| FILES[usize::from(backlog)];
-        let lines_of = |path: &str| -> Vec<String> {
-            String::from_utf8(machine.file(path).unwrap_or_default())
-                .unwrap()
-                .lines()
-                .map(str::to_owned)
-                .collect()
-        };
-        let suffix = |prefix: char| if prefix == 'c' { ". Check: x" } else { "" };
-        let (path, lines) = match edit {
-            Edit::AddIdLess { backlog }
-            | Edit::AddText { backlog }
-            | Edit::AddTyped { backlog } => {
-                let (path, prefix) = list(*backlog);
-                let token = self.token();
-                let line = match edit {
-                    Edit::AddIdLess { .. } => format!("- {token}{}", suffix(prefix)),
-                    Edit::AddText { .. } => format!("note {token}"),
-                    _ => {
-                        // Past every id seen or typed, by more than a trace
-                        // can allocate meanwhile: a collision is the example
-                        // test's, not the trace's.
-                        let seen = self
-                            .owners
-                            .keys()
-                            .filter(|(p, _)| *p == prefix)
-                            .map(|(_, n)| *n);
-                        let typed = self.typed.get(&prefix).copied();
-                        let n = seen.chain(typed).max().unwrap_or(0) + 100;
-                        self.typed.insert(prefix, n);
-                        format!("- {prefix}{n} {token}{}", suffix(prefix))
-                    }
-                };
-                effect.added.push(token);
-                let mut lines = lines_of(path);
-                lines.push(line);
-                (path.to_owned(), lines)
-            }
-            Edit::Change(index) | Edit::Move(index, _) | Edit::Delete(index) => {
-                // Items of the clone. An item without an id whose id is
-                // being published: its token on the remote with an id (a
-                // kill after the push left the clone behind), or any in a
-                // window. A delete or a move picks one of those when there
-                // is one, as the merge has to read them by the published
-                // id and nothing else gets there. A change of one keeps the
-                // change under a new id, and a close of the published id on
-                // the other clone does not win over it: the residue
-                // `adopt_ids` names, left out.
-                let remote: BTreeSet<String> = self
-                    .read(2)
-                    .into_iter()
-                    .flat_map(|(_, lines)| lines)
-                    .map(|line| line.token().to_owned())
-                    .collect();
-                let mut candidates = Vec::new();
-                let mut publishing = Vec::new();
-                for (file, (path, prefix)) in FILES.iter().enumerate() {
-                    for (at, line) in lines_of(path).iter().enumerate() {
-                        match parse(*prefix, line.as_bytes()).first() {
-                            Some(Line::Item { id: Some(_), .. }) => candidates.push((file, at)),
-                            Some(Line::Item { id: None, token })
-                                if window || remote.contains(token) =>
-                            {
-                                publishing.push((file, at));
-                            }
-                            Some(Line::Item { id: None, .. }) => candidates.push((file, at)),
-                            Some(Line::Text { .. } | Line::Body { .. }) | None => {}
-                        }
-                    }
-                }
-                if !publishing.is_empty() && !matches!(edit, Edit::Change(_)) {
-                    candidates = publishing;
-                    effect.published = true;
-                }
-                if candidates.is_empty() {
-                    return None;
-                }
-                let (file, at) = *index.get(&candidates);
-                let (path, prefix) = FILES[file];
-                let mut lines = lines_of(path);
-                let token = parse(prefix, lines[at].as_bytes())[0].token().to_owned();
-                // An item is its line and its body, as in an editor: moved
-                // or deleted whole.
-                let end = at
-                    + 1
-                    + lines[at + 1..]
-                        .iter()
-                        .take_while(|line| is_body(line))
-                        .count();
-                match edit {
-                    Edit::Change(_) => {
-                        let mark = self.token();
-                        lines[at] = format!("{} {mark}", lines[at]);
-                    }
-                    Edit::Move(_, to) => {
-                        let block: Vec<String> = lines.drain(at..end).collect();
-                        // Between blocks, never inside another item's body.
-                        let places: Vec<usize> = (0..=lines.len())
-                            .filter(|place| lines.get(*place).is_none_or(|line| !is_body(line)))
-                            .collect();
-                        let place = places[to.index(places.len())];
-                        lines.splice(place..place, block);
-                    }
-                    _ => {
-                        lines.drain(at..end);
-                        effect.deleted.push(token);
-                    }
-                }
-                (path.to_owned(), lines)
-            }
+    /// A hand edit of `who`'s files: the change, and what the edit does.
+    /// `None` when there is nothing to edit. `window`: the edit is made
+    /// while the clone's own write runs, which writes these items.
+    fn edit(&mut self, who: Who, edit: &Edit, window: Option<&[Id]>) -> Option<(Change, Effect)> {
+        let snapshot = self.read(who.slot());
+        let items: Vec<&ItemSeen> = snapshot.items.values().collect();
+        match edit {
             Edit::BodyLine(index) => {
-                // An item with an id of the clone: the merge keeps an item's
-                // body by its id.
-                let mut candidates = Vec::new();
-                for (file, (path, prefix)) in FILES.iter().enumerate() {
-                    for (at, line) in lines_of(path).iter().enumerate() {
-                        if let Some(Line::Item { id: Some(_), token }) =
-                            parse(*prefix, line.as_bytes()).first()
-                        {
-                            candidates.push((file, at, token.clone()));
-                        }
-                    }
-                }
-                if candidates.is_empty() {
+                if items.is_empty() {
                     return None;
                 }
-                let (file, at, item) = index.get(&candidates).clone();
-                let mut lines = lines_of(FILES[file].0);
-                let end = at
-                    + 1
-                    + lines[at + 1..]
-                        .iter()
-                        .take_while(|line| is_body(line))
-                        .count();
+                let item = *index.get(&items);
                 let token = self.token();
-                lines.insert(end, format!("  - {token}"));
-                effect.body_added.push(token.clone());
-                self.body_write_late(who, &item, BodyChange::Append(vec![token]), false, window);
-                self.depth.body_lines_by_hand += 1;
-                (FILES[file].0.to_owned(), lines)
+                let mut effect = Effect::new(Hand::Body);
+                effect.writes.push((
+                    item.token.clone(),
+                    vec![token.clone()],
+                    BTreeSet::new(),
+                    Some(BodyChange::Append(vec![token.clone()])),
+                ));
+                effect.changed = Some(item.id);
+                let bytes = with_body_line(&item.bytes, &token);
+                Some((Change::Write(item_path(item.id), bytes), effect))
             }
             Edit::DeleteBodyLine(index) => {
-                let mut candidates = Vec::new();
-                for (file, (path, prefix)) in FILES.iter().enumerate() {
-                    let lines = lines_of(path);
-                    let parsed = parse(*prefix, lines.join("\n").as_bytes());
-                    // `parse` drops lines it does not read: match by text.
-                    for (at, line) in lines.iter().enumerate() {
-                        if !is_body(line) {
-                            continue;
-                        }
-                        let found = parsed.iter().find(|parsed| {
-                            matches!(parsed, Line::Body { token, .. } if line.trim_start() == format!("- {token}"))
-                        });
-                        if let Some(Line::Body {
-                            token,
-                            owner: Some(item),
-                        }) = found
-                        {
-                            candidates.push((file, at, token.clone(), item.clone()));
-                        }
-                    }
-                }
-                if candidates.is_empty() {
+                let lines: Vec<(&ItemSeen, &String)> = items
+                    .iter()
+                    .flat_map(|item| item.body.iter().map(move |token| (*item, token)))
+                    .collect();
+                if lines.is_empty() {
                     return None;
                 }
-                let (file, at, token, item) = index.get(&candidates).clone();
-                let mut lines = lines_of(FILES[file].0);
-                lines.remove(at);
-                self.body_write_late(who, &item, BodyChange::Remove(token), false, window);
-                self.depth.body_lines_by_hand += 1;
-                (FILES[file].0.to_owned(), lines)
+                let (item, token) = *index.get(&lines);
+                let mut effect = Effect::new(Hand::Body);
+                effect.writes.push((
+                    item.token.clone(),
+                    Vec::new(),
+                    BTreeSet::from([token.clone()]),
+                    Some(BodyChange::Remove(token.clone())),
+                ));
+                effect.changed = Some(item.id);
+                let bytes = without_body_line(&item.bytes, token);
+                Some((Change::Write(item_path(item.id), bytes), effect))
+            }
+            Edit::Key { item, order } => {
+                if items.is_empty() {
+                    return None;
+                }
+                let item = *item.get(&items);
+                let token = self.token();
+                let mut effect = Effect::new(Hand::Key);
+                effect.changed = Some(item.id);
+                let bytes = if *order {
+                    // A number of the token's: mostly far from the tool's
+                    // thousands, so the item goes first, now and then next
+                    // to another one set so.
+                    with_key(&item.bytes, "order", token.trim_start_matches('t'))
+                } else {
+                    effect.writes.push((
+                        item.token.clone(),
+                        vec![token.clone()],
+                        item.mark.iter().cloned().collect(),
+                        None,
+                    ));
+                    with_key(&item.bytes, "mark", &token)
+                };
+                Some((Change::Write(item_path(item.id), bytes), effect))
+            }
+            Edit::Delete(index) => {
+                if items.is_empty() {
+                    return None;
+                }
+                let item = *index.get(&items);
+                let mut effect = Effect::new(Hand::Delete);
+                effect.deleted = Some((item.id, item.token.clone()));
+                Some((Change::Remove(item_path(item.id)), effect))
+            }
+            Edit::AddFile { backlog } => {
+                let (dir, prefix) = KINDS[usize::from(*backlog)];
+                // Past every id seen or given by hand, by more than a trace
+                // can allocate meanwhile: a collision is the example test's,
+                // not the trace's.
+                let seen = self
+                    .owners
+                    .keys()
+                    .filter(|(p, _)| *p == prefix)
+                    .map(|(_, n)| *n);
+                let typed = self.typed.get(&prefix).copied();
+                let n = seen.chain(typed).max().unwrap_or(0) + 100;
+                self.typed.insert(prefix, n);
+                let (token, line) = (self.token(), self.token());
+                let group = if *backlog { "" } else { "group: Home\n" };
+                let check = if *backlog { "" } else { "check: x\n" };
+                let bytes = format!(
+                    "id: {prefix}{n}\n{group}order: 500\n{check}{CREATED}\n\n# {token}\n\n- {line}\n"
+                );
+                let mut effect = Effect::new(Hand::Add);
+                effect.added = Some(token.clone());
+                effect.changed = Some((prefix, n));
+                effect.writes.push((
+                    token,
+                    vec![line.clone()],
+                    BTreeSet::new(),
+                    Some(BodyChange::Replace(vec![line])),
+                ));
+                Some((
+                    Change::Write(format!("{dir}/{prefix}{n}.md"), bytes.into_bytes()),
+                    effect,
+                ))
+            }
+            Edit::AddMisnamed { backlog } => {
+                let (dir, _) = KINDS[usize::from(*backlog)];
+                let token = self.token();
+                let path = format!("{dir}/hand-{token}.md");
+                let bytes = format!("# {token}\n").into_bytes();
+                let mut effect = Effect::new(Hand::Misnamed);
+                effect.misnamed = Some((path.clone(), bytes.clone()));
+                Some((Change::Write(path, bytes), effect))
             }
             Edit::Brief(pick) => {
-                let briefs = self.briefs(who.slot());
+                let briefs = snapshot.briefs;
                 let open: Vec<&BriefSeen> = briefs.iter().filter(|brief| !brief.filed).collect();
                 // A brief made by hand while the clone's own write runs
                 // could take the number that write gives: a duplicate the
@@ -1510,7 +1737,7 @@ impl<'w> Oracle<'w> {
                     .find(|brief| !written(brief))
                     .or_else(|| open.first());
                 let chosen = match pick {
-                    BriefPick::New if window => first,
+                    BriefPick::New if window.is_some() => first,
                     BriefPick::New => None,
                     BriefPick::First => first,
                     BriefPick::Any(index) if !open.is_empty() => Some(index.get(&open)),
@@ -1525,7 +1752,7 @@ impl<'w> Oracle<'w> {
                         brief.number,
                         brief.text.lines().map(str::to_owned).collect(),
                     ),
-                    None if window => return None,
+                    None if window.is_some() => return None,
                     None => {
                         let number = briefs.iter().map(|brief| brief.number).max().unwrap_or(0) + 1;
                         (
@@ -1544,43 +1771,53 @@ impl<'w> Oracle<'w> {
                 }
                 let token = self.token();
                 lines.push(format!("body {token}"));
+                let mut effect = Effect::new(Hand::Brief);
                 effect.brief = Some((token, number));
-                (path, lines)
+                let bytes = lines
+                    .iter()
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>();
+                Some((Change::Write(path, bytes.into_bytes()), effect))
             }
-        };
-        let bytes = lines
-            .iter()
-            .map(|line| format!("{line}\n"))
-            .collect::<String>();
-        Some((path, bytes.into_bytes(), effect))
+        }
     }
 
-    /// Whether the clone's files have an item without an id.
-    fn has_id_less(&self, who: Who) -> bool {
-        self.read(who.slot())
-            .into_iter()
-            .flat_map(|(_, lines)| lines)
-            .any(|line| matches!(line, Line::Item { id: None, .. }))
-    }
-
-    /// Records a hand edit as made. Its new lines were in the clone's files
-    /// from then on, seen or not: a write that lost them breaks I4.
+    /// Records a hand edit as made. Its new content was in the clone's files
+    /// from then on, seen or not: a write that lost it breaks I9.
     fn made(&mut self, who: Who, effect: Effect) {
-        self.places[who.slot()]
-            .tokens
-            .extend(effect.added.iter().cloned());
-        // In the clone's file from then on, seen or not: a write that lost
-        // them breaks I9.
-        self.places[who.slot()]
-            .body_tokens
-            .extend(effect.body_added.iter().cloned());
-        self.added.extend(effect.added);
-        self.closed.extend(effect.deleted);
-        if effect.published {
-            self.depth.published_line_edited += 1;
+        let slot = who.slot();
+        match effect.hand {
+            Hand::Body => self.depth.body_lines_by_hand += 1,
+            Hand::Key => self.depth.keys_by_hand += 1,
+            Hand::Delete => self.depth.files_deleted_by_hand += 1,
+            Hand::Add => self.depth.files_added_by_hand += 1,
+            Hand::Misnamed => self.depth.misnamed_by_hand += 1,
+            Hand::Brief => {}
+        }
+        if let Some(token) = effect.added {
+            self.places[slot].tokens.insert(token.clone());
+            self.added.insert(token);
+        }
+        if let Some((id, token)) = effect.deleted {
+            self.closed.insert(token.clone());
+            self.closed_in_step[slot].insert(token);
+            self.pending[slot].remove(&id);
+            if let Some(remote) = self.places[2].files.get(&id).cloned() {
+                self.deletes_pending[slot].insert(id, remote);
+            }
+        }
+        for (item, tokens, drops, change) in effect.writes {
+            self.content_write(&item, &tokens, drops, change);
+            self.places[slot].content.extend(tokens);
+        }
+        if let Some(id) = effect.changed {
+            self.pending[slot].insert(id);
         }
         if let Some((token, brief)) = effect.brief {
             self.brief_lines.push((token, who, brief));
+        }
+        if let Some((path, bytes)) = effect.misnamed {
+            self.misnamed.push((who, path, bytes));
         }
     }
 
@@ -1589,6 +1826,9 @@ impl<'w> Oracle<'w> {
         // step runs first (to bring a brief or an item there) check the
         // places too, before the write they prepare has run.
         self.body_changes.clear();
+        self.closed_in_step = Default::default();
+        self.pending_at_step = self.pending.clone();
+        self.actor = None;
         match step {
             Step::RejectPushes(pushes) => {
                 self.world.reject_pushes(u32::from(*pushes));
@@ -1601,8 +1841,12 @@ impl<'w> Oracle<'w> {
                 Ok(())
             }
             Step::HandEdit { who, edit } => {
-                if let Some((path, bytes, effect)) = self.edit(*who, edit, false) {
-                    self.machine(*who).write(&path, bytes);
+                if let Some((change, effect)) = self.edit(*who, edit, None) {
+                    let machine = self.machine(*who);
+                    match change {
+                        Change::Write(path, bytes) => machine.write(&path, bytes),
+                        Change::Remove(path) => fs::remove_file(machine.data().join(path)).unwrap(),
+                    }
                     self.made(*who, effect);
                 }
                 self.check_everywhere()
@@ -1615,6 +1859,7 @@ impl<'w> Oracle<'w> {
     /// `board sync` on a clone outside `Quiesce`: exit 0 online, 3 without
     /// the remote or with every push refused.
     fn sync(&mut self, who: Who) -> Result<(), TestCaseError> {
+        self.actor = Some(who);
         let rejecting = self.world.rejects_left() > 0;
         let output = self
             .machine(who)
@@ -1629,11 +1874,12 @@ impl<'w> Oracle<'w> {
         };
         self.depth.commands += 1;
         self.depth.given_up_online += u32::from(given_up_online(&run));
+        let conflicts = self.notes(who, &run)?;
         match run.code {
             Some(0) => {
                 self.depth.succeeded += 1;
                 prop_assert_eq!(&run.stdout, "synced\n");
-                self.learned(who, true);
+                self.pulled(who, true);
             }
             Some(3) => {
                 self.depth.not_pushed += 1;
@@ -1644,8 +1890,39 @@ impl<'w> Oracle<'w> {
             }
             _ => prop_assert!(false, "unexpected exit of sync: {run:?}"),
         }
-        self.notes(who, &run)?;
+        self.conflicts_stay(who, &conflicts, &[])?;
         self.check_everywhere()
+    }
+
+    /// A run of `who` got the remote's commits, and pushed all of its own
+    /// if `pushed`.
+    fn pulled(&mut self, who: Who, pushed: bool) {
+        self.moves_unseen[who.slot()].clear();
+        if pushed {
+            self.pending[who.slot()].clear();
+            self.moves_pending[who.slot()].clear();
+        }
+    }
+
+    /// The items a run noted a conflict of are in the clone: the remote's
+    /// version stands, and a delete that won leaves no copy. Not for an item
+    /// the run deletes itself.
+    fn conflicts_stay(
+        &self,
+        who: Who,
+        conflicts: &[Id],
+        closes: &[Id],
+    ) -> Result<(), TestCaseError> {
+        let snapshot = self.read(who.slot());
+        for id in conflicts.iter().filter(|id| !closes.contains(id)) {
+            prop_assert!(
+                snapshot.items.contains_key(id),
+                "a conflict of {:?} noted on {:?}, and the item is gone",
+                id,
+                who
+            );
+        }
+        Ok(())
     }
 
     /// For a `queue` that writes first: the planner's sections into the
@@ -1664,8 +1941,8 @@ impl<'w> Oracle<'w> {
             .iter()
             .any(|brief| brief.number == *number && !brief.filed && !written(brief));
         if unwritten
-            && let Some((path, bytes, effect)) =
-                self.edit(who, &Edit::Brief(BriefPick::Number(*number)), false)
+            && let Some((Change::Write(path, bytes), effect)) =
+                self.edit(who, &Edit::Brief(BriefPick::Number(*number)), None)
         {
             self.machine(who).write(&path, bytes);
             self.made(who, effect);
@@ -1673,19 +1950,25 @@ impl<'w> Oracle<'w> {
         self.check_everywhere()
     }
 
-    /// For `move` when the clone and the remote have fewer than two items
-    /// of its list, as mostly they do: the adds that bring two there, each
-    /// judged as a command of its own. A second chore goes into the other
-    /// group, so that a move crosses one.
-    fn prepare_list(&mut self, who: Who, backlog: bool) -> Result<(), TestCaseError> {
+    /// For an op on an item when the clone and the remote have fewer than
+    /// `wanted` of its kind, as mostly they do: the adds that bring them
+    /// there, each judged as a command of its own. A second chore goes into
+    /// the other group, so that a move crosses one, and a third into that
+    /// group too, so that a move lands between two.
+    fn prepare_list(
+        &mut self,
+        who: Who,
+        backlog: bool,
+        wanted: usize,
+    ) -> Result<(), TestCaseError> {
         let prefix = if backlog { 'b' } else { 'c' };
-        for _ in 0..2 {
+        for _ in 0..wanted {
             let ids: BTreeSet<u32> = self
                 .ids_in(who.slot(), prefix)
                 .into_iter()
                 .chain(self.ids_in(2, prefix))
                 .collect();
-            if ids.len() >= 2 {
+            if ids.len() >= wanted {
                 break;
             }
             let add = if backlog {
@@ -1704,8 +1987,8 @@ impl<'w> Oracle<'w> {
     /// the remote has a brief they take: the commands that bring one there,
     /// as the planner and the worker would have run them, each judged as a
     /// command of its own. Left to chance, a trace seldom gets a brief from
-    /// new to started, let alone reported, before it ends. `move` has
-    /// [`Oracle::prepare_list`].
+    /// new to started, let alone reported, before it ends. An op on an item
+    /// has [`Oracle::prepare_list`].
     fn prepare(&mut self, who: Who, op: &Op) -> Result<(), TestCaseError> {
         let wanted: &[&str] = match op {
             Op::Block(_) | Op::Report(_) => &["started"],
@@ -1719,8 +2002,11 @@ impl<'w> Oracle<'w> {
             | Op::NewBrief
             | Op::Queue { .. }
             | Op::Next => return Ok(()),
-            Op::Move { backlog, .. } | Op::Retitle { backlog, .. } | Op::Body { backlog, .. } => {
-                return self.prepare_list(who, *backlog);
+            // Three for a move: with two, every move puts the item first or
+            // last, and the order halfway between two is never judged.
+            Op::Move { backlog, .. } => return self.prepare_list(who, *backlog, 3),
+            Op::Retitle { backlog, .. } | Op::Body { backlog, .. } => {
+                return self.prepare_list(who, *backlog, 2);
             }
         };
         // At most new, queue, next and report; fewer when one is refused.
@@ -1754,6 +2040,7 @@ impl<'w> Oracle<'w> {
         if let Some(Fault::WindowOp(window_op)) = fault {
             self.prepare(who.other(), window_op)?;
         }
+        self.actor = Some(who);
         let rejecting = self.world.rejects_left() > 0;
         let (args, subject) = self.args(who, op);
         self.write_before_queue(who, op, &subject)?;
@@ -1764,6 +2051,16 @@ impl<'w> Oracle<'w> {
             Some(Fault::WindowOp(window_op)) => {
                 let (window_args, window_subject) = self.args(who.other(), window_op);
                 self.write_before_queue(who.other(), window_op, &window_subject)?;
+                // A replace whose push meets the other clone's write of that
+                // body runs again on it, and so sees that write's lines.
+                if let (
+                    Subject::Body(id, _, true, Some(write)),
+                    Subject::Body(window_id, lines, ..),
+                ) = (&subject, &window_subject)
+                    && id == window_id
+                {
+                    self.writes[*write].drops.extend(lines.iter().cloned());
+                }
                 let words: Vec<&str> = window_args.iter().map(String::as_str).collect();
                 let script = match window_subject.input() {
                     Some(input) => {
@@ -1777,30 +2074,36 @@ impl<'w> Oracle<'w> {
                 window = Some(window_subject);
             }
             Some(Fault::WindowEdit(edit)) => {
-                if let Edit::Move(index, _) | Edit::Delete(index) = edit
-                    && !self.has_id_less(who)
-                    && let Some((path, bytes, effect)) = self.edit(
-                        who,
-                        &Edit::AddIdLess {
-                            backlog: index.index(2) == 1,
-                        },
-                        false,
-                    )
-                {
-                    machine.write(&path, bytes);
-                    self.made(who, effect);
-                }
-                if let Some((path, bytes, effect)) = self.edit(who, edit, true) {
-                    let saved = self.world.dir().join("window-edit");
-                    fs::write(&saved, bytes).unwrap();
-                    machine.hook_once(
-                        "pre-push",
-                        &format!(
-                            "mkdir -p \"$(dirname {path})\" && cp {} {path} || exit 1\n",
-                            quote(&saved.to_string_lossy()),
-                            path = quote(&path)
-                        ),
-                    );
+                // What the command writes: its item, or for a move any of
+                // its kind, which a renumbering writes.
+                let writes: Vec<Id> = match &subject {
+                    Subject::Move(item, ..) => [who.slot(), 2]
+                        .into_iter()
+                        .flat_map(|place| self.ids_in(place, item.0))
+                        .map(|n| (item.0, n))
+                        .collect(),
+                    other => other.item().into_iter().collect(),
+                };
+                if let Some((change, effect)) = self.edit(who, edit, Some(&writes)) {
+                    // git's fast-forward wrote such a file back once.
+                    if let Some((id, _)) = &effect.deleted
+                        && writes.contains(id)
+                    {
+                        self.depth.window_delete_of_written += 1;
+                    }
+                    let script = match change {
+                        Change::Write(path, bytes) => {
+                            let saved = self.world.dir().join("window-edit");
+                            fs::write(&saved, bytes).unwrap();
+                            format!(
+                                "mkdir -p \"$(dirname {path})\" && cp {} {path} || exit 1\n",
+                                quote(&saved.to_string_lossy()),
+                                path = quote(&path)
+                            )
+                        }
+                        Change::Remove(path) => format!("rm {} || exit 1\n", quote(&path)),
+                    };
+                    machine.hook_once("pre-push", &script);
                     window_edit = Some(effect);
                 }
             }
@@ -1846,12 +2149,13 @@ impl<'w> Oracle<'w> {
             run.code.is_some() || killable,
             "killed without a kill: {run:?}"
         );
-        let window_edit_made = match window_edit {
+        let window_edited = match window_edit {
             Some(effect) if hook_ran => {
+                let changed = effect.changed;
                 self.made(who, effect);
-                true
+                Some(changed)
             }
-            Some(_) | None => false,
+            Some(_) | None => None,
         };
 
         // The other clone's run, when the hook ran.
@@ -1891,8 +2195,24 @@ impl<'w> Oracle<'w> {
             if window_run.code == Some(0) && run.code == Some(0) && run.stderr.contains("retry") {
                 self.depth.raced_in_the_window += 1;
             }
+            // One clone's move and the other's write of the same item, in
+            // one push's window: the later runs again on the earlier.
+            let moved = matches!(&subject, Subject::Move(..))
+                || matches!(window_subject, Subject::Move(..));
+            if moved
+                && window_run.code == Some(0)
+                && run.code == Some(0)
+                && subject.item().is_some()
+                && subject.item() == window_subject.item()
+            {
+                self.depth.move_met += 1;
+            }
         }
         self.judge(who, &subject, &run, rejecting, fault, false)?;
+        // Saved after the push it waited on: the clone's to push still.
+        if let Some(Some(id)) = window_edited {
+            self.pending[who.slot()].insert(id);
+        }
 
         // Every path `next` printed is one more claimed brief on the remote,
         // and no brief is claimed twice; a run that ended without knowing
@@ -1933,7 +2253,7 @@ impl<'w> Oracle<'w> {
             {
                 self.depth.late_landing_recognised += 1;
             }
-            if window_edit_made && run.stderr.contains("board: merged ") {
+            if window_edited.is_some() && run.stderr.contains("board: merged ") {
                 self.depth.window_edit_settled += 1;
             }
         }
@@ -1947,39 +2267,52 @@ impl<'w> Oracle<'w> {
     }
 
     /// Checks the notes of a run on `who` that ended: each line is a note
-    /// the trace can cause, or the one line of a run that failed; an id
-    /// assigned is on the remote with its token.
-    fn notes(&mut self, who: Who, run: &Run) -> Result<(), TestCaseError> {
+    /// the trace can cause, or the one line of a run that failed; a
+    /// conflict copy of an item is there, of that item. Gives the items
+    /// whose conflict was noted.
+    fn notes(&mut self, who: Who, run: &Run) -> Result<Vec<Id>, TestCaseError> {
+        let machine = self.machine(who);
         let lines: Vec<&str> = run.stderr.lines().collect();
+        let mut conflicts = Vec::new();
         for (at, line) in lines.iter().enumerate() {
             let last = at + 1 == lines.len();
-            if let Some(assigned) = line.strip_prefix("board: assigned ") {
-                self.depth.assigned += 1;
-                let (id, text) = assigned.split_once(": ").expect("assigned <id>: <text>");
-                let prefix = id.chars().next().unwrap();
-                let id = id_of(prefix, id).expect("an id");
-                let token = text.split(' ').next().unwrap().trim_end_matches('.');
-                let file = if prefix == 'c' { 0 } else { 1 };
-                let on_remote = self.read(2).remove(file).1;
-                prop_assert!(
-                    on_remote.contains(&Line::Item {
-                        id: Some(id),
-                        token: token.to_owned()
-                    }),
-                    "assigned {:?} is not on the remote with {}: {:?}",
-                    id,
-                    token,
-                    run
-                );
-            } else if line.starts_with("board: merged ") {
-                if line.contains("(by line: ") {
-                    self.depth.merged_by_line += 1;
-                }
+            if line.starts_with("board: merged ") {
+                self.depth.merged += 1;
             } else if line.starts_with("board: conflict: brief ") {
                 self.depth.brief_conflicts += 1;
-            } else if line.starts_with("board: lint: ") {
+            } else if let Some(conflict) = line.strip_prefix("board: conflict: ") {
+                let (word, said) = conflict.split_once(' ').expect("conflict: <id> …");
+                let id = word
+                    .chars()
+                    .next()
+                    .and_then(|prefix| id_of(prefix, word))
+                    .expect("an item's id");
+                let path = said
+                    .strip_prefix(
+                        "changed here and on the remote; the remote version is kept, \
+                         yours is saved as ",
+                    )
+                    .and_then(|path| path.strip_prefix(&format!("{}/", machine.data().display())));
+                let copy = path.and_then(|path| machine.file(path));
                 prop_assert!(
-                    line.contains("unmerged local version of brief"),
+                    path.is_some_and(|path| path.starts_with(&format!("{}.local", item_path(id))))
+                        && copy.as_ref().is_some_and(|copy| {
+                            item_seen(id, copy.clone()).header_id == Some(show(id))
+                        }),
+                    "a conflict note without a copy of {:?} where it says: {:?}",
+                    id,
+                    run
+                );
+                self.depth.local_copies += 1;
+                let slot = who.slot();
+                if self.moves_pending[slot].contains(&id) || self.moves_unseen[slot].contains(&id) {
+                    self.depth.move_met += 1;
+                }
+                conflicts.push(id);
+            } else if let Some(finding) = line.strip_prefix("board: lint: ") {
+                prop_assert!(
+                    finding.contains("unmerged local version of ")
+                        || finding.contains("not named as the board names its files"),
                     "a lint finding the trace does not make: {run:?}"
                 );
             } else if line.starts_with("board: retry ") {
@@ -1996,7 +2329,7 @@ impl<'w> Oracle<'w> {
         if pushed_all && self.online[who.slot()] && std::mem::take(&mut self.unpushed[who.slot()]) {
             self.depth.not_pushed_then_pushed += 1;
         }
-        Ok(())
+        Ok(conflicts)
     }
 
     /// Checks one run of `who` against the places after the step, and
@@ -2012,7 +2345,8 @@ impl<'w> Oracle<'w> {
         window: bool,
     ) -> Result<(), TestCaseError> {
         self.depth.commands += 1;
-        let offline = !self.online[who.slot()];
+        let slot = who.slot();
+        let offline = !self.online[slot];
         match run.code {
             Some(0) => {
                 self.depth.succeeded += 1;
@@ -2055,32 +2389,45 @@ impl<'w> Oracle<'w> {
             None => {}
             Some(_) => prop_assert!(false, "unexpected exit: {run:?}"),
         }
-        if run.code.is_some() {
-            self.notes(who, run)?;
-        }
-        let pushed = run.code == Some(0) && !run.stderr.contains("board: not pushed: ");
+        let conflicts = if run.code.is_some() {
+            self.notes(who, run)?
+        } else {
+            Vec::new()
+        };
+        // Offline nothing is pushed, though a write that changed nothing (a
+        // move to where the item stands) has no commit to note as not pushed.
+        let pushed = run.code == Some(0) && !offline && !run.stderr.contains("board: not pushed: ");
         if run.code == Some(0) && !offline {
-            self.learned(who, pushed);
+            self.pulled(who, pushed);
+        }
+        if run.code == Some(0)
+            && !pushed
+            && let Some(id) = subject.item()
+        {
+            self.pending[slot].insert(id);
+        }
+        // Another write of the step may delete the item after this run's
+        // merge kept it: the other clone's in the window, or a file saved
+        // during the push.
+        let met = !window && matches!(fault, Some(Fault::WindowOp(_) | Fault::WindowEdit(_)));
+        if !met {
+            self.conflicts_stay(who, &conflicts, &subject.closes())?;
         }
         match subject {
             Subject::Add(token, body) => {
                 let on_remote: Vec<Id> = self
                     .read(2)
-                    .into_iter()
-                    .flat_map(|(_, lines)| lines)
-                    .filter(|line| line.token() == token)
-                    .filter_map(|line| match line {
-                        Line::Item { id, .. } => id,
-                        Line::Text { .. } | Line::Body { .. } => None,
-                    })
+                    .items
+                    .values()
+                    .filter(|item| item.token == *token)
+                    .map(|item| item.id)
                     .collect();
                 match run.code {
                     Some(0) => {
                         prop_assert!(!offline, "an add offline exited 0: {run:?}");
                         // The printed id is on the remote with this token.
                         let printed = run.stdout.trim_end();
-                        let shown: Vec<String> =
-                            on_remote.iter().map(|(p, n)| format!("{p}{n}")).collect();
+                        let shown: Vec<String> = on_remote.iter().map(|id| show(*id)).collect();
                         prop_assert_eq!(&shown, &vec![printed.to_owned()], "{:?}", run);
                         self.added.insert(token.clone());
                         if !body.is_empty() {
@@ -2088,8 +2435,8 @@ impl<'w> Oracle<'w> {
                         }
                         // Written, so in the clone and on the remote: a loss
                         // breaks I9 at once.
-                        for place in [who.slot(), 2] {
-                            self.places[place].body_tokens.extend(body.iter().cloned());
+                        for place in [slot, 2] {
+                            self.places[place].content.extend(body.iter().cloned());
                         }
                     }
                     None if matches!(fault, Some(Fault::KillAfterPush))
@@ -2103,16 +2450,12 @@ impl<'w> Oracle<'w> {
                     }
                 }
             }
-            Subject::Body(id, lines, replace) => match run.code {
+            Subject::Body(id, lines, replace, write) => match run.code {
                 Some(0) => {
-                    prop_assert_eq!(&run.stdout, &format!("amended {}{}\n", id.0, id.1));
-                    let places = if pushed {
-                        vec![who.slot(), 2]
-                    } else {
-                        vec![who.slot()]
-                    };
+                    prop_assert_eq!(&run.stdout, &format!("amended {}\n", show(*id)));
+                    let places = if pushed { vec![slot, 2] } else { vec![slot] };
                     for place in places {
-                        self.places[place].body_tokens.extend(lines.iter().cloned());
+                        self.places[place].content.extend(lines.iter().cloned());
                     }
                     match (replace, lines.is_empty()) {
                         (false, _) => self.depth.bodies_appended += 1,
@@ -2123,33 +2466,40 @@ impl<'w> Oracle<'w> {
                 Some(1) => {
                     let last = run.stderr.lines().last().unwrap_or_default();
                     prop_assert!(
-                        last.starts_with(&format!("board: amend {}{}: ", id.0, id.1))
+                        last.starts_with(&format!("board: amend {}: ", show(*id)))
                             && (last.ends_with("no such chore")
                                 || last.ends_with("no such backlog item")),
                         "{:?}",
                         run
                     );
-                    prop_assert!(!self.ids_in(who.slot(), id.0).contains(&id.1), "{:?}", run);
+                    prop_assert!(!self.ids_in(slot, id.0).contains(&id.1), "{:?}", run);
                     self.never.extend(lines.iter().cloned());
+                    // Refused: it took nothing out.
+                    if let Some(write) = write {
+                        self.writes[*write].drops.clear();
+                    }
                 }
                 // Killed: written or not.
                 Some(_) | None => {}
             },
             Subject::Close(id) => {
                 let token = self.owners.get(id).cloned();
-                let here = self.ids_in(who.slot(), id.0).contains(&id.1);
+                let here = self.ids_in(slot, id.0).contains(&id.1);
                 match run.code {
                     Some(0) => {
                         let past = if id.0 == 'c' { "done" } else { "dropped" };
-                        prop_assert_eq!(&run.stdout, &format!("{past} {}{}\n", id.0, id.1));
+                        prop_assert_eq!(&run.stdout, &format!("{past} {}\n", show(*id)));
                         prop_assert!(!here, "{id:?} is still in {who:?} after {run:?}");
                         if pushed {
                             prop_assert!(
                                 !self.ids_in(2, id.0).contains(&id.1),
                                 "{id:?} is still on the remote after {run:?}"
                             );
+                        } else if let Some(remote) = self.places[2].files.get(id).cloned() {
+                            self.deletes_pending[slot].insert(*id, remote);
                         }
-                        self.closed.extend(token);
+                        self.closed.extend(token.clone());
+                        self.closed_in_step[slot].extend(token);
                     }
                     Some(1) => {
                         prop_assert!(
@@ -2220,7 +2570,7 @@ impl<'w> Oracle<'w> {
                     prop_assert_eq!(&run.stdout, &format!("queued {number}\n"));
                     // Queued, or claimed since: a queue run in the window of
                     // a `next` is claimed by its retry.
-                    let place = if pushed { 2 } else { who.slot() };
+                    let place = if pushed { 2 } else { slot };
                     let status: Vec<Option<String>> = self
                         .briefs(place)
                         .into_iter()
@@ -2295,32 +2645,9 @@ impl<'w> Oracle<'w> {
         Ok(())
     }
 
-    /// The ids of the item lines of a place's list, in file order; `None`
-    /// for an item without one.
-    fn order(&self, place: usize, prefix: char) -> Vec<Option<Id>> {
-        let (path, _) = FILES.iter().find(|(_, p)| *p == prefix).expect("a list");
-        let bytes = match place {
-            0 => self.world.a().file(path),
-            1 => self.world.b().file(path),
-            _ => self.world.remote_file(path),
-        };
-        // Line by line, so that a heading or a blank line is a line too:
-        // the moved item has to be next to its target, nothing between but
-        // the target's body, which an item has below it wherever it is.
-        String::from_utf8(bytes.unwrap_or_default())
-            .unwrap()
-            .lines()
-            .filter(|line| !is_body(line))
-            .map(|line| match parse(prefix, line.as_bytes()).first() {
-                Some(Line::Item { id, .. }) => *id,
-                Some(Line::Text { .. } | Line::Body { .. }) | None => None,
-            })
-            .collect()
-    }
-
-    /// A `retitle` run: what it printed, and the line with its new text
-    /// and check where the retitle was the last change, as for a move;
-    /// refused only for an id that is not there.
+    /// A `retitle` run: what it printed, and the item's new title and check
+    /// where the retitle was the last change, as for a move; refused only
+    /// for an id that is not there.
     fn judge_retitle(
         &mut self,
         who: Who,
@@ -2331,22 +2658,22 @@ impl<'w> Oracle<'w> {
     ) -> Result<(), TestCaseError> {
         match run.code {
             Some(0) => {
-                prop_assert_eq!(&run.stdout, &format!("retitled {}{}\n", id.0, id.1));
+                prop_assert_eq!(&run.stdout, &format!("retitled {}\n", show(id)));
                 let saved_after = !pushed && matches!(fault, Some(Fault::WindowEdit(_)));
                 if !window && !saved_after {
-                    // Counted where the line is judged, so the depth test
+                    // Counted where the item is judged, so the depth test
                     // proves the judging runs.
                     self.depth.items_retitled += 1;
                     let place = if pushed { 2 } else { who.slot() };
-                    let line = self.line_of(place, id);
-                    let starts = format!("- {}{} {start}", id.0, id.1);
+                    let snapshot = self.read(place);
+                    let item = snapshot.items.get(&id);
                     prop_assert!(
-                        line.as_ref().is_some_and(|line| line.starts_with(&starts)
-                            && check.is_none_or(|check| line.contains(&format!("Check: {check}")))),
+                        item.is_some_and(|item| item.title.starts_with(start)
+                            && check.is_none_or(|check| item.check.as_deref() == Some(check))),
                         "{:?} in place {} is {:?} after {:?}",
                         id,
                         place,
-                        line,
+                        item,
                         run
                     );
                 }
@@ -2354,7 +2681,7 @@ impl<'w> Oracle<'w> {
             Some(1) => {
                 let last = run.stderr.lines().last().unwrap_or_default();
                 prop_assert!(
-                    last.starts_with(&format!("board: retitle {}{}: ", id.0, id.1))
+                    last.starts_with(&format!("board: retitle {}: ", show(id)))
                         && (last.ends_with("no such chore")
                             || last.ends_with("no such backlog item")),
                     "{:?}",
@@ -2368,43 +2695,19 @@ impl<'w> Oracle<'w> {
         Ok(())
     }
 
-    /// The line an id is on in a place, the first when it is on more.
-    fn line_of(&self, place: usize, id: Id) -> Option<String> {
-        let (path, _) = FILES.iter().find(|(_, p)| *p == id.0).expect("a list");
-        let bytes = match place {
-            0 => self.world.a().file(path),
-            1 => self.world.b().file(path),
-            _ => self.world.remote_file(path),
-        };
-        String::from_utf8(bytes.unwrap_or_default())
-            .unwrap()
-            .lines()
-            .find(|line| {
-                matches!(parse(id.0, line.as_bytes()).first(), Some(Line::Item { id: Some(found), .. }) if *found == id)
-            })
-            .map(str::to_owned)
-    }
-
     /// The token of an id in the clone or the remote.
     fn token_of(&self, who: Who, id: Id) -> Option<String> {
         [who.slot(), 2].into_iter().find_map(|place| {
             self.read(place)
-                .into_iter()
-                .flat_map(|(_, lines)| lines)
-                .find_map(|line| match line {
-                    Line::Item {
-                        id: Some(found),
-                        token,
-                    } if found == id => Some(token),
-                    Line::Item { .. } | Line::Text { .. } | Line::Body { .. } => None,
-                })
+                .items
+                .get(&id)
+                .map(|item| item.token.clone())
         })
     }
 
-    /// A `move` run: what it printed, and the item next to its target in
-    /// the place it wrote to (past the target's body, if it has one),
-    /// which puts a chore into the target's group; refused only for an id
-    /// that is not there.
+    /// A `move` run: what it printed, and the item next to its target, in
+    /// the target's group, in the listing of the place it wrote to; refused
+    /// only for an id that is not there.
     fn judge_move(
         &mut self,
         who: Who,
@@ -2418,14 +2721,14 @@ impl<'w> Oracle<'w> {
             Some(0) => {
                 prop_assert_eq!(
                     &run.stdout,
-                    &format!(
-                        "moved {}{} {side} {}{}\n",
-                        item.0, item.1, target.0, target.1
-                    )
+                    &format!("moved {} {side} {}\n", show(item), show(target))
                 );
                 self.depth.items_moved += 1;
-                if !pushed {
+                if pushed {
+                    self.moves_unseen[who.other().slot()].insert(item);
+                } else {
                     self.depth.moves_not_pushed += 1;
+                    self.moves_pending[who.slot()].insert(item);
                 }
                 // Where the move was the last change: the remote when
                 // pushed, else the clone. Not for a run in a window, which
@@ -2434,13 +2737,24 @@ impl<'w> Oracle<'w> {
                 let saved_after = !pushed && matches!(fault, Some(Fault::WindowEdit(_)));
                 if !window && !saved_after {
                     let place = if pushed { 2 } else { who.slot() };
-                    let order = self.order(place, item.0);
-                    let at = |id: Id| order.iter().position(|line| *line == Some(id));
+                    let listed = listing(&self.read(place).items, item.0);
+                    let at = |id: Id| listed.iter().position(|(_, listed)| *listed == id);
                     let next_to = match (at(item), at(target)) {
-                        (Some(i), Some(t)) if after => i == t + 1,
-                        (Some(i), Some(t)) => i + 1 == t,
+                        (Some(i), Some(t)) => {
+                            listed[i].0 == listed[t].0
+                                && if after { i == t + 1 } else { i + 1 == t }
+                        }
                         _ => false,
                     };
+                    let between = at(item).is_some_and(|i| {
+                        i > 0
+                            && i + 1 < listed.len()
+                            && listed[i - 1].0 == listed[i].0
+                            && listed[i + 1].0 == listed[i].0
+                    });
+                    if next_to && between {
+                        self.depth.moved_between += 1;
+                    }
                     prop_assert!(
                         next_to,
                         "{:?} is not {} {:?} in place {}: {:?} after {:?}",
@@ -2448,7 +2762,7 @@ impl<'w> Oracle<'w> {
                         side,
                         target,
                         place,
-                        order,
+                        listed,
                         run
                     );
                 }
@@ -2456,7 +2770,7 @@ impl<'w> Oracle<'w> {
             Some(1) => {
                 let last = run.stderr.lines().last().unwrap_or_default();
                 prop_assert!(
-                    last.starts_with(&format!("board: move {}{}: ", item.0, item.1))
+                    last.starts_with(&format!("board: move {}: ", show(item)))
                         && (last.ends_with("no such chore")
                             || last.ends_with("no such backlog item")),
                     "{:?}",
@@ -2541,7 +2855,9 @@ impl<'w> Oracle<'w> {
                         id,
                         run
                     );
-                    self.closed.extend(self.owners.get(id).cloned());
+                    let token = self.owners.get(id).cloned();
+                    self.closed.extend(token.clone());
+                    self.closed_in_step[who.slot()].extend(token);
                 }
                 // And none it names is left open unsaid: ids are never
                 // reused, so a named id still there is one `file` skipped.
@@ -2644,54 +2960,36 @@ impl<'w> Oracle<'w> {
         Ok(())
     }
 
-    /// I1 to I6 in every place, and nothing that never was anywhere.
+    /// The invariants in every place.
     fn check_everywhere(&mut self) -> Result<(), TestCaseError> {
-        for (who, place) in [(Who::A, 0), (Who::B, 1)] {
+        for who in [Who::A, Who::B] {
             prop_assert_eq!(
                 self.machine(who).head_ref(),
                 "refs/heads/main",
                 "I5: {:?} is off main",
                 who
             );
-            self.check_place(place)?;
-            self.check_briefs(place)?;
         }
-        self.check_place(2)?;
-        self.check_briefs(2)?;
-        for place in 0..3 {
-            for (item, body) in self.bodies(place) {
-                self.bodies_seen.entry(item).or_default().insert(body);
+        let snapshots = [self.read(0), self.read(1), self.read(2)];
+        for (place, snapshot) in snapshots.iter().enumerate() {
+            self.check_place(place, snapshot)?;
+            self.check_briefs(place, &snapshot.briefs)?;
+        }
+        for snapshot in &snapshots {
+            let copies = snapshot.copies.iter().map(|(_, copy)| copy);
+            for item in snapshot.items.values().chain(copies) {
+                self.bodies_seen
+                    .entry(item.token.clone())
+                    .or_default()
+                    .insert(item.body.clone());
             }
         }
         Ok(())
     }
 
-    /// Per item of a place, by token, its body: the tokens of the lines
-    /// below it, in order.
-    fn bodies(&self, place: usize) -> BTreeMap<String, Vec<String>> {
-        let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (_, lines) in self.read(place) {
-            for line in lines {
-                match line {
-                    Line::Item { token, .. } => {
-                        bodies.entry(token).or_default();
-                    }
-                    Line::Body {
-                        token,
-                        owner: Some(owner),
-                    } => {
-                        bodies.entry(owner).or_default().push(token);
-                    }
-                    Line::Body { owner: None, .. } | Line::Text { .. } => {}
-                }
-            }
-        }
-        bodies
-    }
-
     /// I8: the bodies an item may have now: one seen before, or one this
     /// step's writes make of one, in any order. A body that is neither is
-    /// a mix of two sides' lines, or a line lost or applied twice.
+    /// a mix of two writers' lines, or a line lost or applied twice.
     fn bodies_allowed(&self, item: &str) -> BTreeSet<Vec<String>> {
         let mut allowed = self.bodies_seen.get(item).cloned().unwrap_or_default();
         allowed.insert(Vec::new());
@@ -2712,11 +3010,10 @@ impl<'w> Oracle<'w> {
     }
 
     /// I6, and no brief of a `new brief` that failed.
-    fn check_briefs(&mut self, place: usize) -> Result<(), TestCaseError> {
+    fn check_briefs(&mut self, place: usize, briefs: &[BriefSeen]) -> Result<(), TestCaseError> {
         let name = ["A", "B", "the remote"][place];
-        let briefs = self.briefs(place);
         let mut numbers = BTreeSet::new();
-        for brief in &briefs {
+        for brief in briefs {
             prop_assert!(
                 numbers.insert(brief.number),
                 "I6: brief {} is on two files of {}: {:?}",
@@ -2748,7 +3045,7 @@ impl<'w> Oracle<'w> {
         if place != 2 {
             return Ok(());
         }
-        for brief in &briefs {
+        for brief in briefs {
             let status = if brief.filed {
                 Some("filed".to_owned())
             } else {
@@ -2785,137 +3082,173 @@ impl<'w> Oracle<'w> {
         Ok(())
     }
 
-    fn check_place(&mut self, place: usize) -> Result<(), TestCaseError> {
+    /// I1 to I5 and I7 to I9 in a place, and nothing that never was
+    /// anywhere.
+    fn check_place(&mut self, place: usize, snapshot: &Snapshot) -> Result<(), TestCaseError> {
         let name = ["A", "B", "the remote"][place];
         let mut ids = BTreeSet::new();
         let mut tokens = BTreeSet::new();
-        let mut body_tokens = BTreeSet::new();
-        for (file, lines) in self.read(place) {
-            let mut item_tokens = BTreeSet::new();
-            let mut file_ids = BTreeSet::new();
-            let mut file_tokens = BTreeSet::new();
-            for line in &lines {
-                let token = line.token().to_owned();
-                prop_assert!(
-                    file_tokens.insert(token.clone()),
-                    "I1: {} twice in file {} of {}",
-                    token,
-                    file,
-                    name
-                );
-                prop_assert!(
-                    !self.never.contains(&token),
-                    "{} was never added, and is in {}",
-                    token,
-                    name
-                );
-                if let Line::Body { token, owner } = line {
-                    // I7: below the item it was written under, or nowhere:
-                    // never under another, never loose.
-                    let written_under = self.body_owner.get(token);
-                    prop_assert!(
-                        written_under.is_some() && owner.as_ref() == written_under,
-                        "I7: body line {} is under {:?} in file {} of {}, written under {:?}",
-                        token,
-                        owner,
-                        file,
-                        name,
-                        written_under
-                    );
-                    body_tokens.insert(token.clone());
-                    continue;
+        let mut content = BTreeSet::new();
+        for item in snapshot.items.values() {
+            let id = item.id;
+            prop_assert_eq!(
+                item.header_id.clone(),
+                Some(show(id)),
+                "I1: the file of {:?} in {} has another id: {:?}",
+                id,
+                name,
+                item
+            );
+            prop_assert!(
+                item.odd.is_empty(),
+                "a line no write made, in {:?} in {}: {:?}",
+                id,
+                name,
+                item
+            );
+            prop_assert!(
+                tokens.insert(item.token.clone()),
+                "I1: {} in two files of {}",
+                item.token,
+                name
+            );
+            prop_assert!(
+                !self.never.contains(&item.token),
+                "{} was never added, and is in {}",
+                item.token,
+                name
+            );
+            prop_assert!(
+                !self.places[place].gone.contains(&id),
+                "I3: {:?} came back to {}",
+                id,
+                name
+            );
+            match self.owners.get(&id) {
+                Some(owner) => {
+                    prop_assert_eq!(owner, &item.token, "I2: {:?} carries two tokens", id)
                 }
-                item_tokens.insert(token.clone());
-                if let Line::Item { id, .. } = line {
-                    match id {
-                        Some(id) => {
-                            prop_assert!(file_ids.insert(*id), "I1: {:?} twice in {}", id, name);
-                            prop_assert!(
-                                !self.places[place].gone.contains(id),
-                                "I3: {:?} came back to {}",
-                                id,
-                                name
-                            );
-                            match self.owners.get(id) {
-                                Some(owner) => prop_assert_eq!(
-                                    owner,
-                                    &token,
-                                    "I2: {:?} carries two tokens",
-                                    id
-                                ),
-                                None => {
-                                    self.owners.insert(*id, token.clone());
-                                }
-                            }
-                        }
-                        None => prop_assert!(
-                            place != 2,
-                            "I5: an item without an id on the remote: {:?}",
-                            line
-                        ),
-                    }
+                None => {
+                    self.owners.insert(id, item.token.clone());
                 }
             }
-            ids.extend(file_ids);
-            tokens.extend(item_tokens);
+            for token in item.content() {
+                prop_assert!(
+                    content.insert(token.clone()),
+                    "I1: {} in two items of {}",
+                    token,
+                    name
+                );
+                prop_assert!(
+                    !self.never.contains(token),
+                    "{} was never written, and is in {}",
+                    token,
+                    name
+                );
+                let written_for = self.content_owner.get(token);
+                prop_assert!(
+                    written_for == Some(&item.token),
+                    "I7: {} is in {:?} in {}, written for {:?}",
+                    token,
+                    id,
+                    name,
+                    written_for
+                );
+            }
+            ids.insert(id);
         }
-        // I8: each item's body is one seen before, or this step's writes
-        // made of one.
-        let bodies = self.bodies(place);
-        for (item, body) in &bodies {
-            let allowed = self.bodies_allowed(item);
+        // I5: nothing the board does not commit.
+        if place == 2 {
             prop_assert!(
-                allowed.contains(body),
-                "I8: the body of {} in {} is {:?}, not a body any side had: {:?}",
-                item,
+                snapshot.copies.is_empty() && snapshot.other.is_empty(),
+                "I5: a copy or a misnamed file is on the remote: {:?} {:?}",
+                snapshot.copies,
+                snapshot.other
+            );
+        }
+        for path in &snapshot.other {
+            prop_assert!(
+                self.misnamed
+                    .iter()
+                    .any(|(who, made, _)| who.slot() == place && made == path),
+                "{} in {} is no file the trace made",
+                path,
+                name
+            );
+        }
+        for (path, copy) in &snapshot.copies {
+            prop_assert_eq!(
+                self.owners.get(&copy.id),
+                Some(&copy.token),
+                "I2: copy {} in {} is of another item",
+                path,
+                name
+            );
+            for token in copy.content() {
+                prop_assert!(
+                    self.content_owner.get(token) == Some(&copy.token),
+                    "I7: {} is in copy {} in {}",
+                    token,
+                    path,
+                    name
+                );
+            }
+        }
+        // I8: each body, in the files and in the copies, is one seen before
+        // or one this step's writes made of one.
+        let copies = snapshot.copies.iter().map(|(_, copy)| copy);
+        for item in snapshot.items.values().chain(copies) {
+            let allowed = self.bodies_allowed(&item.token);
+            prop_assert!(
+                allowed.contains(&item.body),
+                "I8: the body of {:?} in {} is {:?}, not one writer's whole: {:?}",
+                item.id,
                 name,
-                body,
+                item.body,
                 allowed
             );
         }
-        // I9: a body line leaves an item that stays only for another write
-        // of its body that did not come before it and could drop it (see
-        // `BodyWrite::may_drop`): a lone write is never lost.
-        for token in self.places[place].body_tokens.difference(&body_tokens) {
-            let item = &self.body_owner[token];
-            if !bodies.contains_key(item) {
+        // I9: content leaves an item that stays only for a write that saw it
+        // and took it out, or into a copy of the clone whose version lost.
+        let left: Vec<String> = self.places[place]
+            .content
+            .difference(&content)
+            .cloned()
+            .collect();
+        for token in left {
+            let item = self
+                .content_owner
+                .get(&token)
+                .cloned()
+                .expect("content comes from a write");
+            let item = &item;
+            if !tokens.contains(item) {
                 continue;
             }
-            let writes = &self.body_writes[item];
-            let made = writes
-                .iter()
-                .find(|write| write.id == self.body_step[token])
-                .expect("a body line comes from a write");
-            let droppers: Vec<&BodyWrite> = writes
-                .iter()
-                .filter(|write| write.id != made.id && !write.before(made) && write.may_drop(token))
-                .collect();
-            let dropped_by = !droppers.is_empty();
-            // The other clone's write, made without knowing of this one:
-            // the two met, and the merge kept one side whole.
-            if droppers
-                .iter()
-                .any(|write| write.who != made.who && !made.before(write))
-            {
-                self.depth.body_conflicts += 1;
+            let made = self.content_made[&token];
+            let dropped = self.writes.iter().any(|write| {
+                write.id != made && write.item == *item && write.drops.contains(&token)
+            });
+            if dropped {
+                self.depth.content_dropped += 1;
+                continue;
             }
+            let in_copy = snapshot
+                .copies
+                .iter()
+                .any(|(_, copy)| copy.token == *item && copy.content().any(|t| *t == token));
             prop_assert!(
-                dropped_by,
-                "I9: body line {} left {} in {} with no write that could drop it: {:?}, now {:?}",
+                in_copy,
+                "I9: {} left {} in {} with no write that took it out and no copy: now {:?}",
                 token,
                 item,
                 name,
-                writes,
-                bodies.get(item)
+                snapshot.by_token(item)
             );
-            self.depth.body_lines_superseded += 1;
+            self.depth.content_kept_in_copy += 1;
         }
-        self.places[place].body_tokens = body_tokens;
-        let seen = &mut self.places[place];
-        for id in seen.ids.difference(&ids) {
-            seen.gone.insert(*id);
-        }
-        for token in seen.tokens.difference(&tokens) {
+        // I4, and the deletes that won over an edit.
+        for token in self.places[place].tokens.difference(&tokens) {
             prop_assert!(
                 self.closed.contains(token) || self.maybe_closed.contains(token),
                 "I4: {} left {} without being closed",
@@ -2923,8 +3256,45 @@ impl<'w> Oracle<'w> {
                 name
             );
         }
+        let gone: Vec<Id> = self.places[place].ids.difference(&ids).copied().collect();
+        for id in gone {
+            self.places[place].gone.insert(id);
+            let token = self.owners[&id].clone();
+            if place < 2 {
+                // The clone changed it, and the other side's delete took it
+                // at a merge.
+                let changed =
+                    self.pending[place].contains(&id) || self.pending_at_step[place].contains(&id);
+                if changed && !self.closed_in_step[place].contains(&token) {
+                    self.depth.delete_won += 1;
+                }
+                self.pending[place].remove(&id);
+            } else {
+                // The clone's delete pushed over a change the remote got
+                // after it.
+                let was = self.places[2].files.get(&id);
+                let won = self.actor.is_some_and(|actor| {
+                    self.deletes_pending[actor.slot()]
+                        .get(&id)
+                        .is_some_and(|then| Some(then) != was)
+                });
+                if won {
+                    self.depth.delete_won += 1;
+                }
+                for pending in &mut self.deletes_pending {
+                    pending.remove(&id);
+                }
+            }
+        }
+        let seen = &mut self.places[place];
         seen.ids = ids;
         seen.tokens = tokens;
+        seen.content = content;
+        seen.files = snapshot
+            .items
+            .iter()
+            .map(|(id, item)| (*id, item.bytes.clone()))
+            .collect();
         Ok(())
     }
 
@@ -2937,6 +3307,7 @@ impl<'w> Oracle<'w> {
             self.online[who.slot()] = true;
         }
         for who in [Who::A, Who::B, Who::A] {
+            self.actor = Some(who);
             let machine = self.machine(who);
             machine.unhook("pre-push");
             let output = machine.command().arg("sync").output().expect("run board");
@@ -2951,11 +3322,12 @@ impl<'w> Oracle<'w> {
                 "{:?}",
                 run
             );
-            self.learned(who, true);
-            self.notes(who, &run)?;
+            let conflicts = self.notes(who, &run)?;
+            self.pulled(who, true);
             if std::mem::take(&mut self.healing[who.slot()]) {
                 self.depth.kill_after_push_healed += 1;
             }
+            self.conflicts_stay(who, &conflicts, &[])?;
             self.check_everywhere()?;
         }
         let remote_main = self.world.remote_main();
@@ -2967,23 +3339,42 @@ impl<'w> Oracle<'w> {
                 "{:?} is not on the remote's commit",
                 who
             );
-            // Conflict copies are untracked and stay; nothing else may.
+            // Conflict copies and misnamed files are untracked and stay;
+            // nothing else may.
             let changed: Vec<String> = machine
                 .status()
                 .lines()
-                .filter(|line| !line.starts_with("?? ") || !line.contains(".md.local"))
+                .filter(|line| {
+                    let untracked = line.strip_prefix("?? ");
+                    !untracked.is_some_and(|path| {
+                        path.contains(".md.local")
+                            || self
+                                .misnamed
+                                .iter()
+                                .any(|(by, made, _)| *by == who && made == path)
+                    })
+                })
                 .map(str::to_owned)
                 .collect();
             prop_assert_eq!(changed, Vec::<String>::new(), "{:?} has changed files", who);
         }
-        let remote: Vec<String> = self
-            .read(2)
-            .into_iter()
-            .flat_map(|(_, lines)| lines)
-            .map(|line| line.token().to_owned())
-            .collect();
+        for (who, path, bytes) in &self.misnamed {
+            let now = self.machine(*who).file(path);
+            prop_assert_eq!(
+                now.as_ref(),
+                Some(bytes),
+                "misnamed {} changed on {:?}",
+                path,
+                who
+            );
+        }
+        let remote = self.read(2);
         for token in &self.added {
-            let count = remote.iter().filter(|t| *t == token).count();
+            let count = remote
+                .items
+                .values()
+                .filter(|item| item.token == *token)
+                .count();
             if self.closed.contains(token) {
                 prop_assert_eq!(count, 0, "{} was closed and is on the remote", token);
             } else if !self.maybe_closed.contains(token) {
@@ -2992,7 +3383,7 @@ impl<'w> Oracle<'w> {
         }
         // A line written into a brief is in that brief, or in a conflict
         // copy the clone that wrote it saved.
-        let remote_briefs = self.briefs(2);
+        let remote_briefs = remote.briefs;
         for (token, who, number) in &self.brief_lines {
             let line = format!("body {token}");
             let has_line = |text: &str| text.lines().any(|l| l == line);
@@ -3094,10 +3485,8 @@ fn the_traces_get_deep() {
     assert!(depth.refused > 0, "{depth:?}");
     assert!(depth.offline_refused > 0, "{depth:?}");
     assert!(depth.not_pushed_then_pushed > 0, "{depth:?}");
-    assert!(depth.merged_by_line > 0, "{depth:?}");
-    assert!(depth.assigned > 0, "{depth:?}");
+    assert!(depth.merged > 0, "{depth:?}");
     assert!(depth.window_edit_settled > 0, "{depth:?}");
-    assert!(depth.published_line_edited > 0, "{depth:?}");
     assert!(depth.brief_conflicts > 0, "{depth:?}");
     assert!(depth.lost_ack_recognised > 0, "{depth:?}");
     assert!(depth.late_landing_recognised > 0, "{depth:?}");
@@ -3111,18 +3500,23 @@ fn the_traces_get_deep() {
     assert!(depth.briefs_reported > 0, "{depth:?}");
     assert!(depth.briefs_filed > 0, "{depth:?}");
     assert!(depth.closed_by_file > 0, "{depth:?}");
-    // An offline move needs two items on a clone that is offline, which the
-    // fixed seed does not bring about: `a_move_made_offline_meets_the_remote_s`
-    // has it.
     assert!(depth.items_moved > 0, "{depth:?}");
+    assert!(depth.move_met > 0, "{depth:?}");
+    assert!(depth.moved_between > 0, "{depth:?}");
     assert!(depth.items_retitled > 0, "{depth:?}");
     assert!(depth.bodies_added > 0, "{depth:?}");
     assert!(depth.bodies_appended > 0, "{depth:?}");
     assert!(depth.bodies_replaced > 0, "{depth:?}");
     assert!(depth.bodies_removed > 0, "{depth:?}");
-    assert!(depth.body_conflicts > 0, "{depth:?}");
-    assert!(depth.body_lines_superseded > 0, "{depth:?}");
+    assert!(depth.local_copies > 0, "{depth:?}");
+    assert!(depth.delete_won > 0, "{depth:?}");
+    assert!(depth.content_dropped > 0, "{depth:?}");
+    assert!(depth.content_kept_in_copy > 0, "{depth:?}");
     assert!(depth.body_lines_by_hand > 0, "{depth:?}");
+    assert!(depth.keys_by_hand > 0, "{depth:?}");
+    assert!(depth.files_deleted_by_hand > 0, "{depth:?}");
+    assert!(depth.files_added_by_hand > 0, "{depth:?}");
+    assert!(depth.misnamed_by_hand > 0, "{depth:?}");
     assert!(
         depth.succeeded * 10 >= depth.commands * 6,
         "fewer than 60% of the commands succeeded: {depth:?}"
@@ -3133,8 +3527,23 @@ fn the_traces_get_deep() {
 // seed, not the steps, and a seed replays another trace once the strategies
 // change shape.
 
-/// The `Index` that picks the first element. proptest gives `Index` no
-/// constructor, so one is shrunk all the way, to zero.
+/// The `Index` that picks element `at` of `len`. proptest gives `Index` no
+/// constructor, so one is drawn until it picks that one.
+fn index_at(at: usize, len: usize) -> Index {
+    let mut runner = TestRunner::deterministic();
+    loop {
+        let index = any::<Index>()
+            .new_tree(&mut runner)
+            .expect("an Index strategy never rejects")
+            .current();
+        if index.index(len) == at {
+            return index;
+        }
+    }
+}
+
+/// The `Index` that picks the first element, whatever the length: one
+/// shrunk all the way, to zero.
 fn first() -> Index {
     let mut tree = any::<Index>()
         .new_tree(&mut TestRunner::deterministic())
@@ -3143,26 +3552,32 @@ fn first() -> Index {
     tree.current()
 }
 
-/// [`run_example`], and the remote's backlog after it.
-fn run_example_backlog(steps: &[Step]) -> (Depth, String) {
+/// [`run_trace`] on a world it gives back, for a test to look at after.
+fn run_example_in(steps: &[Step]) -> (Depth, World) {
     let world = World::new();
-    let mut oracle = Oracle::new(&world);
-    let run = steps
-        .iter()
-        .try_for_each(|step| oracle.step(step))
-        .and_then(|()| oracle.quiesce());
-    if let Err(error) = run {
-        panic!("{error}");
-    }
-    let backlog =
-        String::from_utf8(world.remote_file("proj/backlog.md").unwrap_or_default()).unwrap();
-    (oracle.depth, backlog)
+    let depth = {
+        let mut oracle = Oracle::new(&world);
+        let run = steps
+            .iter()
+            .try_for_each(|step| oracle.step(step))
+            .and_then(|()| oracle.quiesce());
+        if let Err(error) = run {
+            panic!("{error}");
+        }
+        oracle.depth
+    };
+    (depth, world)
 }
 
 fn run_example(steps: &[Step]) -> Depth {
-    match run_trace(steps) {
-        Ok(depth) => depth,
-        Err(error) => panic!("{error}"),
+    run_example_in(steps).0
+}
+
+fn cmd(who: Who, op: Op) -> Step {
+    Step::Cmd {
+        who,
+        op,
+        fault: None,
     }
 }
 
@@ -3204,7 +3619,7 @@ fn one_brief_number_made_by_hand_on_both_clones() {
         Step::Cmd {
             who: Who::A,
             op: Op::Drop(first()),
-            fault: Some(Fault::WindowEdit(Edit::AddIdLess { backlog: true })),
+            fault: Some(Fault::WindowEdit(Edit::AddFile { backlog: true })),
         },
         Step::Cmd {
             who: Who::B,
@@ -3271,33 +3686,34 @@ fn next_after_a_queue_whose_brief_was_saved_during_the_push() {
     assert!(depth.briefs_queued > 0, "{depth:?}");
 }
 
-/// `move` on a clone that is offline, both lists, a chore into the other
+/// `move` on a clone that is offline, both kinds, a chore into the other
 /// group; meanwhile the other clone adds an item and moves the same chore.
-/// The moves wait on the clone and meet the remote's changes at the sync.
+/// At the sync the backlog move, which only A made, stands; the chore both
+/// clones moved keeps the remote's place, B's, and A's is its copy.
 #[test]
 fn a_move_made_offline_meets_the_remote_s() {
-    let cmd = |who, op| Step::Cmd {
-        who,
-        op,
-        fault: None,
-    };
     let moving = |backlog, after| Op::Move {
         backlog,
         item: first(),
         target: first(),
         after,
     };
-    let depth = run_example(&[
+    let (depth, world) = run_example_in(&[
+        // Three of each, as a move's preparation brings: none is needed
+        // offline, where an add is refused.
+        cmd(Who::A, Op::AddBacklog),
         cmd(Who::A, Op::AddBacklog),
         cmd(Who::A, Op::AddBacklog),
         cmd(Who::A, Op::AddChore { group: true }),
+        cmd(Who::A, Op::AddChore { group: false }),
         cmd(Who::A, Op::AddChore { group: false }),
         Step::Sync { who: Who::B },
         Step::Net {
             who: Who::A,
             online: false,
         },
-        // b1 after b2; c1 after c2, out of Home into Work.
+        // b1 after b2, between it and b3; c1 after c2, out of Home into
+        // Work, between c2 and c3.
         cmd(Who::A, moving(true, true)),
         cmd(Who::A, moving(false, true)),
         cmd(Who::B, Op::AddBacklog),
@@ -3310,20 +3726,36 @@ fn a_move_made_offline_meets_the_remote_s() {
     ]);
     assert!(depth.moves_not_pushed >= 2, "{depth:?}");
     assert!(depth.items_moved >= 3, "{depth:?}");
-    assert!(depth.merged_by_line > 0, "{depth:?}");
+    assert!(depth.move_met > 0, "{depth:?}");
+    assert!(depth.moved_between > 0, "{depth:?}");
+    assert!(depth.local_copies > 0, "{depth:?}");
+    let remote: BTreeMap<Id, ItemSeen> = world
+        .remote_blobs("proj")
+        .into_iter()
+        .filter_map(|(path, bytes)| {
+            KINDS.iter().find_map(|(dir, prefix)| {
+                let name = path.strip_prefix(&format!("{dir}/"))?.strip_suffix(".md")?;
+                let id = id_of(*prefix, name)?;
+                Some((id, item_seen(id, bytes.clone())))
+            })
+        })
+        .collect();
+    let ids = |prefix| -> Vec<Id> {
+        listing(&remote, prefix)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect()
+    };
+    assert_eq!(ids('b'), [('b', 2), ('b', 1), ('b', 3), ('b', 4)]);
+    assert_eq!(ids('c'), [('c', 1), ('c', 2), ('c', 3)]);
+    assert!(world.a().file("proj/chores/c1.md.local").is_some());
 }
 
 /// Both clones write one item's body before either has the other's: A
-/// offline, B online, then A syncs. The merge keeps one side's body whole,
-/// the clone's, which changed it: A's; B's lines are gone, nothing is
-/// mixed.
+/// offline, B online, then A syncs. The item keeps the remote's version, B's,
+/// whole; A's is its copy, whole; nothing is mixed.
 #[test]
-fn a_body_written_on_both_clones_keeps_one_side_whole() {
-    let cmd = |who, op| Step::Cmd {
-        who,
-        op,
-        fault: None,
-    };
+fn a_body_written_on_both_clones_keeps_the_remote_s_and_copies_the_clone_s() {
     let amend = |replace, lines| Op::Body {
         backlog: true,
         item: first(),
@@ -3332,24 +3764,28 @@ fn a_body_written_on_both_clones_keeps_one_side_whole() {
     };
     // Tokens in the order made: b1 is t1 with body t2 t3, b2 is t4; A's
     // lines come next, then B's.
-    // B's lines lost to A's whole body: a conflict I9 excuses; B's empty
-    // replace loses no line.
-    for (a_writes, b_writes, want, lines_lost) in [
+    let cases: [(Op, Op, Vec<&str>, Vec<&str>); 3] = [
         (
             amend(false, 2),
             amend(false, 1),
-            "  - t2\n  - t3\n  - t5\n  - t6\n",
-            true,
+            vec!["t2", "t3", "t7"],
+            vec!["t2", "t3", "t5", "t6"],
         ),
-        (amend(true, 2), amend(false, 2), "  - t5\n  - t6\n", true),
+        (
+            amend(true, 2),
+            amend(false, 2),
+            vec!["t2", "t3", "t7", "t8"],
+            vec!["t5", "t6"],
+        ),
         (
             amend(false, 1),
             amend(true, 0),
-            "  - t2\n  - t3\n  - t5\n",
-            false,
+            vec![],
+            vec!["t2", "t3", "t5"],
         ),
-    ] {
-        let (depth, backlog) = run_example_backlog(&[
+    ];
+    for (a_writes, b_writes, remote, copy) in cases {
+        let (depth, world) = run_example_in(&[
             cmd(Who::A, Op::AddWithBody { backlog: true }),
             cmd(Who::A, Op::AddBacklog),
             Step::Sync { who: Who::B },
@@ -3365,39 +3801,158 @@ fn a_body_written_on_both_clones_keeps_one_side_whole() {
             },
             Step::Sync { who: Who::A },
         ]);
-        assert_eq!(backlog, format!("- b1 t1\n{want}- b2 t4\n"));
-        assert_eq!(depth.body_conflicts > 0, lines_lost, "{depth:?}");
+        let body = |bytes: Option<Vec<u8>>| item_seen(('b', 1), bytes.unwrap()).body;
+        assert_eq!(body(world.remote_file("proj/backlog/b1.md")), remote);
+        assert_eq!(body(world.a().file("proj/backlog/b1.md.local")), copy);
+        assert!(depth.local_copies > 0, "{depth:?}");
+        assert!(depth.content_kept_in_copy > 0, "{depth:?}");
     }
 }
 
 /// A body line typed on A while A's own write pushes lands after that
 /// push's commit: B, replacing the body meanwhile, never had it, and A's
-/// sync keeps A's body whole with it (a review's case: the oracle must not
-/// take the line for pushed with A's write).
+/// sync keeps B's body and saves A's, with the line, as its copy (a
+/// review's case: the oracle must not take the line for pushed with A's
+/// write).
 #[test]
 fn a_body_line_saved_during_a_push_goes_out_with_the_next() {
-    run_example(&[
-        Step::Cmd {
-            who: Who::A,
-            op: Op::AddWithBody { backlog: true },
-            fault: None,
-        },
+    let depth = run_example(&[
+        cmd(Who::A, Op::AddWithBody { backlog: true }),
         Step::Sync { who: Who::B },
         Step::Cmd {
             who: Who::A,
             op: Op::AddChore { group: false },
             fault: Some(Fault::WindowEdit(Edit::BodyLine(first()))),
         },
-        Step::Cmd {
-            who: Who::B,
-            op: Op::Body {
+        cmd(
+            Who::B,
+            Op::Body {
                 backlog: true,
                 item: first(),
                 replace: true,
                 lines: 1,
             },
-            fault: None,
-        },
+        ),
         Step::Sync { who: Who::A },
     ]);
+    assert!(depth.local_copies > 0, "{depth:?}");
+}
+
+/// An item deleted on one clone and edited on the other is deleted, either
+/// way round, without a copy: A's hand delete over B's amend, B's `drop`
+/// over A's hand edit.
+#[test]
+fn a_delete_wins_over_an_edit_either_way_round() {
+    let depth = run_example(&[
+        cmd(Who::A, Op::AddBacklog),
+        cmd(Who::A, Op::AddBacklog),
+        Step::Sync { who: Who::B },
+        // A deletes b1 by hand; B amends it and pushes; A's sync deletes it
+        // on the remote.
+        Step::HandEdit {
+            who: Who::A,
+            edit: Edit::Delete(first()),
+        },
+        cmd(
+            Who::B,
+            Op::Body {
+                backlog: true,
+                item: first(),
+                replace: false,
+                lines: 1,
+            },
+        ),
+        Step::Sync { who: Who::A },
+        // A edits b2 by hand; B drops it; A's sync deletes it on A.
+        Step::HandEdit {
+            who: Who::A,
+            edit: Edit::Key {
+                item: first(),
+                order: false,
+            },
+        },
+        // B has b1 still, the remote b2 only: the second of the two.
+        cmd(Who::B, Op::Drop(index_at(1, 2))),
+        Step::Sync { who: Who::A },
+    ]);
+    assert!(depth.delete_won >= 2, "{depth:?}");
+    assert_eq!(depth.local_copies, 0, "{depth:?}");
+}
+
+/// A move into a gap with no integer left renumbers its kind in the move's
+/// commit: the orders set by hand to 4, 5, 6 become 1000, 2000, 3000. The
+/// random trace seldom gets there (about ten moves into one gap). B's hand
+/// edit of a renumbered neighbour then meets the renumbering like any other
+/// write of that file: the remote's stands, B's is its copy.
+#[test]
+fn a_move_into_a_full_gap_renumbers_the_kind() {
+    let world = World::new();
+    let mut oracle = Oracle::new(&world);
+    let order = |at| Edit::Key {
+        item: index_at(at, 3),
+        order: true,
+    };
+    let steps = [
+        cmd(Who::A, Op::AddBacklog),
+        cmd(Who::A, Op::AddBacklog),
+        cmd(Who::A, Op::AddBacklog),
+        Step::Sync { who: Who::B },
+        // Tokens t4, t5, t6: orders 4, 5, 6 for b1, b2, b3.
+        Step::HandEdit {
+            who: Who::A,
+            edit: order(0),
+        },
+        Step::HandEdit {
+            who: Who::A,
+            edit: order(1),
+        },
+        Step::HandEdit {
+            who: Who::A,
+            edit: order(2),
+        },
+        Step::HandEdit {
+            who: Who::B,
+            edit: Edit::BodyLine(index_at(1, 3)),
+        },
+        // b3 before b2: between 4 and 5, where no integer is.
+        cmd(
+            Who::A,
+            Op::Move {
+                backlog: true,
+                item: index_at(2, 3),
+                target: index_at(1, 2),
+                after: false,
+            },
+        ),
+    ];
+    for step in &steps {
+        if let Err(error) = oracle.step(step) {
+            panic!("{error}");
+        }
+    }
+    let order_of = |n: u32| {
+        let path = format!("proj/backlog/b{n}.md");
+        item_seen(('b', n), world.remote_file(&path).unwrap()).order
+    };
+    assert_eq!(
+        [order_of(1), order_of(3), order_of(2)],
+        [Some(1000), Some(2000), Some(3000)]
+    );
+    // One commit: the move's, with every file it renumbered.
+    assert_eq!(
+        world.remote_changed("main"),
+        [
+            "proj/backlog/b1.md",
+            "proj/backlog/b2.md",
+            "proj/backlog/b3.md"
+        ]
+    );
+    let run = [Step::Sync { who: Who::B }, Step::Quiesce]
+        .iter()
+        .try_for_each(|step| oracle.step(step));
+    if let Err(error) = run {
+        panic!("{error}");
+    }
+    assert!(oracle.depth.local_copies > 0, "{:?}", oracle.depth);
+    assert!(world.b().file("proj/backlog/b2.md.local").is_some());
 }

@@ -921,15 +921,22 @@ mod tests {
         assert_eq!(filed[(x, y)].fg, Color::Reset);
     }
 
-    /// A list item's preview: its line, then its indented lines without the
-    /// indentation they share; a deeper one keeps the rest of its own.
+    /// A list item's preview: what `show` prints, its body as the file has
+    /// it, blank lines and all.
     #[test]
-    fn an_item_s_preview_has_its_indented_lines() {
+    fn an_item_s_preview_is_what_show_prints() {
         let mut project = crate::project::Project::empty(ProjectName::parse("shop").unwrap());
-        project.backlog = crate::list::ListFile::parse(
-            ListKind::Backlog,
-            b"- b41 Cache the prices\n    why: slow\n    - a list\n      - nested\n\n  free\n- b42 plain\n",
-        );
+        for (number, text) in [
+            (
+                41,
+                "id: b41\norder: 1\n\n# Cache the prices\n\nwhy: slow\n\n- a list\n  - nested\n",
+            ),
+            (42, "id: b42\norder: 2\n\n# plain\n"),
+        ] {
+            project
+                .list_mut(ListKind::Backlog)
+                .insert(number, crate::item::Item::parse(text.as_bytes()));
+        }
         let data = Data {
             backlog: Data::of(&project).backlog,
             ..data()
@@ -944,7 +951,9 @@ mod tests {
             text(&state),
             [
                 "b41 Cache the prices",
+                "",
                 "why: slow",
+                "",
                 "- a list",
                 "  - nested"
             ]

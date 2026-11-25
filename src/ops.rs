@@ -13,7 +13,8 @@ use crate::brief::{
 use crate::error::Error;
 use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
-use crate::list::{Body, FindError, Line, Move, MoveError, NoCheck, RemoveError, RetitleError};
+use crate::item::{self, Body, Item, MoveError};
+use crate::list::{FindError, Line, Move};
 use crate::project::{BoardPath, BriefFile, BriefName, Project, Slug};
 
 /// The sections a brief needs text in before it is queued: what the worker
@@ -239,7 +240,7 @@ pub struct Filed {
     /// `None` for a brief filed with `--no-commits`. Never zero: a brief
     /// without a commit is not filed.
     pub commits: Option<NonZeroUsize>,
-    /// The backlog items whose lines were deleted.
+    /// The backlog items whose files were deleted.
     pub closed: Vec<BacklogId>,
 }
 
@@ -260,7 +261,7 @@ impl fmt::Display for Filed {
     }
 }
 
-/// Files a reported brief: deletes the backlog lines its `closes:` names,
+/// Files a reported brief: deletes the backlog items its `closes:` names,
 /// stamps it filed and moves it to `briefs/done/`, all in one commit.
 ///
 /// The commits are checked after the status, so a brief that is not
@@ -268,8 +269,7 @@ impl fmt::Display for Filed {
 ///
 /// An item `closes:` names that is gone already (dropped meanwhile, or
 /// deleted by hand) is skipped: the brief is what is filed, and the item is
-/// closed either way. One on two lines is refused, as everywhere: deleting
-/// both would guess which one the planner meant.
+/// closed either way.
 pub(crate) fn file(
     project: &mut Project,
     number: BriefId,
@@ -311,27 +311,13 @@ pub(crate) fn file(
             word.escape_debug()
         ))
     })?;
-    let mut closed = Vec::new();
-    for id in closes {
-        match project.list(ListKind::Backlog).find(id.get()) {
-            Ok(_) => closed.push(id),
-            Err(FindError::Missing) => {}
-            Err(why @ FindError::Duplicate(_)) => {
-                return Err(refused(format!(
-                    "closes {id}: {}",
-                    not_one(ListKind::Backlog, id.get(), why)
-                )));
-            }
-        }
-    }
-    // Only a list that loses a line is touched: a brief that closes nothing
-    // must not write a backlog file the project does not have.
-    if !closed.is_empty() {
-        let numbers: Vec<u32> = closed.iter().map(|id| id.get()).collect();
-        project
-            .list_mut(ListKind::Backlog)
-            .remove(&numbers)
-            .expect("each id is on one line, checked above");
+    let closed: Vec<BacklogId> = closes
+        .into_iter()
+        .filter(|id| project.list(ListKind::Backlog).get(id.get()).is_some())
+        .collect();
+    for id in &closed {
+        project.list_mut(ListKind::Backlog).remove(id.get());
+        project.touched(ListId::Backlog(*id));
     }
     let file = project
         .brief_mut(number)
@@ -397,74 +383,99 @@ fn bad_status(bad: &BadStatus) -> String {
 pub struct NewChore {
     pub text: Line,
     pub group: Line,
-    pub check: Line,
+    /// How to see it is done; optional (owner, 2026-11-25: "some chores are
+    /// just that, simple actions. A check would repeat it").
+    pub check: Option<Line>,
     pub from: Option<ItemId>,
     /// Empty for none.
     pub body: Body,
 }
 
-pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore) -> Result<(), Error> {
-    let list = project.list_mut(ListKind::Chores);
-    list.add_chore(id, &new.group, &new.text, &new.check, new.from)
-        .map_err(|NoCheck| Error::Refused(format!("add chore: {}", no_check(&new.check))))?;
-    list.amend_body(id.get(), &new.body, false)
-        .expect("an id just given is on one line");
-    Ok(())
+/// What `retitle --check` asks of a chore's check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckChange {
+    Set(Line),
+    /// `--check ""`: the chore has none after.
+    Remove,
 }
 
-/// Why a check is refused, as `add chore` and `retitle` say it.
-fn no_check(check: &Line) -> String {
-    if check.as_str().contains("Check:") {
-        format!("`{check}` holds a `Check:` of its own; lint would read only what follows it")
-    } else {
-        format!("`{check}` does not say how to see that the chore is done")
-    }
+/// Adds chore `id` last in its group.
+pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore, now: Stamp) {
+    let items = project.list_mut(ListKind::Chores);
+    let order = items.next_order(Some(new.group.as_str().as_bytes()));
+    let item = Item::new(item::New {
+        id: ItemId::Chore(id),
+        group: Some(&new.group),
+        order,
+        check: new.check.as_ref(),
+        from: new.from,
+        created: now,
+        title: &new.text,
+        body: &new.body,
+    });
+    items.insert(id.get(), item);
+    project.touched(ListId::Chore(id));
 }
 
+/// Adds backlog item `id` last in the backlog.
 pub(crate) fn add_backlog(
     project: &mut Project,
     id: BacklogId,
     text: &Line,
     from: Option<ItemId>,
     body: &Body,
+    now: Stamp,
 ) {
-    let list = project.list_mut(ListKind::Backlog);
-    list.add_backlog(id, text, from);
-    list.amend_body(id.get(), body, false)
-        .expect("an id just given is on one line");
+    let items = project.list_mut(ListKind::Backlog);
+    let order = items.next_order(None);
+    let item = Item::new(item::New {
+        id: ItemId::Backlog(id),
+        group: None,
+        order,
+        check: None,
+        from,
+        created: now,
+        title: text,
+        body,
+    });
+    items.insert(id.get(), item);
+    project.touched(ListId::Backlog(id));
 }
 
-/// Changes a chore's or backlog item's line, keeping its id, place,
-/// reference and body; gives what `retitle` prints, as `retitled c12`.
-/// Without it the planner, which writes the board only through `board`,
-/// could change a line only by drop and add: a new id, and the item at the
-/// bottom.
+/// Changes a chore's or backlog item's title, or a chore's check (set or
+/// removed), keeping its id, place, reference, body and every other key;
+/// gives what `retitle` prints, as `retitled c12`. Without it the planner,
+/// which changes single items only through `board`, could change a title
+/// only by drop and add: a new id, and the item at the bottom.
 pub(crate) fn retitle(
     project: &mut Project,
     id: ListId,
     text: Option<&Line>,
-    check: Option<&Line>,
+    check: Option<&CheckChange>,
 ) -> Result<String, Error> {
     let kind = id.kind();
-    let refused = |why: String| Error::Refused(format!("retitle {id}: {why}"));
-    project
-        .list_mut(kind)
-        .retitle(id.get(), text, check)
-        .map_err(|error| match error {
-            RetitleError::Find(why) => refused(not_one(kind, id.get(), why)),
-            RetitleError::NoCheck => refused(no_check(check.expect("only a new check is refused"))),
-            RetitleError::NoCheckOnLine => {
-                refused("its line has no check to keep; give one with --check".to_owned())
-            }
-        })?;
+    let item = project.item_mut(id).ok_or_else(|| {
+        Error::Refused(format!(
+            "retitle {id}: {}",
+            not_one(kind, id.get(), FindError::Missing)
+        ))
+    })?;
+    if let Some(text) = text {
+        item.set_title(text);
+    }
+    match check {
+        Some(CheckChange::Set(check)) => item.set("check", check.as_str()),
+        Some(CheckChange::Remove) => item.remove("check"),
+        None => {}
+    }
     Ok(format!("retitled {id}"))
 }
 
-/// Writes a chore's or backlog item's body: appended, or in place of the
-/// one it has (`--replace`). A replace is there because the planner writes
-/// the board only through `board`: without it, rewriting a parked idea
-/// takes a hand edit of the list file, and append-only bodies collect text
-/// that is no longer true. Appending is the default: it cannot lose text.
+/// Writes a chore's or backlog item's body: appended after one blank line,
+/// or in place of the one it has (`--replace`; empty, it removes the body).
+/// A replace is there because the planner changes single items only
+/// through `board`, and append-only bodies collect text that is no longer
+/// true. Appending is the default: it cannot lose text.
 pub(crate) fn amend_item(
     project: &mut Project,
     id: ListId,
@@ -472,83 +483,99 @@ pub(crate) fn amend_item(
     replace: bool,
 ) -> Result<String, Error> {
     let kind = id.kind();
-    project
-        .list_mut(kind)
-        .amend_body(id.get(), body, replace)
-        .map_err(|why| Error::Refused(format!("amend {id}: {}", not_one(kind, id.get(), why))))?;
+    let item = project.item_mut(id).ok_or_else(|| {
+        Error::Refused(format!(
+            "amend {id}: {}",
+            not_one(kind, id.get(), FindError::Missing)
+        ))
+    })?;
+    if replace {
+        item.set_body(body);
+    } else {
+        item.append_body(body);
+    }
     Ok(format!("amended {id}"))
 }
 
-/// Deletes the chores' lines, all or none; gives what `done` prints.
+/// Deletes the chores' files, all or none; gives what `done` prints.
 pub(crate) fn done(project: &mut Project, ids: &[ChoreId]) -> Result<String, Error> {
-    let numbers: Vec<u32> = ids.iter().map(|id| id.get()).collect();
-    remove(project, ListKind::Chores, &numbers, ("done", "done"))
+    let ids: Vec<ListId> = ids.iter().copied().map(ListId::Chore).collect();
+    remove(project, &ids, ("done", "done"))
 }
 
-/// Deletes the backlog items' lines, all or none; gives what `drop` prints.
+/// Deletes the backlog items' files, all or none; gives what `drop` prints.
 pub(crate) fn drop_items(project: &mut Project, ids: &[BacklogId]) -> Result<String, Error> {
-    let numbers: Vec<u32> = ids.iter().map(|id| id.get()).collect();
-    remove(project, ListKind::Backlog, &numbers, ("drop", "dropped"))
+    let ids: Vec<ListId> = ids.iter().copied().map(ListId::Backlog).collect();
+    remove(project, &ids, ("drop", "dropped"))
 }
 
-/// Moves an item next to another of its list; gives what `move` prints, as
-/// `moved c12 before c3`.
+/// Moves an item next to another of its kind; gives what `move` prints, as
+/// `moved c12 before c3`. Writes the moved item's file, or the files of its
+/// group when that is renumbered ([`Items::move_item`]).
 ///
 /// An item already where it is asked to be changes no file, so the write
 /// makes no commit and the output is the same: what was asked is so.
 pub(crate) fn move_item(project: &mut Project, wanted: &Move) -> Result<String, Error> {
     let kind = wanted.kind();
     let refused = |why: String| Error::Refused(format!("move {}: {why}", wanted.item()));
-    let mut list = project.list(kind).clone();
-    list.move_item(wanted).map_err(|error| match error {
-        MoveError::Item(why) => refused(not_one(kind, wanted.item().get(), why)),
-        MoveError::Target(why) => refused(format!(
-            "{} {}: {}",
-            wanted.side(),
-            wanted.target(),
-            not_one(kind, wanted.target().get(), why)
-        )),
-    })?;
-    if list != *project.list(kind) {
-        *project.list_mut(kind) = list;
+    let changed = project
+        .list_mut(kind)
+        .move_item(wanted)
+        .map_err(|error| match error {
+            MoveError::Item(why) => refused(not_one(kind, wanted.item().get(), why)),
+            MoveError::Target(why) => refused(format!(
+                "{} {}: {}",
+                wanted.side(),
+                wanted.target(),
+                not_one(kind, wanted.target().get(), why)
+            )),
+        })?;
+    for number in changed {
+        project.touched(list_id(kind, number));
     }
     Ok(format!("moved {wanted}"))
+}
+
+fn list_id(kind: ListKind, number: u32) -> ListId {
+    match kind {
+        ListKind::Chores => ListId::Chore(ChoreId::new(number).expect("an item's id is past 0")),
+        ListKind::Backlog => {
+            ListId::Backlog(BacklogId::new(number).expect("an item's id is past 0"))
+        }
+    }
 }
 
 /// `(command, past)`: the command names a refusal, the past tense what was
 /// done.
 fn remove(
     project: &mut Project,
-    kind: ListKind,
-    numbers: &[u32],
+    ids: &[ListId],
     (command, past): (&str, &str),
 ) -> Result<String, Error> {
-    // An id given twice is one line to delete and one word of the output.
-    let mut unique: Vec<u32> = Vec::with_capacity(numbers.len());
-    for number in numbers {
-        if !unique.contains(number) {
-            unique.push(*number);
+    // An id given twice is one file to delete and one word of the output.
+    let mut unique: Vec<ListId> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !unique.contains(id) {
+            unique.push(*id);
         }
     }
-    project
-        .list_mut(kind)
-        .remove(&unique)
-        .map_err(|RemoveError { number, why }| {
+    for id in &unique {
+        project.list(id.kind()).find(id.get()).map_err(|why| {
             Error::Refused(format!(
-                "{command} {}{number}: {}",
-                kind.prefix(),
-                not_one(kind, number, why)
+                "{command} {id}: {}",
+                not_one(id.kind(), id.get(), why)
             ))
         })?;
-    let ids: Vec<String> = unique
-        .iter()
-        .map(|number| format!("{}{number}", kind.prefix()))
-        .collect();
+    }
+    for id in &unique {
+        project.list_mut(id.kind()).remove(id.get());
+        project.touched(*id);
+    }
+    let ids: Vec<String> = unique.iter().map(ListId::to_string).collect();
     Ok(format!("{past} {}", ids.join(" ")))
 }
 
-/// Why a list id names no single item, as every command that takes one says
-/// it.
+/// Why a list id names no item, as every command that takes one says it.
 pub(crate) fn not_one(kind: ListKind, number: u32, why: FindError) -> String {
     match why {
         FindError::Missing => match kind {
@@ -565,15 +592,39 @@ pub(crate) fn not_one(kind: ListKind, number: u32, why: FindError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::list::ListFile;
+    use crate::list::Side::{After, Before};
     use crate::project::{BoardPath, ProjectName};
 
-    fn project(chores: &str, backlog: &str) -> Project {
-        Project {
-            chores: ListFile::parse(ListKind::Chores, chores.as_bytes()),
-            backlog: ListFile::parse(ListKind::Backlog, backlog.as_bytes()),
-            ..Project::empty(ProjectName::parse("shop").unwrap())
+    const CREATED: &str = "2026-11-25T10:00:00Z";
+
+    /// A project with these item files, as `(id, text)`.
+    fn project(chores: &[(u32, &str)], backlog: &[(u32, &str)]) -> Project {
+        let mut project = Project::empty(ProjectName::parse("shop").unwrap());
+        for (kind, items) in [(ListKind::Chores, chores), (ListKind::Backlog, backlog)] {
+            for (number, text) in items {
+                project
+                    .list_mut(kind)
+                    .insert(*number, Item::parse(text.as_bytes()));
+            }
         }
+        project
+    }
+
+    fn chore_file(id: u32, group: &str, order: i64, title: &str) -> String {
+        format!("id: c{id}\ngroup: {group}\norder: {order}\ncreated: {CREATED}\n\n# {title}\n")
+    }
+
+    fn backlog_file(id: u32, order: i64, title: &str) -> String {
+        format!("id: b{id}\norder: {order}\ncreated: {CREATED}\n\n# {title}\n")
+    }
+
+    /// The file of item `id` (`c1`) as the project has it now; `None` once
+    /// deleted.
+    fn file_text(project: &Project, id: &str) -> Option<String> {
+        let path = project.item_path(id.parse().unwrap());
+        project
+            .bytes(&path)
+            .map(|bytes| String::from_utf8(bytes).unwrap())
     }
 
     fn chore(number: u32) -> ChoreId {
@@ -588,6 +639,10 @@ mod tests {
         Line::new(text).unwrap()
     }
 
+    fn now() -> Stamp {
+        "2026-11-25T14:08:18Z".parse().unwrap()
+    }
+
     fn changed(project: &Project) -> Vec<String> {
         project.changed.iter().map(BoardPath::to_string).collect()
     }
@@ -600,147 +655,337 @@ mod tests {
     }
 
     #[test]
-    fn done_deletes_every_line_and_names_each_id_once() {
-        let mut shop = project("- c1 a. Check: x\n- c2 b. Check: y\n- c3 c. Check: z\n", "");
-        assert_eq!(
-            done(&mut shop, &[chore(3), chore(1), chore(3)]).unwrap(),
-            "done c3 c1"
-        );
-        assert_eq!(shop.chores.to_bytes(), b"- c2 b. Check: y\n");
-        assert_eq!(changed(&shop), ["shop/chores.md"]);
-    }
-
-    #[test]
-    fn done_and_drop_refuse_all_for_one_id_that_names_no_single_item() {
-        let chores = "- c1 a. Check: x\n- c2 b. Check: y\n- c2 again. Check: y\n";
-        let backlog_bytes = "- b1 a\n";
-        let mut shop = project(chores, backlog_bytes);
-        assert_eq!(
-            refusal(done(&mut shop, &[chore(1), chore(9)])),
-            "done c9: no such chore"
-        );
-        assert_eq!(
-            refusal(done(&mut shop, &[chore(1), chore(2)])),
-            "done c2: c2 is on 2 lines; fix the duplicate first"
-        );
-        assert_eq!(
-            refusal(drop_items(&mut shop, &[backlog(4)])),
-            "drop b4: no such backlog item"
-        );
-        assert_eq!(shop.chores.to_bytes(), chores.as_bytes());
-        assert_eq!(shop.backlog.to_bytes(), backlog_bytes.as_bytes());
-    }
-
-    #[test]
-    fn drop_says_dropped() {
-        let mut shop = project("", "- b1 a\n- b2 b\n");
-        assert_eq!(drop_items(&mut shop, &[backlog(2)]).unwrap(), "dropped b2");
-        assert_eq!(shop.backlog.to_bytes(), b"- b1 a\n");
-        assert_eq!(changed(&shop), ["shop/backlog.md"]);
-    }
-
-    #[test]
-    fn adds_go_into_their_list() {
-        let mut shop = project("", "");
+    fn add_writes_an_item_s_file_last_in_its_group() {
+        let home = chore_file(1, "Home", 3000, "Old");
+        let mut shop = project(&[(1, &home)], &[]);
+        let new = |text: &str, group: &str, check: Option<&str>, body: &[u8]| NewChore {
+            text: line(text),
+            group: line(group),
+            check: check.map(line),
+            from: None,
+            body: Body::new(body),
+        };
         add_chore(
             &mut shop,
             chore(4),
-            &NewChore {
-                text: line("Rotate the key"),
-                group: line("Home"),
-                check: line("login works"),
-                from: None,
-                body: Body::new(b""),
-            },
-        )
-        .unwrap();
+            &new("Rotate the key", "Home", Some("login works"), b""),
+            now(),
+        );
+        add_chore(
+            &mut shop,
+            chore(5),
+            &new(
+                "Water the plants",
+                "Away",
+                None,
+                b"first\n\n## step\n```sql\nselect 1;\n```",
+            ),
+            now(),
+        );
+        assert_eq!(
+            file_text(&shop, "c4").unwrap(),
+            "id: c4\ngroup: Home\norder: 4000\ncheck: login works\n\
+             created: 2026-11-25T14:08:18Z\n\n# Rotate the key\n"
+        );
+        assert_eq!(
+            file_text(&shop, "c5").unwrap(),
+            "id: c5\ngroup: Away\norder: 1000\ncreated: 2026-11-25T14:08:18Z\n\n\
+             # Water the plants\n\nfirst\n\n## step\n```sql\nselect 1;\n```\n"
+        );
+        let from = Some(ItemId::Brief(BriefId::new(126)));
         add_backlog(
             &mut shop,
             backlog(7),
             &line("Dark mode"),
-            None,
+            from,
             &Body::new(b""),
+            now(),
         );
         assert_eq!(
-            shop.chores.to_bytes(),
-            b"## Home\n- c4 Rotate the key. Check: login works\n"
+            file_text(&shop, "b7").unwrap(),
+            "id: b7\norder: 1000\nfrom: 126\ncreated: 2026-11-25T14:08:18Z\n\n# Dark mode\n"
         );
-        assert_eq!(shop.backlog.to_bytes(), b"- b7 Dark mode\n");
-        assert_eq!(changed(&shop), ["shop/chores.md", "shop/backlog.md"]);
+        assert_eq!(
+            changed(&shop),
+            [
+                "shop/chores/c4.md",
+                "shop/chores/c5.md",
+                "shop/backlog/b7.md"
+            ]
+        );
+        assert_eq!(file_text(&shop, "c1").unwrap(), home);
+    }
+
+    #[test]
+    fn amend_appends_after_one_blank_line_and_replace_takes_the_body_s_place() {
+        let bare = backlog_file(1, 1000, "Later");
+        let with_body = format!("{}\nfirst\n\n\n", backlog_file(2, 2000, "Body"));
+        let mut shop = project(&[], &[(1, &bare), (2, &with_body)]);
+        let body = |text: &str| Body::new(text.as_bytes());
+        assert_eq!(
+            amend_item(&mut shop, "b1".parse().unwrap(), &body("one"), false).unwrap(),
+            "amended b1"
+        );
+        assert_eq!(file_text(&shop, "b1").unwrap(), format!("{bare}\none\n"));
+        amend_item(&mut shop, "b1".parse().unwrap(), &body("two\n"), false).unwrap();
+        assert_eq!(
+            file_text(&shop, "b1").unwrap(),
+            format!("{bare}\none\n\ntwo\n")
+        );
+        amend_item(&mut shop, "b2".parse().unwrap(), &body("more"), false).unwrap();
+        assert_eq!(
+            file_text(&shop, "b2").unwrap(),
+            format!("{}\nfirst\n\nmore\n", backlog_file(2, 2000, "Body"))
+        );
+        amend_item(
+            &mut shop,
+            "b2".parse().unwrap(),
+            &body("new\n\nwhole"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            file_text(&shop, "b2").unwrap(),
+            format!("{}\nnew\n\nwhole\n", backlog_file(2, 2000, "Body"))
+        );
+        // Empty stdin with `--replace`: the file ends at its title.
+        amend_item(&mut shop, "b2".parse().unwrap(), &body(""), true).unwrap();
+        assert_eq!(
+            file_text(&shop, "b2").unwrap(),
+            backlog_file(2, 2000, "Body")
+        );
+        assert_eq!(
+            refusal(amend_item(
+                &mut shop,
+                "c9".parse().unwrap(),
+                &body("x"),
+                false
+            )),
+            "amend c9: no such chore"
+        );
+        // A key the tool does not know stays as it is.
+        let text = "id: b3\norder: 3\nowner: me\ncreated: x\n\n# T\n";
+        let mut shop = project(&[], &[(3, text)]);
+        amend_item(&mut shop, "b3".parse().unwrap(), &body("more"), false).unwrap();
+        assert_eq!(file_text(&shop, "b3").unwrap(), format!("{text}\nmore\n"));
+    }
+
+    #[test]
+    fn retitle_changes_the_title_or_the_check_and_keeps_every_other_byte() {
+        let text = "id: c1\ngroup: Home\norder: 1000\nowner: me\ncheck: old\n\
+                    created: 2026-11-25T10:00:00Z\n\n# Old title\n\nthe body\n";
+        let plain = chore_file(2, "Home", 2000, "No check");
+        let mut shop = project(&[(1, text), (2, &plain)], &[]);
+        assert_eq!(
+            retitle(
+                &mut shop,
+                "c1".parse().unwrap(),
+                Some(&line("New title")),
+                None
+            )
+            .unwrap(),
+            "retitled c1"
+        );
+        assert_eq!(
+            file_text(&shop, "c1").unwrap(),
+            text.replace("# Old title", "# New title")
+        );
+        let set = CheckChange::Set(line("select 1"));
+        retitle(&mut shop, "c1".parse().unwrap(), None, Some(&set)).unwrap();
+        assert_eq!(
+            file_text(&shop, "c1").unwrap(),
+            text.replace("# Old title", "# New title")
+                .replace("check: old", "check: select 1")
+        );
+        retitle(
+            &mut shop,
+            "c1".parse().unwrap(),
+            None,
+            Some(&CheckChange::Remove),
+        )
+        .unwrap();
+        assert_eq!(
+            file_text(&shop, "c1").unwrap(),
+            text.replace("# Old title", "# New title")
+                .replace("check: old\n", "")
+        );
+        // A chore without a check is retitled, and given one.
+        retitle(
+            &mut shop,
+            "c2".parse().unwrap(),
+            Some(&line("Still none")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            file_text(&shop, "c2").unwrap(),
+            chore_file(2, "Home", 2000, "Still none")
+        );
+        retitle(&mut shop, "c2".parse().unwrap(), None, Some(&set)).unwrap();
+        assert_eq!(
+            file_text(&shop, "c2").unwrap(),
+            chore_file(2, "Home", 2000, "Still none")
+                .replace("\n\n# Still none", "\ncheck: select 1\n\n# Still none")
+        );
+        assert_eq!(
+            refusal(retitle(
+                &mut shop,
+                "b3".parse().unwrap(),
+                Some(&line("x")),
+                None
+            )),
+            "retitle b3: no such backlog item"
+        );
+    }
+
+    #[test]
+    fn done_and_drop_delete_the_files_and_name_each_id_once() {
+        let files: Vec<String> = (1..=3)
+            .map(|n| chore_file(n, "Home", 1000 * i64::from(n), "x"))
+            .collect();
+        let mut shop = project(
+            &[(1, &files[0]), (2, &files[1]), (3, &files[2])],
+            &[(1, &backlog_file(1, 1, "b"))],
+        );
+        assert_eq!(
+            refusal(done(&mut shop, &[chore(1), chore(9)])),
+            "done c9: no such chore"
+        );
+        assert_eq!(changed(&shop), Vec::<String>::new());
+        assert_eq!(
+            done(&mut shop, &[chore(3), chore(1), chore(3)]).unwrap(),
+            "done c3 c1"
+        );
+        assert_eq!(
+            (file_text(&shop, "c1"), file_text(&shop, "c3")),
+            (None, None)
+        );
+        assert_eq!(file_text(&shop, "c2").unwrap(), files[1]);
+        assert_eq!(changed(&shop), ["shop/chores/c1.md", "shop/chores/c3.md"]);
+        assert_eq!(
+            refusal(drop_items(&mut shop, &[backlog(4)])),
+            "drop b4: no such backlog item"
+        );
+        assert_eq!(drop_items(&mut shop, &[backlog(1)]).unwrap(), "dropped b1");
+        assert_eq!(file_text(&shop, "b1"), None);
     }
 
     fn moving(item: &str, side: crate::list::Side, target: &str) -> Move {
         Move::new(item.parse().unwrap(), side, target.parse().unwrap()).unwrap()
     }
 
-    #[test]
-    fn move_puts_a_chore_into_the_group_of_the_item_it_goes_next_to() {
-        use crate::list::Side::{After, Before};
-        let chores = "## Home\n- c1 a. Check: x\n- c2 b. Check: x\n## Work\n- c3 c. Check: x\n";
-        let mut shop = project(chores, "");
-        assert_eq!(
-            move_item(&mut shop, &moving("c1", After, "c3")).unwrap(),
-            "moved c1 after c3"
-        );
-        assert_eq!(
-            shop.chores.to_bytes(),
-            b"## Home\n- c2 b. Check: x\n## Work\n- c3 c. Check: x\n- c1 a. Check: x\n"
-        );
-        assert_eq!(changed(&shop), ["shop/chores.md"]);
+    /// Home: c1 1000, c2 2000, c3 3000; Work: c4 1000.
+    fn groups() -> Project {
+        let c: Vec<String> = [
+            (1, "Home", 1000),
+            (2, "Home", 2000),
+            (3, "Home", 3000),
+            (4, "Work", 1000),
+        ]
+        .map(|(n, group, order)| chore_file(n, group, order, "x"))
+        .into();
+        project(&[(1, &c[0]), (2, &c[1]), (3, &c[2]), (4, &c[3])], &[])
+    }
 
-        let mut shop = project(chores, "");
+    #[test]
+    fn a_move_writes_the_moved_item_only() {
+        for (wanted, file_after) in [
+            // Halfway between its new neighbours.
+            (moving("c3", Before, "c2"), chore_file(3, "Home", 1500, "x")),
+            // Last: past the last by a step.
+            (moving("c1", After, "c3"), chore_file(1, "Home", 4000, "x")),
+            // First, into another group: before the first by a step.
+            (moving("c4", Before, "c1"), chore_file(4, "Home", 0, "x")),
+            // Last in another group.
+            (moving("c1", After, "c4"), chore_file(1, "Work", 2000, "x")),
+        ] {
+            let mut shop = groups();
+            assert_eq!(
+                move_item(&mut shop, &wanted).unwrap(),
+                format!("moved {wanted}")
+            );
+            let id = wanted.item().to_string();
+            assert_eq!(changed(&shop), [format!("shop/chores/{id}.md")], "{wanted}");
+            assert_eq!(file_text(&shop, &id).unwrap(), file_after, "{wanted}");
+        }
+    }
+
+    #[test]
+    fn a_move_into_no_gap_renumbers_that_list() {
+        let b: Vec<String> = (1..=3)
+            .map(|n| backlog_file(n, i64::from(n), "x"))
+            .collect();
+        let mut shop = project(&[], &[(1, &b[0]), (2, &b[1]), (3, &b[2])]);
+        move_item(&mut shop, &moving("b3", Before, "b2")).unwrap();
+        assert_eq!(
+            changed(&shop),
+            [
+                "shop/backlog/b1.md",
+                "shop/backlog/b2.md",
+                "shop/backlog/b3.md"
+            ]
+        );
+        assert_eq!(
+            [1, 3, 2].map(|n| file_text(&shop, &format!("b{n}")).unwrap()),
+            [
+                backlog_file(1, 1000, "x"),
+                backlog_file(3, 2000, "x"),
+                backlog_file(2, 3000, "x"),
+            ]
+        );
+        // A chores' group is renumbered alone.
+        let c: Vec<String> = [(1, "Home", 1), (2, "Home", 2), (3, "Work", 5)]
+            .map(|(n, group, order)| chore_file(n, group, order, "x"))
+            .into();
+        let mut shop = project(&[(1, &c[0]), (2, &c[1]), (3, &c[2])], &[]);
         move_item(&mut shop, &moving("c3", Before, "c2")).unwrap();
         assert_eq!(
-            shop.chores.to_bytes(),
-            b"## Home\n- c1 a. Check: x\n- c3 c. Check: x\n- c2 b. Check: x\n## Work\n"
+            changed(&shop),
+            [
+                "shop/chores/c1.md",
+                "shop/chores/c2.md",
+                "shop/chores/c3.md"
+            ]
+        );
+        assert_eq!(
+            file_text(&shop, "c3").unwrap(),
+            chore_file(3, "Home", 2000, "x")
+        );
+        assert_eq!(
+            file_text(&shop, "c2").unwrap(),
+            chore_file(2, "Home", 3000, "x")
         );
     }
 
     #[test]
-    fn a_move_to_where_the_item_is_changes_no_file() {
-        use crate::list::Side::{After, Before};
-        let mut shop = project("", "- b1 a\n- b2 b\n");
+    fn a_move_to_where_the_item_is_changes_no_file_and_keeps_unknown_keys() {
+        let mut shop = groups();
         assert_eq!(
-            move_item(&mut shop, &moving("b2", After, "b1")).unwrap(),
-            "moved b2 after b1"
+            move_item(&mut shop, &moving("c2", After, "c1")).unwrap(),
+            "moved c2 after c1"
         );
-        move_item(&mut shop, &moving("b1", Before, "b2")).unwrap();
-        assert_eq!(shop.backlog.to_bytes(), b"- b1 a\n- b2 b\n");
+        move_item(&mut shop, &moving("c1", Before, "c2")).unwrap();
         assert_eq!(changed(&shop), Vec::<String>::new());
+        let text = "id: b1\norder: 5\nowner: me\ncreated: x\n\n# a\n";
+        let mut shop = project(&[], &[(1, text), (2, &backlog_file(2, 9, "b"))]);
+        move_item(&mut shop, &moving("b1", After, "b2")).unwrap();
+        assert_eq!(
+            file_text(&shop, "b1").unwrap(),
+            text.replace("order: 5", "order: 1009")
+        );
     }
 
     #[test]
-    fn move_refuses_an_id_that_names_no_single_item() {
-        use crate::list::Side::{After, Before};
-        let backlog_bytes = "- b1 a\n- b2 b\n- b2 again\n";
-        let mut shop = project("", backlog_bytes);
-        let mut refused_move = |item: &str, side, target: &str| {
-            refusal(move_item(&mut shop, &moving(item, side, target)))
-        };
+    fn move_refuses_an_id_that_names_no_item() {
+        let mut shop = groups();
         assert_eq!(
-            refused_move("b9", Before, "b1"),
-            "move b9: no such backlog item"
+            refusal(move_item(&mut shop, &moving("c9", Before, "c1"))),
+            "move c9: no such chore"
         );
         assert_eq!(
-            refused_move("b1", After, "b9"),
-            "move b1: after b9: no such backlog item"
+            refusal(move_item(&mut shop, &moving("c1", After, "c9"))),
+            "move c1: after c9: no such chore"
         );
-        assert_eq!(
-            refused_move("b2", Before, "b1"),
-            "move b2: b2 is on 2 lines; fix the duplicate first"
-        );
-        assert_eq!(
-            refused_move("b1", Before, "b2"),
-            "move b1: before b2: b2 is on 2 lines; fix the duplicate first"
-        );
-        assert_eq!(
-            refusal(move_item(
-                &mut project("- c1 a. Check: x\n", ""),
-                &moving("c1", Before, "c2")
-            )),
-            "move c1: before c2: no such chore"
-        );
-        assert_eq!(shop.backlog.to_bytes(), backlog_bytes.as_bytes());
         assert_eq!(changed(&shop), Vec::<String>::new());
     }
 
@@ -753,8 +998,14 @@ mod tests {
         text.parse().unwrap()
     }
 
-    fn with_briefs(files: &[(&str, &str)], backlog: &str) -> Project {
-        let mut project = project("", backlog);
+    /// The briefs, and backlog items with these ids.
+    fn with_briefs(files: &[(&str, &str)], backlog: &[u32]) -> Project {
+        let items: Vec<(u32, String)> = backlog
+            .iter()
+            .map(|n| (*n, backlog_file(*n, i64::from(*n), "x")))
+            .collect();
+        let items: Vec<(u32, &str)> = items.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        let mut project = project(&[], &items);
         for (path, text) in files {
             match BoardPath::parse(&format!("shop/{path}")) {
                 Some(BoardPath::Brief { name, filed, .. }) => project.briefs.push(BriefFile {
@@ -782,7 +1033,7 @@ mod tests {
 
     #[test]
     fn a_new_brief_is_a_draft_header() {
-        let mut shop = project("", "");
+        let mut shop = project(&[], &[]);
         let base = Oid::parse(b"86743aa86743aa86743aa86743aa86743aa86743\n").unwrap();
         let path = new_brief(
             &mut shop,
@@ -803,7 +1054,7 @@ mod tests {
     #[test]
     fn queue_stamps_a_draft_with_text_in_every_required_section() {
         let draft = format!("id: 1\nstatus: draft\n\n{SECTIONS}");
-        let mut shop = with_briefs(&[("briefs/1-a.md", &draft)], "- b41 x\n- b52 y\n");
+        let mut shop = with_briefs(&[("briefs/1-a.md", &draft)], &[41, 52]);
         let closes = [backlog(52), backlog(41), backlog(52)];
         assert_eq!(
             queue(
@@ -825,7 +1076,7 @@ mod tests {
 
         // Without --closes a `closes:` written by hand stays.
         let by_hand = format!("id: 2\nstatus: draft\ncloses: b9\n\n{SECTIONS}");
-        let mut shop = with_briefs(&[("briefs/2-b.md", &by_hand)], "");
+        let mut shop = with_briefs(&[("briefs/2-b.md", &by_hand)], &[]);
         queue(&mut shop, BriefId::new(2), None, at("2026-11-20T16:40:12Z")).unwrap();
         assert!(text_of(&shop, "briefs/2-b.md").contains("\ncloses: b9\n"));
     }
@@ -837,7 +1088,7 @@ mod tests {
         let draft = "id: 1\nstatus: draft\n\n## TASK\nt\n## design\n \n\
                      ## Premises\n```\n## Out of scope\n```\n## Verification\nv\n\
                      ## Report\n## Not doable by the worker\nn\n## Worker protocol\nw\n";
-        let mut shop = with_briefs(&[("briefs/1-a.md", draft)], "");
+        let mut shop = with_briefs(&[("briefs/1-a.md", draft)], &[]);
         assert_eq!(
             refused(queue(
                 &mut shop,
@@ -865,7 +1116,7 @@ mod tests {
                 ("briefs/5-a.md", &full("wip")),
                 ("briefs/6-a.md", &full("draft")),
             ],
-            "- b1 x\n- b1 y\n",
+            &[1],
         );
         let now = at("2026-11-20T16:40:12Z");
         let mut queue_one = |number: u32, closes: Option<&[BacklogId]>| {
@@ -880,10 +1131,6 @@ mod tests {
         assert_eq!(queue_one(4, None), "queue 4: it has no `status:` line");
         assert_eq!(queue_one(5, None), "queue 5: its status `wip` is unknown");
         assert_eq!(queue_one(7, None), "queue 7: no such brief");
-        assert_eq!(
-            queue_one(6, Some(&[backlog(1)])),
-            "queue 6: closes b1: b1 is on 2 lines; fix the duplicate first"
-        );
         assert_eq!(
             queue_one(6, Some(&[backlog(2)])),
             "queue 6: closes b2: no such backlog item"
@@ -904,7 +1151,7 @@ mod tests {
                 ("briefs/done/6-filed.md", &queued("2000-01-01T00:00:00Z")),
                 ("briefs/7-started.md", "status: started\n"),
             ],
-            "",
+            &[],
         );
         let mut order = Vec::new();
         while let Some((number, path)) = next(&mut shop, at("2026-11-20T17:00:00Z")).unwrap() {
@@ -927,7 +1174,7 @@ mod tests {
 
     #[test]
     fn next_on_an_empty_queue_changes_nothing() {
-        let mut shop = with_briefs(&[("briefs/1-a.md", "status: draft\n")], "");
+        let mut shop = with_briefs(&[("briefs/1-a.md", "status: draft\n")], &[]);
         assert_eq!(next(&mut shop, at("2026-11-20T17:00:00Z")).unwrap(), None);
         assert_eq!(changed(&shop), Vec::<String>::new());
     }
@@ -939,7 +1186,7 @@ mod tests {
                 ("briefs/1-a.md", "status: queued\n"),
                 ("briefs/done/1-b.md", ""),
             ],
-            "",
+            &[],
         );
         assert_eq!(
             refused(next(&mut shop, at("2026-11-20T17:00:00Z"))),
@@ -960,7 +1207,7 @@ mod tests {
                 "briefs/1-a.md",
                 "status: started\nstarted: 2026-11-20T17:00:00Z\n\n## Task\nt\n",
             )],
-            "",
+            &[],
         );
         assert_eq!(
             block(&mut shop, BriefId::new(1), &entry("Which db?"), at(T)).unwrap(),
@@ -984,7 +1231,7 @@ mod tests {
                 ("briefs/2-a.md", "status: queued\n"),
                 ("briefs/3-a.md", "status: started\nstarted: x\n"),
             ],
-            "",
+            &[],
         );
         let mut amend_one = |number: u32| {
             amend(
@@ -1013,7 +1260,7 @@ mod tests {
 
     #[test]
     fn report_makes_the_report_and_stamps_reported() {
-        let mut shop = with_briefs(&[("briefs/1-a.md", "status: started\n\n## Task\nt\n")], "");
+        let mut shop = with_briefs(&[("briefs/1-a.md", "status: started\n\n## Task\nt\n")], &[]);
         let text: Text = "Ran:\n## Checks\nall green\n".parse().unwrap();
         assert_eq!(
             report(&mut shop, BriefId::new(1), &text, at(T)).unwrap(),
@@ -1055,7 +1302,7 @@ mod tests {
             for command in 0..3 {
                 // Each on the files as they are: one that goes through
                 // changes the status the next one sees.
-                let mut shop = with_briefs(&files, "");
+                let mut shop = with_briefs(&files, &[]);
                 let result = match command {
                     0 => block(&mut shop, id, &entry("x"), at(T)),
                     1 => amend(&mut shop, id, &entry("x"), at(T)),
@@ -1093,7 +1340,7 @@ mod tests {
                 "report 9: no such brief",
             ]
         );
-        let mut shop = with_briefs(&files, "");
+        let mut shop = with_briefs(&files, &[]);
         for number in [1, 5, 6, 7, 8, 9] {
             let id = BriefId::new(number);
             let _ = block(&mut shop, id, &entry("x"), at(T));
@@ -1121,19 +1368,19 @@ mod tests {
     #[test]
     fn file_closes_the_backlog_items_and_moves_the_brief_to_done() {
         let reported = "id: 1\nstatus: reported\ncloses: b41, b9, b52\n\n# T\n";
-        let mut shop = with_briefs(
-            &[("briefs/1-a.md", reported)],
-            "- b41 a\n  more on a\n- b52 b\n- b60 c\n",
-        );
+        let mut shop = with_briefs(&[("briefs/1-a.md", reported)], &[41, 52, 60]);
         let filed = file(&mut shop, BriefId::new(1), &counted(3), at(T)).unwrap();
         // b9 was dropped since the brief was queued: skipped.
         assert_eq!(filed.to_string(), "filed 1 (3 commits) closed b41 b52");
-        // A closed item goes with its indented lines, as on `drop`.
-        assert_eq!(shop.backlog.to_bytes(), b"- b60 c\n");
+        // A closed item's file is deleted, as on `drop`.
+        assert_eq!(file_text(&shop, "b41"), None);
+        assert_eq!(file_text(&shop, "b52"), None);
+        assert_eq!(file_text(&shop, "b60").unwrap(), backlog_file(60, 60, "x"));
         assert_eq!(
             paths(&shop),
             [
-                "shop/backlog.md",
+                "shop/backlog/b41.md",
+                "shop/backlog/b52.md",
                 "shop/briefs/1-a.md",
                 "shop/briefs/done/1-a.md"
             ]
@@ -1154,7 +1401,7 @@ mod tests {
 
     #[test]
     fn file_without_closes_leaves_the_backlog_alone() {
-        let mut shop = with_briefs(&[("briefs/1-a.md", "status: reported\n")], "");
+        let mut shop = with_briefs(&[("briefs/1-a.md", "status: reported\n")], &[]);
         let filed = file(&mut shop, BriefId::new(1), &Commits::Skipped, at(T)).unwrap();
         assert_eq!(filed.to_string(), "filed 1 (no commits)");
         assert_eq!(
@@ -1162,7 +1409,7 @@ mod tests {
             ["shop/briefs/1-a.md", "shop/briefs/done/1-a.md"]
         );
 
-        let mut shop = with_briefs(&[("briefs/2-a.md", "status: reported\n")], "");
+        let mut shop = with_briefs(&[("briefs/2-a.md", "status: reported\n")], &[]);
         let filed = file(&mut shop, BriefId::new(2), &counted(1), at(T)).unwrap();
         assert_eq!(filed.to_string(), "filed 2 (1 commit)");
     }
@@ -1173,18 +1420,16 @@ mod tests {
             ("briefs/1-a.md", "status: started\n"),
             ("briefs/2-a.md", "status: reported\n"),
             ("briefs/3-a.md", "status: reported\ncloses: b4l\n"),
-            ("briefs/4-a.md", "status: reported\ncloses: b1, b2\n"),
             ("briefs/done/5-a.md", "status: filed\n"),
             ("briefs/6-a.md", "status: reported\n"),
             ("briefs/done/6-b.md", ""),
             ("briefs/7-a.md", "# no header\n"),
         ];
-        let backlog = "- b1 x\n- b2 y\n- b2 z\n";
+        let backlog = &[1, 2];
         let refusals: Vec<String> = [
             (1, counted(2)),
             (2, counted(0)),
             (3, counted(1)),
-            (4, Commits::Skipped),
             (5, counted(1)),
             (6, counted(1)),
             (7, counted(1)),
@@ -1206,7 +1451,6 @@ mod tests {
                  the worker puts it on every commit of the brief (--no-commits files a brief \
                  that changed nothing there)",
                 "file 3: its `closes:` names `b4l`, which is no backlog id; fix the header first",
-                "file 4: closes b2: b2 is on 2 lines; fix the duplicate first",
                 "file 5: it is filed, not reported",
                 "file 6: 6 is on 2 files; fix the duplicate first",
                 "file 7: it has no `status:` line",
@@ -1234,26 +1478,5 @@ mod tests {
             other => panic!("not a usage error: {other:?}"),
         }
         assert_eq!(paths(&shop), Vec::<String>::new());
-    }
-
-    #[test]
-    fn a_chore_whose_check_says_nothing_is_refused() {
-        let mut shop = project("", "");
-        let refused = add_chore(
-            &mut shop,
-            chore(1),
-            &NewChore {
-                text: line("Rotate the key"),
-                group: line("Home"),
-                check: line("(126)"),
-                from: None,
-                body: Body::new(b""),
-            },
-        );
-        assert!(
-            matches!(&refused, Err(Error::Refused(why)) if why == "add chore: `(126)` does not say how to see that the chore is done"),
-            "{refused:?}"
-        );
-        assert_eq!(shop.chores.to_bytes(), b"");
     }
 }

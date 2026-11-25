@@ -17,10 +17,10 @@ Three parties:
 Three lists, one board per project:
 
 - **Briefs** (`126`): one markdown file per piece of work: the planner's design, then the worker's questions and report. Numbered per project. Written by the planner, moved along by both; it ends filed.
-- **Chores** (`c12`): an action of the user's that a brief leaves behind (a deploy, an edit on production, something to judge by eye). A title line under a group heading, with a check that tells it is done, and a body below it if needed: a chore expires unannounced, and the check is how to see it did. It ends deleted, by the user or the planner.
-- **Backlog** (`b41`): an unrefined item for later: a title line, and a body below it if needed. Line order is the user's priority. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
+- **Chores** (`c12`): an action of the user's that a brief leaves behind (a deploy, an edit on production, something to judge by eye). A file of its own with a title, a group, and when the title does not show how to see it is done, a check: a chore expires unannounced, and the check is how to see it did. It ends deleted, by the user or the planner.
+- **Backlog** (`b41`): an unrefined item for later, a file of its own with a title. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
 
-The ID is the first word after a list line's dash (`- b41 …`), so it copies and greps cleanly. What does not fit an item's line goes in its body, the indented lines below it: written from stdin with `board add backlog "<text>" --body`, added to with `board amend <id>` and rewritten with `board amend <id> --replace`, or edited by hand; `board show <id>` and the TUI's preview show it, and it goes when the item does. A chore's check stays on its line. Git history is the archive of everything deleted.
+An item is listed as one line, its ID first (`b41 Dark mode  (from 126)`), so it copies and greps cleanly; its file is named by the ID (`backlog/b41.md`). Header lines hold what the board needs (`id`, a chore's `group`, `order`, a chore's `check`, `from`, `created`), then the `# ` title and, when there is one, the body: Markdown, kept as written, so a query or a list reads and copies whole. A body is written from stdin with `board add backlog "<text>" --body`, added to with `board amend <id>` and rewritten with `board amend <id> --replace`, or edited by hand; `board show <id>` and the TUI's preview show it. The order within a group, or the backlog, is the `order` key: `board move <id> --before <id>` and the TUI's `J`/`K` change it. Git history is the archive of everything deleted.
 
 ## The life of a brief
 
@@ -56,13 +56,13 @@ board-data/
   shop/
     briefs/1-fix-login.md
     briefs/done/
-    chores.md
-    backlog.md
+    chores/c1.md
+    backlog/b1.md
 ```
 
 ## Usage
 
-The planner runs `board new brief <slug>`, `board queue <id>`, `board amend <id>`, `board file <id>`, `board add chore "<text>" --group <group> --check "<check>" --from <id>`, `board add backlog "<text>" --from <id>`, `board retitle <id> "<text>"` (an item's line, keeping its ID and place) and `board done <id>`, and reads with `board ls`, `board ls briefs --status reported` and `board show <id>`. The worker runs `board next`, `board block <id> "<question>"` and `board report <id>`. `board --help` is the reference, and each command has its own (`board queue --help`).
+The planner runs `board new brief <slug>`, `board queue <id>`, `board amend <id>`, `board file <id>`, `board add chore "<text>" --group <group> --check "<check>" --from <id>` (the check only when the title does not say how to see it is done), `board add backlog "<text>" --from <id>`, `board retitle <id> "<text>"` (an item's title, keeping its ID and place) and `board done <id>`, and reads with `board ls`, `board ls briefs --status reported` and `board show <id>`. The worker runs `board next`, `board block <id> "<question>"` and `board report <id>`. `board --help` is the reference, and each command has its own (`board queue --help`).
 
 A session in `~/Work/shop`, from a backlog item to a filed brief:
 
@@ -102,7 +102,7 @@ The TUI edits no text itself: every action is the CLI command of the same name, 
 
 ## Sync
 
-The tool is the only thing that runs git in the board-data clone, and it pushes: the board is shared data, not code waiting for review. Every write takes a lock, commits any hand edits, fetches and merges, applies the change, commits and pushes; reads never touch the network. Editing the list files or a brief in an editor is fine: the next write commits it. `board sync` brings the clone and the remote together without a change of its own; `board lint` checks the files (duplicate IDs, a chore without a check, an unknown status) and is also run after every write. A write that hands out an ID needs the network, and so does `board next`; other writes commit locally and go out with the next push.
+The tool is the only thing that runs git in the board-data clone, and it pushes: the board is shared data, not code waiting for review. Every write takes a lock, commits any hand edits, fetches and merges, applies the change, commits and pushes; reads never touch the network. Editing an item's or a brief's file in an editor is fine: the next write commits it. `board sync` brings the clone and the remote together without a change of its own; `board lint` checks the files (an item's ID or keys, a brief's number or status, a misnamed file, a leftover `chores.md` or `backlog.md` of the older storage) and is also run after every write. An item or a brief changed on two machines keeps the remote's version, and the other is saved beside it as `<file>.local` for you to merge; an item deleted on one machine is deleted, whatever the other did to it. A write that hands out an ID needs the network, and so does `board next`; other writes commit locally and go out with the next push.
 
 ## The planner skill
 

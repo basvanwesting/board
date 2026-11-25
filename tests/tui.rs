@@ -72,14 +72,14 @@ fn main() {
             quote(&clipboard.to_string_lossy())
         ),
     );
-    // An editor that notes its arguments and adds a chore by hand.
+    // An editor that notes its arguments and adds a line to the file's body.
     let editor_args = world.dir().join("editor-args");
     let editor = bin.join("editor");
     script(
         &editor,
         &format!(
             "printf '%s\\n' \"$@\" >{}\n\
-             printf '%s\\n' '- typed in the editor. Check: by eye' >>\"$2\"\n",
+             printf '\\n%s\\n' 'typed in the editor' >>\"$1\"\n",
             quote(&editor_args.to_string_lossy())
         ),
     );
@@ -110,16 +110,24 @@ fn main() {
     // d, y: done through the write loop, after b's commit; then the input
     // ends, and the TUI quits once the write is done.
     tui(&a, "2jdy");
-    let chores = text(world.remote_file("proj/chores.md"));
-    assert!(!chores.contains("c2 "), "{chores}");
-    assert!(chores.contains("- c1 first") && chores.contains("- c3 third"));
+    assert_eq!(
+        world.remote_files("proj/chores"),
+        [
+            "proj/chores/c1.md",
+            "proj/chores/c3.md",
+            "proj/chores/c4.md"
+        ]
+    );
     assert_eq!(world.remote_log()[0], "proj: done c2");
     assert_eq!(
-        a.file("proj/backlog.md"),
-        world.remote_file("proj/backlog.md")
+        a.file("proj/backlog/b1.md"),
+        world.remote_file("proj/backlog/b1.md")
     );
     b.board(&["sync"]).ok();
-    assert_eq!(b.file("proj/chores.md"), a.file("proj/chores.md"));
+    assert_eq!(
+        b.board(&["ls", "chores"]).ok(),
+        a.board(&["ls", "chores"]).ok()
+    );
 
     // x, then a no, an Esc, a ctrl-c: nothing runs.
     let before = world.remote_main();
@@ -130,38 +138,27 @@ fn main() {
     // input ends); c1 goes below c4, past c3 and c4 and back and on.
     tui(&a, "2JJKJ");
     assert_eq!(world.remote_log()[..2], ["proj: move c1", "proj: done c2"]);
-    let chores = text(world.remote_file("proj/chores.md"));
-    let order: Vec<&str> = chores
-        .lines()
-        .filter_map(|line| line.strip_prefix("- "))
-        .map(|item| item.split(' ').next().unwrap())
-        .collect();
-    assert_eq!(order, ["c3", "c4", "c1"]);
+    assert_eq!(
+        a.board(&["ls", "chores"]).ok(),
+        "## home\nc3 third. Check: x\nc4 fourth. Check: x\nc1 first. Check: x\n"
+    );
 
-    // e: the editor on chores.md at c1's line; on return a sync commits
-    // what it added, and gives that line an id. The mouse is captured
-    // while the TUI runs and given back around the editor.
+    // e: the editor on c1's own file; on return a sync commits what it
+    // added. The mouse is captured while the TUI runs and given back
+    // around the editor.
     let raw = tui(&a, "2Ge");
     let (on, off) = (mouse(true), mouse(false));
     assert_eq!(raw, [&on[..], &off, &on, &off].concat());
     let args = fs::read_to_string(&editor_args).expect("the editor ran");
-    let line = chores
-        .lines()
-        .position(|line| line.starts_with("- c1 "))
-        .unwrap()
-        + 1;
     assert_eq!(
         args,
-        format!("+{line}\n{}\n", a.data().join("proj/chores.md").display())
+        format!("{}\n", a.data().join("proj/chores/c1.md").display())
     );
-    let chores = text(world.remote_file("proj/chores.md"));
-    assert!(
-        chores.ends_with("- c5 typed in the editor. Check: by eye\n"),
-        "{chores}"
-    );
+    let c1 = text(world.remote_file("proj/chores/c1.md"));
+    assert!(c1.ends_with("# first\n\ntyped in the editor\n"), "{c1}");
     assert_eq!(
-        world.remote_log()[..3],
-        ["proj: assign c5", "board: hand edits", "proj: move c1"]
+        world.remote_log()[..2],
+        ["board: hand edits", "proj: move c1"]
     );
 
     // y, Y: the id and the line, through OSC 52 and the clipboard helper.

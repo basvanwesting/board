@@ -16,6 +16,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::header::Header;
 use crate::id::{BacklogId, BriefId, ListKind};
 use crate::raw;
 
@@ -302,20 +303,12 @@ pub enum TransitionError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotABacklogId(pub String);
 
-/// The key of a header line: `^[a-z]+:( |$)`.
-fn header_key(content: &[u8]) -> Option<&[u8]> {
-    let colon = content.iter().position(|b| !b.is_ascii_lowercase())?;
-    let (key, rest) = content.split_at(colon);
-    let after = rest.strip_prefix(b":")?;
-    (!key.is_empty() && matches!(after.first(), None | Some(b' '))).then_some(key)
-}
-
 /// A brief file, lossless: writing it back gives the bytes that were read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Brief {
-    /// The leading run of header lines, raw (terminator included). A key the
-    /// tool does not know is a line like any other here, kept as it is.
-    header: Vec<Vec<u8>>,
+    /// The leading run of header lines ([`Header`], shared with the chores'
+    /// and backlog items' files).
+    header: Header,
     /// Everything after the header, untouched.
     body: Vec<u8>,
 }
@@ -512,60 +505,32 @@ impl Brief {
     /// Never fails: a file without header lines (an archived brief placed by
     /// hand) is all body.
     pub fn parse(bytes: &[u8]) -> Brief {
-        let header: Vec<Vec<u8>> = raw::lines(bytes)
-            .take_while(|line| header_key(raw::content(line)).is_some())
-            .map(<[u8]>::to_vec)
-            .collect();
-        let header_len: usize = header.iter().map(Vec::len).sum();
+        let (header, body) = Header::split(bytes);
         Brief {
             header,
-            body: bytes[header_len..].to_vec(),
+            body: body.to_vec(),
         }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        [self.header.concat().as_slice(), &self.body].concat()
+        [self.header.to_bytes().as_slice(), &self.body].concat()
     }
 
     pub fn body(&self) -> &[u8] {
         &self.body
     }
 
-    fn position(&self, key: &str) -> Option<usize> {
-        self.header
-            .iter()
-            .position(|line| header_key(raw::content(line)) == Some(key.as_bytes()))
-    }
-
     /// The trimmed value of the first header line with this key. A key
     /// written twice by hand reads as its first line, which is also the one
     /// a write changes.
     pub fn get(&self, key: &str) -> Option<&[u8]> {
-        let line = raw::content(&self.header[self.position(key)?]);
-        Some(line[key.len() + ":".len()..].trim_ascii())
+        self.header.get(key)
     }
 
     /// Rewrites the key's line in place, or adds the key at the end of the
     /// header. Private: `status` has one writer, [`Brief::transition`].
     fn set(&mut self, key: &str, value: &str) {
-        let line = format!("{key}: {value}").into_bytes();
-        match self.position(key) {
-            Some(at) => {
-                let (_, terminator) = raw::split_terminator(&self.header[at]);
-                self.header[at] = [line.as_slice(), terminator].concat();
-            }
-            None => {
-                let terminator = raw::terminator_of(self.header.first().map(Vec::as_slice));
-                // Only a header that runs to the end of the file can end
-                // without a terminator.
-                if let Some(last) = self.header.last_mut()
-                    && !last.ends_with(b"\n")
-                {
-                    last.extend_from_slice(terminator);
-                }
-                self.header.push([line.as_slice(), terminator].concat());
-            }
-        }
+        self.header.set(key, value);
     }
 
     /// Writes the backlog items the brief resolves, which `file` deletes:
@@ -665,8 +630,7 @@ impl Brief {
     fn terminator(&self) -> &'static [u8] {
         let first = self
             .header
-            .first()
-            .map(Vec::as_slice)
+            .first_line()
             .or_else(|| raw::lines(&self.body).next());
         raw::terminator_of(first)
     }
@@ -675,7 +639,7 @@ impl Brief {
     /// can follow it.
     fn terminate_last_line(&mut self, terminator: &[u8]) {
         let last = if self.body.is_empty() {
-            self.header.last_mut()
+            self.header.last_line_mut()
         } else {
             Some(&mut self.body)
         };
@@ -1850,7 +1814,7 @@ mod tests {
             .iter()
             .map(|section| (section.name.to_vec(), section.text.to_vec()))
             .collect();
-        (brief.header.concat(), body[..preamble].to_vec(), sections)
+        (brief.header.to_bytes(), body[..preamble].to_vec(), sections)
     }
 
     /// `new` is `old`, or, for the last part of the file, `old` with the

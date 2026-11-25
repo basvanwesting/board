@@ -13,8 +13,7 @@
 //!   panel's bottom;
 //! - T3 a cursor stays on its item while the item is shown, whatever came
 //!   (a reload, a filter, a resize, a tab, a move), unless a key moved it;
-//!   one that moved lands where its key says; an item typed by hand that a
-//!   sync gave an id is the same item, here and in T10 and T12;
+//!   one that moved lands where its key says;
 //! - T4 every command comes from the event that gives it, Esc gives none,
 //!   navigation none of its own (the move its key ends, as any other key
 //!   but Esc ends it), and a file change is one load;
@@ -72,17 +71,11 @@ struct Files {
     /// Number, status, lines of text past the header.
     open: Vec<(u32, Option<Status>, u8)>,
     filed: Vec<(u32, u8)>,
-    chores: Vec<ChoreLine>,
-    /// Id, and a variant of the text: the same item edited.
-    backlog: Vec<(Option<u32>, u8)>,
-}
-
-#[derive(Debug, Clone)]
-enum ChoreLine {
-    Group(u8),
-    Item(Option<u32>, u8),
-    /// `c<id><tab>…`: an item without an id, to the CLI (`list::parse_line`).
-    Tabbed(u32, u8),
+    /// Group, id, and a variant of the text: the same item edited (2: no
+    /// check). An id given twice is one item, the first.
+    chores: Vec<(u8, u32, u8)>,
+    /// Id, and a variant of the text. An id given twice is one item.
+    backlog: Vec<(u32, u8)>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,9 +90,6 @@ enum Step {
     /// The files as the last load had them: what a write that changed
     /// another project's files, or nothing, gives.
     LoadSame,
-    /// The files as the last load had them, with an id given to every item
-    /// typed by hand ([`assigned`]): what a sync gives.
-    LoadAssigned,
     LoadFailed,
     /// The answer to `Command::Unpushed` that is out: these briefs have
     /// unpushed commits, which puts the filed ones among them in the
@@ -135,19 +125,13 @@ fn status() -> impl Strategy<Value = Option<Status>> {
 }
 
 /// Few numbers and ids, so that a reload keeps some items, drops some and
-/// adds some, and a hand-typed duplicate comes up.
+/// adds some, and a brief number on two files comes up.
 fn files() -> impl Strategy<Value = Files> {
-    let chore = prop_oneof![
-        1 => (0u8..3).prop_map(ChoreLine::Group),
-        4 => (prop::option::weighted(0.85, 1u32..8), 0u8..2)
-            .prop_map(|(id, variant)| ChoreLine::Item(id, variant)),
-        1 => (1u32..8, 0u8..2).prop_map(|(id, variant)| ChoreLine::Tabbed(id, variant)),
-    ];
     (
         prop::collection::vec((1u32..10, status(), 0u8..60), 0..8),
         prop::collection::vec((1u32..10, 0u8..10), 0..4),
-        prop::collection::vec(chore, 0..14),
-        prop::collection::vec((prop::option::weighted(0.85, 1u32..12), 0u8..2), 0..30),
+        prop::collection::vec((0u8..3, 1u32..12, 0u8..3), 0..14),
+        prop::collection::vec((1u32..14, 0u8..2), 0..30),
     )
         .prop_map(|(open, filed, chores, backlog)| Files {
             open,
@@ -227,7 +211,6 @@ fn step() -> impl Strategy<Value = Step> {
         60 => key().prop_map(Step::Key),
         8 => files().prop_map(Step::Load),
         3 => Just(Step::LoadSame),
-        3 => Just(Step::LoadAssigned),
         10 => (0u64..90).prop_map(Step::Tick),
         4 => Just(Step::FilesChanged),
         8 => answer().prop_map(Step::Answer),
@@ -302,7 +285,6 @@ fn moved() -> impl Strategy<Value = Vec<Step>> {
         8 => prop::sample::select(vec![Char('J'), Char('K')]).prop_map(Step::Key),
         1 => Just(Step::Key(Esc)),
         1 => Just(Step::LoadSame),
-        1 => Just(Step::LoadAssigned),
         1 => files().prop_map(Step::Load),
     ];
     (
@@ -330,45 +312,6 @@ fn moved() -> impl Strategy<Value = Vec<Step>> {
         })
 }
 
-/// A run of `J`/`K` that puts a backlog item next to one typed by hand,
-/// and a sync that gives that one an id while the run goes on: random
-/// files and keys seldom line the three up. Esc first, enough to close
-/// whatever is open, and the cursor from the top.
-fn moved_next_to_hand_typed() -> impl Strategy<Value = Vec<Step>> {
-    use Key::{Char, Esc};
-    (
-        files(),
-        0u8..2,
-        prop::sample::select(vec![Char('j'), Char('r'), Char('q'), Char('1')]),
-    )
-        .prop_map(|(mut files, variant, end)| {
-            // b1 on one line only, so a command can name it.
-            files.backlog.retain(|(id, _)| *id != Some(1));
-            files
-                .backlog
-                .splice(0..0, [(None, variant), (Some(1), variant)]);
-            let mut steps = vec![Step::Load(files)];
-            steps.extend([Esc, Esc, Esc, Esc, Esc].map(Step::Key));
-            steps.extend([Char('3'), Char('g'), Char('g'), Char('j'), Char('K')].map(Step::Key));
-            steps.extend([Step::LoadAssigned, Step::Key(end)]);
-            steps
-        })
-}
-
-/// `e` on a backlog item typed by hand while a sync is out: the editor
-/// waits for the load after it, which gives the item an id.
-fn edited_hand_typed() -> impl Strategy<Value = Vec<Step>> {
-    use Key::{Char, Esc};
-    (files(), 0u8..2, any::<bool>(), 0u8..3).prop_map(|(mut files, variant, ok, how)| {
-        files.backlog.insert(0, (None, variant));
-        let mut steps = vec![Step::Load(files)];
-        steps.extend([Esc, Esc, Esc, Esc, Esc].map(Step::Key));
-        steps.extend([Char('3'), Char('g'), Char('g'), Char('r'), Char('e')].map(Step::Key));
-        steps.extend([Step::Wrote(ok), Step::LoadAssigned, Step::Edited(how)]);
-        steps
-    })
-}
-
 /// `e` while a write is out: the editor waits for its answer and the load
 /// after it, which may give the item an id. Random steps rarely bring the
 /// three in that order.
@@ -377,7 +320,7 @@ fn edit_waits() -> impl Strategy<Value = Vec<Step>> {
         prop::sample::select(vec!['1', '2', '3']),
         0usize..4,
         any::<bool>(),
-        prop::sample::select(vec![Step::LoadSame, Step::LoadAssigned]),
+        Just(Step::LoadSame),
         0u8..3,
     )
         .prop_map(|(panel, down, ok, load, how)| {
@@ -454,8 +397,6 @@ fn trace() -> impl Strategy<Value = (Files, Vec<Step>)> {
         3 => asked(),
         4 => moved(),
         1 => edit_waits(),
-        1 => moved_next_to_hand_typed(),
-        1 => edited_hand_typed(),
         1 => previewed(),
         1 => yanked_whole(),
         1 => moved_then_clicked(),
@@ -472,48 +413,6 @@ fn shop() -> ProjectName {
 
 fn stamp(seconds: u64) -> Stamp {
     Stamp::from_unix(seconds).unwrap()
-}
-
-/// An item's id as its line starts with it: the line of one without an id,
-/// with `<id> ` in front, as a sync gives one.
-fn spelled(prefix: char, id: Option<u32>) -> String {
-    id.map(|id| format!("{prefix}{id} ")).unwrap_or_default()
-}
-
-/// The files after a sync gave every item without an id one, in file
-/// order, from past the highest; the lines whose id was typed with a tab
-/// are left as they are, for brevity.
-fn assigned(files: &Files) -> Files {
-    let mut files = files.clone();
-    let mut next = files
-        .chores
-        .iter()
-        .filter_map(|line| match line {
-            ChoreLine::Item(id, _) => *id,
-            ChoreLine::Tabbed(id, _) => Some(*id),
-            ChoreLine::Group(_) => None,
-        })
-        .max()
-        .unwrap_or(0);
-    for line in &mut files.chores {
-        if let ChoreLine::Item(id @ None, _) = line {
-            next += 1;
-            *id = Some(next);
-        }
-    }
-    let mut next = files
-        .backlog
-        .iter()
-        .filter_map(|(id, _)| *id)
-        .max()
-        .unwrap_or(0);
-    for (id, _) in &mut files.backlog {
-        if id.is_none() {
-            next += 1;
-            *id = Some(next);
-        }
-    }
-    files
 }
 
 /// The data a load of these files gives.
@@ -553,38 +452,52 @@ fn data(files: &Files) -> Data {
             .iter()
             .map(|(number, lines)| brief(*number, Some(Status::Filed), *lines))
             .collect(),
-        chores: ListLine::numbered(
-            ListKind::Chores,
-            files
-                .chores
-                .iter()
-                .map(|line| match line {
-                    ChoreLine::Group(group) => {
-                        ListRow::Group(format!("group {group}").into_bytes())
-                    }
-                    ChoreLine::Item(id, variant) => ListRow::Item(
-                        format!("{}chore v{variant}. Check: it is done", spelled('c', *id))
-                            .into_bytes(),
-                    ),
-                    ChoreLine::Tabbed(id, variant) => ListRow::Item(
-                        format!("c{id}\tchore v{variant}. Check: it is done").into_bytes(),
-                    ),
-                })
-                .collect(),
-        ),
+        chores: ListLine::numbered(ListKind::Chores, chore_rows(&files.chores)),
         backlog: ListLine::numbered(
             ListKind::Backlog,
-            files
-                .backlog
-                .iter()
+            unique(&files.backlog, |(id, _)| *id)
+                .into_iter()
                 .map(|(id, variant)| {
-                    ListRow::Item(
-                        format!("{}backlog item ü v{variant}", spelled('b', *id)).into_bytes(),
-                    )
+                    ListRow::Item(format!("b{id} backlog item ü v{variant}").into_bytes())
                 })
                 .collect(),
         ),
     }
+}
+
+/// The items whose id has not come before: one file per id.
+fn unique<T: Copy>(items: &[T], id: impl Fn(&T) -> u32) -> Vec<T> {
+    let mut seen = Vec::new();
+    items
+        .iter()
+        .filter(|item| {
+            let first = !seen.contains(&id(item));
+            seen.push(id(item));
+            first
+        })
+        .copied()
+        .collect()
+}
+
+/// The chores as `ls` lists them: a group by name, its chores in the order
+/// given (their `order:`), a group only while a chore names it.
+fn chore_rows(chores: &[(u8, u32, u8)]) -> Vec<ListRow> {
+    let chores = unique(chores, |(_, id, _)| *id);
+    let mut rows = Vec::new();
+    for group in 0..3 {
+        let mut items = chores.iter().filter(|(of, _, _)| *of == group).peekable();
+        if items.peek().is_some() {
+            rows.push(ListRow::Group(format!("group {group}").into_bytes()));
+        }
+        for (_, id, variant) in items {
+            let text = match variant {
+                2 => format!("c{id} chore v2"),
+                _ => format!("c{id} chore v{variant}. Check: it is done"),
+            };
+            rows.push(ListRow::Item(text.into_bytes()));
+        }
+    }
+    rows
 }
 
 fn fetched(answer: &Answer) -> Fetched {
@@ -649,21 +562,12 @@ struct Depth {
     dropped_on_reload: u32,
     dropped_unnamed: u32,
     kept_on_reload: u32,
-    /// A run kept across a reload whose sync gave its neighbour an id.
-    kept_next_to_followed: u32,
     came_back: u32,
     edits: u32,
     /// An edit that waited for the writes out.
     edits_waited: u32,
-    /// An edit waited for on an item that the load after gave an id.
-    edit_followed: u32,
     /// A key but Esc or `e` called off an edit waited for.
     edit_called_off: u32,
-    /// A cursor kept on an item a reload gave an id.
-    followed: u32,
-    /// An action key on a line whose id was typed with a tab: no id, to
-    /// the CLI.
-    on_tab_typed_id: u32,
     yanks: u32,
     /// `yy`: the whole item yanked.
     whole_yanks: u32,
@@ -724,14 +628,10 @@ impl Depth {
             dropped_on_reload,
             dropped_unnamed,
             kept_on_reload,
-            kept_next_to_followed,
             came_back,
             edits,
             edits_waited,
-            edit_followed,
             edit_called_off,
-            followed,
-            on_tab_typed_id,
             yanks,
             whole_yanks,
             syncs,
@@ -819,11 +719,7 @@ fn run_trace(first: &Files, steps: &[Step]) -> Result<Depth, TestCaseError> {
                 Event::Loaded(Box::new(data(files)))
             }
             Step::LoadSame => Event::Loaded(Box::new(data(&last))),
-            Step::LoadAssigned => {
-                last = assigned(&last);
-                Event::Loaded(Box::new(data(&last)))
-            }
-            Step::LoadFailed => Event::LoadFailed("cannot read shop/chores.md".to_owned()),
+            Step::LoadFailed => Event::LoadFailed("cannot read shop/chores/c1.md".to_owned()),
             Step::Unpushed(numbers) => {
                 if !oracle.unpushed_out {
                     continue;
@@ -1052,33 +948,13 @@ fn cli_id(kind: ListKind, row: &Row) -> Option<u32> {
     }
 }
 
-/// The oracle's account of an item after a reload from `before` to
-/// `after`: its own key, or, for one typed by hand, the `nth` row in file
-/// order that spells its text, with no id in front or one that was not
-/// there before, when that row has an id. `None` when it is gone.
-fn followed(source: Source, before: &State, after: &State, key: &ItemKey) -> Option<ItemKey> {
-    let rows = all_rows(&after.data, source);
-    if rows.iter().any(|row| row.key.as_ref() == Some(key)) {
-        return Some(key.clone());
-    }
-    let kind = source.list()?;
-    let Ident::Text(text) = &key.ident else {
-        return None;
-    };
-    let old: Vec<u32> = all_rows(&before.data, source)
+/// The oracle's account of an item after a reload: its own key, when the
+/// reload kept it. `None` when it is gone.
+fn followed(source: Source, after: &State, key: &ItemKey) -> Option<ItemKey> {
+    all_rows(&after.data, source)
         .iter()
-        .filter_map(|row| row.key.as_ref()?.id())
-        .collect();
-    let found = rows
-        .iter()
-        .filter_map(|row| row.key.as_ref().map(|key| (key, &row.text)))
-        .filter(|(found, shown)| match found.id() {
-            Some(id) => !old.contains(&id) && **shown == format!("{}{id} {text}", kind.prefix()),
-            None => *shown == text,
-        })
-        .nth(key.nth)?
-        .0;
-    found.id().map(|_| found.clone())
+        .any(|row| row.key.as_ref() == Some(key))
+        .then(|| key.clone())
 }
 
 /// The oracle's `board move`: the item's row taken out and put back next
@@ -1198,17 +1074,9 @@ fn judge(
         _ => None,
     };
     for source in Source::ALL {
-        let Some(mut item) = before.cursor(source).key.clone() else {
+        let Some(item) = before.cursor(source).key.clone() else {
             continue;
         };
-        // An item a sync gave an id is the same item.
-        if let Event::Loaded(_) = event
-            && let Some(found) = followed(source, before, after, &item)
-            && found != item
-        {
-            depth.followed += 1;
-            item = found;
-        }
         let item = &item;
         let items = after.items(source);
         if let Some((on, clicked)) = &clicked
@@ -1311,7 +1179,7 @@ fn judge(
             Command::Yank(text) => {
                 prop_assert!(pressed('y') || pressed('Y'), "yank after {event:?}");
                 // `yy`: the whole item; the trace's items have no body, so
-                // a list item is its line, a brief its file.
+                // an item is its line, a brief its file.
                 if pressed('y')
                     && whole
                     && let Some((source, row)) = before.cursor_item()
@@ -1341,18 +1209,6 @@ fn judge(
                 depth.yanks += 1;
             }
         }
-    }
-    if ['d', 'x', 'y', 'J', 'K'].into_iter().any(pressed)
-        && let Some((source, row)) = before.cursor_item()
-        && let Some(kind) = source.list()
-        && cli_id(kind, &row).is_none()
-        && row
-            .text
-            .split_whitespace()
-            .next()
-            .is_some_and(|word| kind.parse_id(word.as_bytes()).is_some())
-    {
-        depth.on_tab_typed_id += 1;
     }
     match event {
         Event::Key(Key::Esc) => prop_assert!(commands.is_empty(), "{commands:?} after Esc"),
@@ -1548,15 +1404,11 @@ fn judge(
                     .iter()
                     .position(|row| row.key.as_ref() == Some(&moving.item));
                 let nameable = at.is_some_and(|at| named(&rows, at).is_some());
-                // A neighbour a sync gave an id is the same neighbour.
-                let next_to = followed(moving.source, before, after, &moving.place.1);
+                let next_to = followed(moving.source, after, &moving.place.1);
                 prop_assert_eq!(goes_on, nameable && next_to.is_some());
                 if goes_on {
                     let place = &after.moving.as_ref().expect("goes on").place;
                     prop_assert_eq!(Some(&place.1), next_to.as_ref());
-                    if place.1 != moving.place.1 {
-                        depth.kept_next_to_followed += 1;
-                    }
                     depth.kept_on_reload += 1;
                 } else {
                     prop_assert!(dropped);
@@ -1654,7 +1506,7 @@ fn judge(
     if let (Event::Loaded(_), Some((source, item))) = (event, &before.edit_wanted)
         && after.writes.is_empty()
     {
-        let there = followed(*source, before, after, item).is_some_and(|found| {
+        let there = followed(*source, after, item).is_some_and(|found| {
             after
                 .rows(*source)
                 .iter()
@@ -1695,37 +1547,23 @@ fn judge(
                 (source, row.key.expect("an item"))
             } else {
                 depth.edits_waited += 1;
-                let (source, item) = before.edit_wanted.clone().expect("an edit was waited for");
-                // An item a sync gave an id is the same item.
-                let found = match event {
-                    Event::Loaded(_) => followed(source, before, after, &item),
-                    _ => None,
-                }
-                .unwrap_or_else(|| item.clone());
-                if found != item {
-                    depth.edit_followed += 1;
-                }
-                (source, found)
+                before.edit_wanted.clone().expect("an edit was waited for")
             };
             let row = after
                 .rows(source)
                 .into_iter()
                 .find(|row| row.key.as_ref() == Some(&item))
                 .expect("the item is there");
+            prop_assert_eq!(*line, None);
             match source.list() {
-                None => {
-                    prop_assert_eq!(path, &after.brief(source, &row).path);
-                    prop_assert_eq!(*line, None);
-                }
+                None => prop_assert_eq!(path, &after.brief(source, &row).path),
+                // The item's own file, by the id on its row.
                 Some(kind) => {
+                    let id = cli_id(kind, &row).expect("a row with an id");
                     prop_assert_eq!(
-                        path,
-                        &BoardPath::List {
-                            project: shop(),
-                            kind
-                        }
+                        path.to_string(),
+                        format!("shop/{}/{}{id}.md", kind.dir_name(), kind.prefix())
                     );
-                    prop_assert_eq!(*line, Some(after.data.list(kind)[row.at].line));
                 }
             }
             depth.edits += 1;
@@ -1911,16 +1749,11 @@ fn the_traces_get_deep() {
         ("moved_to_other_group", depth.moved_to_other_group > 0),
         ("moved_behind_a_write", depth.moved_behind_a_write > 0),
         ("dropped_on_reload", depth.dropped_on_reload > 0),
-        ("dropped_unnamed", depth.dropped_unnamed > 0),
         ("kept_on_reload", depth.kept_on_reload > 0),
-        ("kept_next_to_followed", depth.kept_next_to_followed > 0),
         ("came_back", depth.came_back > 0),
         ("edits", depth.edits > 0),
         ("edits_waited", depth.edits_waited > 0),
-        ("edit_followed", depth.edit_followed > 0),
         ("edit_called_off", depth.edit_called_off > 0),
-        ("followed", depth.followed > 0),
-        ("on_tab_typed_id", depth.on_tab_typed_id > 0),
         ("yanks", depth.yanks > 0),
         ("whole_yanks", depth.whole_yanks > 0),
         ("syncs", depth.syncs > 0),
@@ -1950,8 +1783,8 @@ fn focus_along(keys: &[Key]) -> Vec<(Panel, bool)> {
         &Files {
             open: vec![(1, None, 1)],
             filed: Vec::new(),
-            chores: vec![ChoreLine::Item(Some(1), 0)],
-            backlog: vec![(Some(1), 0)],
+            chores: vec![(0, 1, 0)],
+            backlog: vec![(1, 0)],
         },
         keys,
     )
@@ -2010,15 +1843,15 @@ fn zero_enters_the_preview_from_each_panel() {
     );
 }
 
-/// Without an item under the cursor `0` does nothing, as Enter: a panel
-/// with only a heading, an empty one. In the preview it does nothing either.
+/// Without an item under the cursor `0` does nothing, as Enter: an empty
+/// panel. In the preview it does nothing either.
 #[test]
 fn zero_needs_an_item_and_does_nothing_in_the_preview() {
     use Key::Char;
     let files = Files {
         open: vec![(1, None, 1)],
         filed: Vec::new(),
-        chores: vec![ChoreLine::Group(0)],
+        chores: Vec::new(),
         backlog: Vec::new(),
     };
     assert_eq!(
@@ -2054,12 +1887,12 @@ fn zero_typed_into_a_filter_is_filter_text() {
 }
 
 /// The yanks each key gives, on a board with brief 1 and two chores: c1,
-/// and one without an id.
+/// and c2 without a check.
 fn yanks_along(keys: &[Key]) -> Vec<Vec<String>> {
     let files = Files {
         open: vec![(1, Some(Status::Queued), 0)],
         filed: Vec::new(),
-        chores: vec![ChoreLine::Item(Some(1), 0), ChoreLine::Item(None, 1)],
+        chores: vec![(0, 1, 0), (0, 2, 2)],
         backlog: Vec::new(),
     };
     let (mut state, _) = start(&files, 1_000_000).unwrap();
@@ -2105,8 +1938,7 @@ fn yy_yanks_the_whole_item_and_y_still_the_id() {
             vec![id]
         ]
     );
-    // A chore: its line; one without an id: `y` takes nothing, `yy` its
-    // line all the same.
+    // A chore: its id, then what `show` prints.
     assert_eq!(
         yanks_along(&[
             Char('2'),
@@ -2121,8 +1953,8 @@ fn yy_yanks_the_whole_item_and_y_still_the_id() {
             vec!["c1".to_owned()],
             vec!["c1 chore v0. Check: it is done\n".to_owned()],
             vec![],
-            vec![],
-            vec!["chore v1. Check: it is done\n".to_owned()],
+            vec!["c2".to_owned()],
+            vec!["c2 chore v2\n".to_owned()],
         ]
     );
 }

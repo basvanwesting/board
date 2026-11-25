@@ -682,7 +682,7 @@ mod tests {
     fn a_change_in_the_project_reloads_and_a_read_or_git_does_not() {
         let dir = PathBuf::from("/data/shop");
         let modify = EventKind::Modify(ModifyKind::Data(DataChange::Content));
-        assert!(changes(&event(modify, "/data/shop/chores.md"), &dir));
+        assert!(changes(&event(modify, "/data/shop/chores/c1.md"), &dir));
         assert!(changes(
             &event(
                 EventKind::Create(CreateKind::File),
@@ -693,7 +693,7 @@ mod tests {
         assert!(changes(
             &event(
                 EventKind::Access(AccessKind::Close(AccessMode::Write)),
-                "/data/shop/backlog.md"
+                "/data/shop/backlog/b1.md"
             ),
             &dir
         ));
@@ -704,14 +704,14 @@ mod tests {
             AccessKind::Close(AccessMode::Read),
         ] {
             assert!(!changes(
-                &event(EventKind::Access(read), "/data/shop/chores.md"),
+                &event(EventKind::Access(read), "/data/shop/chores/c1.md"),
                 &dir
             ));
         }
         assert!(!changes(&event(modify, "/data/.git/FETCH_HEAD"), &dir));
-        assert!(!changes(&event(modify, "/data/other/chores.md"), &dir));
+        assert!(!changes(&event(modify, "/data/other/chores/c1.md"), &dir));
         // `shop` is not the directory of `shop2`.
-        assert!(!changes(&event(modify, "/data/shop2/chores.md"), &dir));
+        assert!(!changes(&event(modify, "/data/shop2/chores/c1.md"), &dir));
         assert!(changes(
             &Err(notify::Error::generic("queue overflow")),
             &dir

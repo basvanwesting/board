@@ -7,3 +7,4 @@
 cc 3bcd80dc1608d5d510816a0d97507c81539bb3bf69fc87d5c88749630e13d346 # shrinks to base = "\tless\n", ours = "", theirs = "- c1 a\n\tless\n", union = ""
 cc d3348de12db95fa228160294345940a3ce94709e64209ab18c3791ff4331257f # shrinks to base = "", ours = "- c5 a\n- c4 b\n\tless\n", theirs = "- c4 a\n", union = "- c1 a\n\tless\n"
 cc a227179c1bd7fa0088f999af16df3a6a8f3764c91ccafb93a39d06567d44aa2b # shrinks to x = "", y = "- c1 a\n\tless\n- no id\n\tless\n"
+cc ca14e8efc5c4cdbd7364abbf08fa1ed8848f289b5259cfcfe6adca696572696e # shrinks to base = {"shop/chores/c1.md": "y"}, ours = {}, theirs = {"shop/chores/c1.md": "x"}

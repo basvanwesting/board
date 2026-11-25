@@ -13,8 +13,9 @@ use std::str::FromStr;
 use crate::brief::{BadStatus, Brief, Stamp, Status, Transition, TransitionError};
 use crate::error::Error;
 use crate::git::{self, Git, Oid};
-use crate::id::{BriefId, ListKind};
-use crate::list::{FindError, ListFile};
+use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
+use crate::item::{Item, Items};
+use crate::list::FindError;
 
 /// What a command takes from the process it runs in. `main` fills it once;
 /// nothing below reads the environment or the current directory again, so a
@@ -331,18 +332,19 @@ impl std::error::Error for InvalidSlug {}
 /// A path the board owns, relative to `$BOARD_ROOT`:
 ///
 /// ```text
-/// <project>/chores.md | <project>/backlog.md
+/// <project>/chores/c<id>.md | <project>/backlog/b<id>.md
 /// <project>/briefs/<brief> | <project>/briefs/done/<brief>
 /// ```
+///
+/// An item's file is named by its id only (owner, 2026-11-25): a retitle
+/// never renames it.
 ///
 /// Anything else in the repo is not the board's: never committed by the tool,
 /// never merged.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BoardPath {
-    List {
-        project: ProjectName,
-        kind: ListKind,
-    },
+    /// A chore's or backlog item's file.
+    Item { project: ProjectName, id: ListId },
     Brief {
         project: ProjectName,
         name: BriefName,
@@ -362,8 +364,17 @@ impl BoardPath {
     pub fn parse(path: &str) -> Option<BoardPath> {
         let (project, rest) = path.split_once('/')?;
         let project = ProjectName::parse(project)?;
-        if let Some(kind) = ListKind::ALL.into_iter().find(|k| k.file_name() == rest) {
-            return Some(BoardPath::List { project, kind });
+        for kind in ListKind::ALL {
+            if let Some(name) = rest
+                .strip_prefix(kind.dir_name())
+                .and_then(|rest| rest.strip_prefix('/'))
+            {
+                let number = kind.parse_id(name.strip_suffix(".md")?.as_bytes())?;
+                return Some(BoardPath::Item {
+                    project,
+                    id: list_id(kind, number)?,
+                });
+            }
         }
         let brief = rest.strip_prefix("briefs/")?;
         let (filed, file_name) = match brief.strip_prefix("done/") {
@@ -378,9 +389,24 @@ impl BoardPath {
         })
     }
 
+    /// The brief or item the path is of.
+    pub fn item_id(&self) -> ItemId {
+        match self {
+            BoardPath::Item {
+                id: ListId::Chore(id),
+                ..
+            } => ItemId::Chore(*id),
+            BoardPath::Item {
+                id: ListId::Backlog(id),
+                ..
+            } => ItemId::Backlog(*id),
+            BoardPath::Brief { name, .. } => ItemId::Brief(name.number()),
+        }
+    }
+
     pub fn project(&self) -> &ProjectName {
         match self {
-            BoardPath::List { project, .. } | BoardPath::Brief { project, .. } => project,
+            BoardPath::Item { project, .. } | BoardPath::Brief { project, .. } => project,
         }
     }
 }
@@ -388,7 +414,9 @@ impl BoardPath {
 impl fmt::Display for BoardPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BoardPath::List { project, kind } => write!(f, "{project}/{}", kind.file_name()),
+            BoardPath::Item { project, id } => {
+                write!(f, "{project}/{}/{id}.md", id.kind().dir_name())
+            }
             BoardPath::Brief {
                 project,
                 name,
@@ -472,19 +500,24 @@ impl BriefFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub(crate) name: ProjectName,
-    pub(crate) chores: ListFile,
-    pub(crate) backlog: ListFile,
+    pub(crate) chores: Items,
+    pub(crate) backlog: Items,
     /// By number, an open brief before a filed one, then by file name.
     pub(crate) briefs: Vec<BriefFile>,
-    /// The `.md` files below `briefs/` that are outside the path grammar, as
-    /// paths relative to the board-data root. The tool does not sync them;
-    /// lint says so.
+    /// The `.md` files below `briefs/`, `chores/` and `backlog/` that are
+    /// outside the path grammar, as paths relative to the board-data root.
+    /// The tool does not sync them; lint says so.
     pub(crate) misnamed: Vec<String>,
-    /// The local versions of briefs that lost to the remote's in a merge
-    /// (`<brief path>.local`, `.local2`, …), as paths relative to the
-    /// board-data root with their brief's number. Untracked, so only a load
+    /// `<project>/chores.md` and `<project>/backlog.md`, the one file per
+    /// kind of the storage before item files, when one is still there: not
+    /// read, so lint says its items are not on the board until it is
+    /// converted.
+    pub(crate) old_lists: Vec<String>,
+    /// The local versions of briefs and items that lost to the remote's in
+    /// a merge (`<path>.local`, `.local2`, …), as paths relative to the
+    /// board-data root with what they are of. Untracked, so only a load
     /// from the files has them.
-    pub(crate) copies: Vec<(String, BriefId)>,
+    pub(crate) copies: Vec<(String, ItemId)>,
     /// The files an edit went through since the load: what a write commits.
     pub(crate) changed: BTreeSet<BoardPath>,
 }
@@ -495,10 +528,11 @@ impl Project {
     pub fn empty(name: ProjectName) -> Project {
         Project {
             name,
-            chores: ListFile::parse(ListKind::Chores, b""),
-            backlog: ListFile::parse(ListKind::Backlog, b""),
+            chores: Items::new(ListKind::Chores),
+            backlog: Items::new(ListKind::Backlog),
             briefs: Vec::new(),
             misnamed: Vec::new(),
+            old_lists: Vec::new(),
             copies: Vec::new(),
             changed: BTreeSet::new(),
         }
@@ -508,7 +542,7 @@ impl Project {
         &self.name
     }
 
-    pub fn list(&self, kind: ListKind) -> &ListFile {
+    pub fn list(&self, kind: ListKind) -> &Items {
         match kind {
             ListKind::Chores => &self.chores,
             ListKind::Backlog => &self.backlog,
@@ -552,16 +586,35 @@ impl Project {
         self.briefs.sort_by(brief_order);
     }
 
-    /// A list to edit; the edit is committed by the write it runs in.
-    pub(crate) fn list_mut(&mut self, kind: ListKind) -> &mut ListFile {
-        self.changed.insert(BoardPath::List {
-            project: self.name.clone(),
-            kind,
-        });
+    /// A kind's items to edit: [`Project::touched`] then names the files the
+    /// edit changed, which the write commits.
+    pub(crate) fn list_mut(&mut self, kind: ListKind) -> &mut Items {
         match kind {
             ListKind::Chores => &mut self.chores,
             ListKind::Backlog => &mut self.backlog,
         }
+    }
+
+    /// Records that the file of item `id` changed (or is gone): the write
+    /// commits it.
+    pub(crate) fn touched(&mut self, id: ListId) {
+        self.changed.insert(self.item_path(id));
+    }
+
+    /// The path of item `id` in this project, whether it is there or not.
+    pub fn item_path(&self, id: ListId) -> BoardPath {
+        BoardPath::Item {
+            project: self.name.clone(),
+            id,
+        }
+    }
+
+    /// The item with this id, to edit; the edit is committed by the write
+    /// it runs in.
+    pub(crate) fn item_mut(&mut self, id: ListId) -> Option<&mut Item> {
+        self.list(id.kind()).get(id.get())?;
+        self.touched(id);
+        self.list_mut(id.kind()).get_mut(id.get())
     }
 
     /// The paths a write commits: every file an edit went through, and
@@ -588,8 +641,8 @@ impl Project {
     /// project does not have.
     pub(crate) fn bytes(&self, path: &BoardPath) -> Option<Vec<u8>> {
         match path {
-            BoardPath::List { project, kind } if *project == self.name => {
-                Some(self.list(*kind).to_bytes())
+            BoardPath::Item { project, id } if *project == self.name => {
+                self.list(id.kind()).get(id.get()).map(Item::to_bytes)
             }
             BoardPath::Brief {
                 project,
@@ -600,7 +653,7 @@ impl Project {
                 .iter()
                 .find(|file| file.name == *name && file.filed == *filed)
                 .map(|file| file.brief.to_bytes()),
-            BoardPath::List { .. } | BoardPath::Brief { .. } => None,
+            BoardPath::Item { .. } | BoardPath::Brief { .. } => None,
         }
     }
 
@@ -610,35 +663,33 @@ impl Project {
     /// an editor shows, hand edits included, and cannot hang behind a write
     /// that waits for the network.
     pub fn load(root: &Path, name: &ProjectName) -> Result<Project, Error> {
-        let dir = root.join(name.as_str());
         let mut project = Project::empty(name.clone());
+        let mut files = Vec::new();
+        for dir in DIRS {
+            files_below(root, &Path::new(name.as_str()).join(dir), &mut files)?;
+        }
         for kind in ListKind::ALL {
-            if let Some(bytes) = read_if_there(&dir.join(kind.file_name()))? {
-                project.set_list(kind, &bytes);
+            let old = format!("{name}/{}", kind.file_name());
+            if root.join(&old).is_file() {
+                project.old_lists.push(old);
             }
         }
-        let mut files = Vec::new();
-        files_below(root, &Path::new(name.as_str()).join("briefs"), &mut files)?;
         for relative in files {
-            // The one path grammar decides what is a brief; this function
-            // only knows where briefs are looked for. A path that is not
-            // UTF-8 is outside the grammar.
+            // The one path grammar decides what is a brief or an item; this
+            // function only knows where they are looked for. A path that is
+            // not UTF-8 is outside the grammar.
             match relative.to_str().and_then(BoardPath::parse) {
-                Some(BoardPath::Brief {
-                    name: brief_name,
-                    filed,
-                    ..
-                }) => {
+                Some(path) => {
                     let file = root.join(&relative);
                     let bytes =
                         fs::read(&file).map_err(|source| Error::io("read", &file, source))?;
-                    project.add_brief(brief_name, filed, &bytes);
+                    project.add(path, &bytes);
                 }
-                Some(BoardPath::List { .. }) | None => {
+                None => {
                     let relative = relative.to_string_lossy();
                     match copy_of(&relative) {
-                        Some(number) => project.copies.push((relative.into_owned(), number)),
-                        None => project.not_a_brief(&relative),
+                        Some(of) => project.copies.push((relative.into_owned(), of)),
+                        None => project.not_the_boards(&relative),
                     }
                 }
             }
@@ -659,7 +710,7 @@ impl Project {
             Error::Git(format!("cannot read {name} at {commit}: {failure}"))
         };
         let mut project = Project::empty(name.clone());
-        let briefs_dir = format!("{name}/briefs/");
+        let dirs = DIRS.map(|dir| format!("{name}/{dir}/"));
         let mut wanted = Vec::new();
         let mut ids = Vec::new();
         for (id, path) in git.files(commit, name.as_str()).map_err(unreadable)? {
@@ -668,43 +719,43 @@ impl Project {
                     wanted.push(board_path);
                     ids.push(id);
                 }
-                None if path.starts_with(&briefs_dir) => project.not_a_brief(&path),
+                None if dirs.iter().any(|dir| path.starts_with(dir.as_str())) => {
+                    project.not_the_boards(&path);
+                }
+                None if ListKind::ALL
+                    .iter()
+                    .any(|kind| path == format!("{name}/{}", kind.file_name())) =>
+                {
+                    project.old_lists.push(path);
+                }
                 None => {}
             }
         }
         let blobs = git.blobs(&ids).map_err(unreadable)?;
         for (path, bytes) in wanted.into_iter().zip(blobs) {
-            match path {
-                BoardPath::List { kind, .. } => project.set_list(kind, &bytes),
-                BoardPath::Brief {
-                    name: brief_name,
-                    filed,
-                    ..
-                } => project.add_brief(brief_name, filed, &bytes),
-            }
+            project.add(path, &bytes);
         }
         Ok(project.sorted())
     }
 
-    fn set_list(&mut self, kind: ListKind, bytes: &[u8]) {
-        let file = ListFile::parse(kind, bytes);
-        match kind {
-            ListKind::Chores => self.chores = file,
-            ListKind::Backlog => self.backlog = file,
+    fn add(&mut self, path: BoardPath, bytes: &[u8]) {
+        match path {
+            BoardPath::Item { id, .. } => {
+                self.list_mut(id.kind())
+                    .insert(id.get(), Item::parse(bytes));
+            }
+            BoardPath::Brief { name, filed, .. } => self.briefs.push(BriefFile {
+                name,
+                filed,
+                brief: Brief::parse(bytes),
+            }),
         }
     }
 
-    fn add_brief(&mut self, name: BriefName, filed: bool, bytes: &[u8]) {
-        self.briefs.push(BriefFile {
-            name,
-            filed,
-            brief: Brief::parse(bytes),
-        });
-    }
-
-    /// A file below `briefs/` that the one path grammar does not take as a
-    /// brief: lint names it when it looks like one, an `.md`.
-    fn not_a_brief(&mut self, relative: &str) {
+    /// A file below `briefs/`, `chores/` or `backlog/` that the one path
+    /// grammar does not take as the board's: lint names it when it looks
+    /// like one, an `.md`.
+    fn not_the_boards(&mut self, relative: &str) {
         if relative.ends_with(".md") {
             self.misnamed.push(relative.to_owned());
         }
@@ -733,23 +784,26 @@ pub(crate) fn copy_paths(brief: &str) -> impl Iterator<Item = String> + '_ {
     })
 }
 
-/// The brief a conflict copy is of, when `path` is one: a brief path with
-/// `.local` or `.local<n>` (n from 2) after it.
-fn copy_of(path: &str) -> Option<BriefId> {
-    let (brief, n) = path.rsplit_once(".local")?;
+/// What a conflict copy is of, when `path` is one: a brief's or an item's
+/// path with `.local` or `.local<n>` (n from 2) after it.
+fn copy_of(path: &str) -> Option<ItemId> {
+    let (of, n) = path.rsplit_once(".local")?;
     let numbered =
         n.is_empty() || (n.bytes().all(|b| b.is_ascii_digit()) && !n.starts_with('0') && n != "1");
-    match BoardPath::parse(brief) {
-        Some(BoardPath::Brief { name, .. }) if numbered => Some(name.number()),
-        Some(BoardPath::Brief { .. } | BoardPath::List { .. }) | None => None,
+    if !numbered {
+        return None;
     }
+    BoardPath::parse(of).map(|path| path.item_id())
 }
 
-fn read_if_there(file: &Path) -> Result<Option<Vec<u8>>, Error> {
-    match fs::read(file) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::io("read", file, source)),
+/// The directories of a project the tool reads: what is below them is the
+/// board's when the path grammar says so, else misnamed.
+const DIRS: [&str; 3] = ["briefs", "chores", "backlog"];
+
+fn list_id(kind: ListKind, number: u32) -> Option<ListId> {
+    match kind {
+        ListKind::Chores => ChoreId::new(number).map(ListId::Chore),
+        ListKind::Backlog => BacklogId::new(number).map(ListId::Backlog),
     }
 }
 
@@ -794,7 +848,7 @@ mod tests {
                 name.slug().to_owned(),
                 filed,
             )),
-            BoardPath::List { .. } => None,
+            BoardPath::Item { .. } => None,
         }
     }
 
@@ -802,17 +856,17 @@ mod tests {
     fn the_four_shapes() {
         let shop = ProjectName::parse("shop").unwrap();
         assert_eq!(
-            BoardPath::parse("shop/chores.md"),
-            Some(BoardPath::List {
+            BoardPath::parse("shop/chores/c12.md"),
+            Some(BoardPath::Item {
                 project: shop.clone(),
-                kind: ListKind::Chores
+                id: "c12".parse().unwrap()
             })
         );
         assert_eq!(
-            BoardPath::parse("shop/backlog.md"),
-            Some(BoardPath::List {
+            BoardPath::parse("shop/backlog/b41.md"),
+            Some(BoardPath::Item {
                 project: shop,
-                kind: ListKind::Backlog
+                id: "b41".parse().unwrap()
             })
         );
         assert_eq!(
@@ -856,6 +910,18 @@ mod tests {
             "shop/briefs/sub/128-a.md",
             "shop/briefs/done/done/128-a.md",
             "shop/briefs/done/128-a/b.md",
+            // The list files are not the board's any more.
+            "shop/chores.md",
+            "shop/backlog.md",
+            "shop/chores/b12.md",
+            "shop/backlog/c12.md",
+            "shop/chores/c012.md",
+            "shop/chores/c0.md",
+            "shop/chores/c12",
+            "shop/chores/c12-slug.md",
+            "shop/chores/sub/c12.md",
+            "shop/backlog/b41.md.local",
+            "shop/chores/notes.md",
         ] {
             assert_eq!(BoardPath::parse(path), None, "{path}");
         }
@@ -874,8 +940,16 @@ mod tests {
             ]
         );
         for path in &named {
-            assert_eq!(copy_of(path), Some(BriefId::new(128)), "{path}");
+            assert_eq!(
+                copy_of(path),
+                Some(ItemId::Brief(BriefId::new(128))),
+                "{path}"
+            );
         }
+        assert_eq!(
+            copy_of("shop/chores/c3.md.local2"),
+            Some(ItemId::Chore(ChoreId::new(3).unwrap()))
+        );
         for path in [
             "shop/briefs/done/128-x.md.local1",
             "shop/briefs/done/128-x.md.local02",
@@ -978,7 +1052,8 @@ mod tests {
         let project = "[A-Za-z0-9][A-Za-z0-9._-]{0,8}";
         let brief = "[0-9]{1,9}-[^/]{1,12}\\.md";
         prop_oneof![
-            (project, "(chores|backlog)\\.md").prop_map(|(p, f)| format!("{p}/{f}")),
+            (project, "(chores/c|backlog/b)[1-9][0-9]{0,8}\\.md")
+                .prop_map(|(p, f)| format!("{p}/{f}")),
             (project, "(done/)?", brief).prop_map(|(p, d, b)| format!("{p}/briefs/{d}{b}")),
         ]
     }
@@ -987,7 +1062,7 @@ mod tests {
     /// `done/`, a slash in the name, a missing number or `.md`.
     fn almost_a_board_path() -> impl Strategy<Value = String> {
         prop_oneof![
-            "[a-z0-9.]{1,3}/(chores|backlog|notes)\\.md/?",
+            "[a-z0-9.]{1,3}/(chores|backlog|notes)(/[bc]0?[0-9]{0,2})?\\.md/?",
             "[a-z0-9.]{1,3}/briefs/(done/){0,3}[0-9]{0,3}-?[a-z/]{0,2}\\.md",
             "([a-z.]{0,3}/){0,2}(chores\\.md|briefs/|done/|[0-9]{0,2}-[a-z]{0,2}(\\.md)?){0,3}",
         ]
@@ -1053,7 +1128,7 @@ mod tests {
                 prop_assert_eq!(parsed.to_string(), &path[..]);
                 // Each part is one path segment.
                 let segments = match parsed {
-                    BoardPath::List { .. } => 2,
+                    BoardPath::Item { .. } => 3,
                     BoardPath::Brief { filed: false, .. } => 3,
                     BoardPath::Brief { filed: true, .. } => 4,
                 };

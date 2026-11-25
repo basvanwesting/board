@@ -5,7 +5,9 @@ pub mod board;
 pub mod brief;
 pub mod error;
 mod git;
+mod header;
 pub mod id;
+pub mod item;
 pub mod lint;
 pub mod list;
 mod merge;
@@ -22,11 +24,9 @@ pub use brief::{
 };
 pub use error::{Error, Exit};
 pub use id::{BacklogId, BriefId, ChoreId, InvalidId, ItemId, ListId, ListKind};
+pub use item::{BadOrder, Body, Item, Items, Listed, MoveError, Row};
 pub use lint::{Finding, Problem, lint};
-pub use list::{
-    BadMove, Body, Entry, FindError, IdsExhausted, Line, ListFile, Move, MoveError, NoCheck,
-    RemoveError, RetitleError, Side,
-};
-pub use ops::{Commits, Filed, NewChore};
+pub use list::{BadMove, Entry, FindError, IdsExhausted, Line, Move, Side};
+pub use ops::{CheckChange, Commits, Filed, NewChore};
 pub use project::{BoardPath, BriefFile, BriefName, Env, InvalidSlug, Project, ProjectName, Slug};
 pub use sync::{Counts, Fetched, Note};

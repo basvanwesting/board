@@ -499,20 +499,6 @@ impl Git {
             .collect()
     }
 
-    /// A file as each of `commits` has it, `None` where it has none, in one
-    /// call.
-    pub(crate) fn file_at(
-        &self,
-        commits: &[Oid],
-        path: &str,
-    ) -> Result<Vec<Option<Vec<u8>>>, Failure> {
-        let names: Vec<String> = commits
-            .iter()
-            .map(|commit| format!("{commit}:{path}"))
-            .collect();
-        self.cat_blobs(&names)
-    }
-
     /// The contents of the blobs `names` name (an id, `<commit>:<path>`), in
     /// the order asked; `None` for a name that names nothing.
     fn cat_blobs(&self, names: &[String]) -> Result<Vec<Option<Vec<u8>>>, Failure> {
@@ -552,24 +538,6 @@ impl Git {
             rest = rest.get(end + 1 + size + 1..).ok_or_else(malformed)?;
         }
         Ok(blobs)
-    }
-
-    /// The commits that are descendants of `from` and ancestors of `to`
-    /// (`to` included), parents before children.
-    pub(crate) fn ancestry_path(&self, from: &Oid, to: &Oid) -> Result<Vec<Oid>, Failure> {
-        let range = format!("{from}..{to}");
-        let stdout = self.run(&[
-            "rev-list",
-            "--ancestry-path",
-            "--topo-order",
-            "--reverse",
-            &range,
-        ])?;
-        stdout
-            .split(|b| *b == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(Oid::parse)
-            .collect()
     }
 
     /// The patches of every commit reachable from `commit` that touched
@@ -786,22 +754,6 @@ impl Git {
             .filter(|message| !message.is_empty())
             .map(<[u8]>::to_vec)
             .collect())
-    }
-
-    /// The three blobs' lines merged, with both sides of a conflict kept,
-    /// ours first: the line order of a list merge.
-    pub(crate) fn union(&self, ours: &Oid, base: &Oid, theirs: &Oid) -> Result<Vec<u8>, Failure> {
-        // With `--union` there are no conflicts, so a non-zero exit is an
-        // error.
-        self.run(&[
-            "merge-file",
-            "-p",
-            "--union",
-            "--object-id",
-            ours.as_str(),
-            base.as_str(),
-            theirs.as_str(),
-        ])
     }
 
     /// Commits `paths` as the work tree has them, added, changed or deleted,

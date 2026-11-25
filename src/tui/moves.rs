@@ -5,7 +5,7 @@
 //! A place is next to another item, as `board move` names it: before the
 //! item below, or after the item above. A chore lands in the group of the
 //! item it is put next to, so the rows between two headings are a group
-//! here as they are in the file, the rows above the first heading one too.
+//! here as they are in the listing.
 
 use super::state::{ItemKey, Row};
 use crate::id::{BacklogId, ChoreId, ListId, ListKind};
@@ -35,9 +35,8 @@ pub(crate) fn put(rows: &mut Vec<Row>, item: &ItemKey, side: Side, next_to: &Ite
     );
 }
 
-/// Puts a move that is out on the worker where the file will have it: by
-/// id, as the command finds them. An id on two rows moves nothing, as the
-/// command refuses it.
+/// Puts a move that is out on the worker where the files will have it: by
+/// id, as the command finds them.
 pub(crate) fn put_sent(rows: &mut Vec<Row>, wanted: &Move) {
     if let (Some(item), Some(target)) = (
         unique(rows, wanted.item().get()),
@@ -47,8 +46,7 @@ pub(crate) fn put_sent(rows: &mut Vec<Row>, wanted: &Move) {
     }
 }
 
-/// The item with this id, when it is on one row only: what a command can
-/// name. A hand-typed duplicate names none, and the command refuses it.
+/// The item with this id, when it is on one row: what a command can name.
 pub(crate) fn unique(rows: &[Row], number: u32) -> Option<ItemKey> {
     let mut found = rows
         .iter()
@@ -113,9 +111,8 @@ pub(crate) fn place_of(rows: &[Row], item: &ItemKey) -> Option<(Side, ItemKey)> 
 }
 
 /// The `board move` that puts `item` where it stands among `rows`: next to
-/// the item directly below or above it that a command can name. `None`
-/// when neither can be (an item typed by hand gets its id at the next
-/// write; a duplicate id names no item), so no command can say the place.
+/// the item directly below or above it. `None` when it has neither in its
+/// group's rows (a heading on both sides), so no command can say the place.
 pub(crate) fn wanted(rows: &[Row], item: &ItemKey, kind: ListKind) -> Option<Move> {
     let at = index_of(rows, item)?;
     unique(rows, item.id()?)?;

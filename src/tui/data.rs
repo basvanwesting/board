@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use crate::board::{BriefRow, arrange};
 use crate::brief::Stamp;
 use crate::id::{BriefId, ListKind};
-use crate::list::{Entry, ListFile};
+use crate::item::{Items, Row};
 use crate::project::{BoardPath, BriefFile, Project, ProjectName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,28 +31,25 @@ pub struct BriefItem {
     pub text: Vec<u8>,
 }
 
-/// A heading or an item of a list file, and the line of the file it is on:
-/// where `e` opens the editor.
+/// A row `ls` shows of a kind (`board::ListRow`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListLine {
     pub entry: ListEntry,
-    /// Counted from 1, as an editor's `+N` counts.
-    pub line: usize,
 }
 
-/// A row `ls` shows of a list (`board::ListRow`), with the id the CLI reads
-/// on an item's line: the TUI's actions name the item by it, so it is the
-/// parser's (`list::parse_line`), never read off the text a second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListEntry {
-    /// A `## group` heading, as its name.
+    /// A chores' group, as its name.
     Group(Vec<u8>),
-    /// An item, as its line without the `- `, and the contents of the
-    /// indented lines below it, which are its own: the preview shows them.
+    /// An item: its id (its file's name), its line as `ls` prints it, and
+    /// the item as `show` prints it, which the preview shows and `yy`
+    /// yanks.
     Item {
-        id: Option<u32>,
+        id: u32,
         text: Vec<u8>,
-        indented: Vec<Vec<u8>>,
+        shown: Vec<u8>,
+        /// Whether its file has a body.
+        body: bool,
     },
 }
 
@@ -119,24 +116,21 @@ impl Data {
     }
 }
 
-/// The rows `ls` shows of a list (`board::list_rows`), each with its line.
-fn list_lines(list: &ListFile) -> Vec<ListLine> {
-    list.entries()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            let entry = match entry {
-                Entry::Heading(name) => ListEntry::Group(name.to_vec()),
-                Entry::Item { id, text } => ListEntry::Item {
-                    id,
-                    text: text.to_vec(),
-                    indented: list.indented_below(index).map(<[u8]>::to_vec).collect(),
+/// The rows `ls` shows of a kind (`board::list_rows`).
+fn list_lines(items: &Items) -> Vec<ListLine> {
+    items
+        .rows()
+        .into_iter()
+        .map(|row| ListLine {
+            entry: match row {
+                Row::Group(name) => ListEntry::Group(name.to_vec()),
+                Row::Item(listed) => ListEntry::Item {
+                    id: listed.number,
+                    text: listed.item.line(items.kind(), listed.number),
+                    shown: listed.item.shown(items.kind(), listed.number),
+                    body: !listed.item.body().is_empty(),
                 },
-                Entry::Text(_) => return None,
-            };
-            Some(ListLine {
-                entry,
-                line: index + 1,
-            })
+            },
         })
         .collect()
 }
@@ -169,22 +163,28 @@ impl BriefItem {
 
 #[cfg(test)]
 impl ListLine {
-    /// Rows on the lines of a file that holds nothing else, read as a load
-    /// reads them: an item's id is the parser's.
+    /// The rows as given, an item's id read off its first word (`c12`),
+    /// without a body: what a load gives of files that list so.
     pub fn numbered(kind: ListKind, rows: Vec<crate::board::ListRow>) -> Vec<ListLine> {
         use crate::board::ListRow;
-        let mut file = Vec::new();
-        for row in rows {
-            let (mark, text) = match row {
-                ListRow::Group(name) => (&b"## "[..], name),
-                ListRow::Item(text) => (&b"- "[..], text),
-            };
-            assert!(!text.contains(&b'\n'), "one row, one line");
-            file.extend_from_slice(mark);
-            file.extend_from_slice(&text);
-            file.push(b'\n');
-        }
-        list_lines(&ListFile::parse(kind, &file))
+        rows.into_iter()
+            .map(|row| ListLine {
+                entry: match row {
+                    ListRow::Group(name) => ListEntry::Group(name),
+                    ListRow::Item(text) => {
+                        let word = text.split(|b| *b == b' ').next().unwrap_or(&text);
+                        let id = kind.parse_id(word).expect("a test row starts with its id");
+                        let shown = [text.as_slice(), b"\n"].concat();
+                        ListEntry::Item {
+                            id,
+                            text,
+                            shown,
+                            body: false,
+                        }
+                    }
+                },
+            })
+            .collect()
     }
 }
 
@@ -192,28 +192,48 @@ impl ListLine {
 mod tests {
     use super::*;
     use crate::board::{ListRow, Snapshot};
+    use crate::item::Item;
 
     #[test]
-    fn a_list_s_rows_are_ls_s_with_the_lines_they_are_on() {
+    fn a_kind_s_rows_are_ls_s_with_what_show_prints() {
         let mut project = Project::empty(ProjectName::parse("shop").unwrap());
-        project.chores = ListFile::parse(
-            ListKind::Chores,
-            b"# Chores\n\n## home\n- c1 one. Check: x\n  more of c1\n- by hand. Check: y\n\
-              - c2\tid typed with a tab. Check: z\n",
-        );
+        for (number, text) in [
+            (
+                1,
+                "id: c1\ngroup: home\norder: 1000\n\n# one\n\nmore of c1\n",
+            ),
+            (2, "id: c2\ngroup: away\norder: 1000\ncheck: z\n\n# two\n"),
+        ] {
+            project
+                .list_mut(ListKind::Chores)
+                .insert(number, Item::parse(text.as_bytes()));
+        }
         let data = Data::of(&project);
-        let (rows, ids): (Vec<ListRow>, Vec<Option<u32>>) = data
+        let rows: Vec<ListRow> = data
             .chores
             .iter()
             .map(|line| match &line.entry {
-                ListEntry::Group(name) => (ListRow::Group(name.clone()), None),
-                ListEntry::Item { id, text, .. } => (ListRow::Item(text.clone()), *id),
+                ListEntry::Group(name) => ListRow::Group(name.clone()),
+                ListEntry::Item { text, .. } => ListRow::Item(text.clone()),
             })
-            .unzip();
+            .collect();
         assert_eq!(rows, Snapshot::of(&project, &BTreeSet::new()).chores);
-        // As the CLI reads them: `c2<tab>` is no id (`list::parse_line`).
-        assert_eq!(ids, [None, Some(1), None, None]);
-        let lines: Vec<usize> = data.chores.iter().map(|line| line.line).collect();
-        assert_eq!(lines, [3, 4, 6, 7]);
+        let shown: Vec<(u32, &[u8], bool)> = data
+            .chores
+            .iter()
+            .filter_map(|line| match &line.entry {
+                ListEntry::Item {
+                    id, shown, body, ..
+                } => Some((*id, shown.as_slice(), *body)),
+                ListEntry::Group(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (2, &b"c2 two. Check: z\n"[..], false),
+                (1, &b"c1 one\n\nmore of c1\n"[..], true),
+            ]
+        );
     }
 }
