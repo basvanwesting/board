@@ -94,6 +94,7 @@ done c1
 The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones and the unpushed, and Filed), Chores by group, Backlog in order, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
 
 - `j`/`k` move, `1` `2` `3` or Tab focus a panel, `0` or Enter scrolls the preview, `/` filters the panel.
+- A click focuses a pane and selects the row clicked; the wheel moves as `j`/`k`. The TUI captures the mouse for that, so selecting text with the mouse takes the terminal's bypass (Shift-drag in most); `y`, `Y` and `yy` copy.
 - `d` marks a chore done, `x` drops a backlog item (each asks once), `J`/`K` reorder, `e` opens the item in `$EDITOR`.
 - `r` syncs, `?` shows every key, `q` quits. Esc only ever backs out.
 

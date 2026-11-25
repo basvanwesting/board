@@ -44,9 +44,34 @@ pub(crate) enum Key {
     Down,
 }
 
+/// What the mouse did, as the state knows it; the runtime maps the
+/// terminal's to these and drops the rest (a release, a drag, a move,
+/// another button).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mouse {
+    /// The left button pressed at this cell of the screen.
+    Click {
+        column: u16,
+        row: u16,
+    },
+    WheelUp,
+    WheelDown,
+}
+
+/// What a click is on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hit {
+    /// A list panel, and the item on the row clicked, if any.
+    Panel(Panel, Option<ItemKey>),
+    Preview,
+    /// The status line, or off the screen.
+    Nothing,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum Event {
     Key(Key),
+    Mouse(Mouse),
     Resize {
         width: u16,
         height: u16,
@@ -424,6 +449,7 @@ impl State {
     pub fn step(mut self, event: Event) -> (State, Vec<Command>) {
         let commands = match event {
             Event::Key(key) => self.key(key),
+            Event::Mouse(mouse) => self.mouse(mouse),
             Event::Resize { width, height } => {
                 self.width = width;
                 self.height = height;
@@ -503,16 +529,7 @@ impl State {
         // Esc does nothing but its one thing, so the message stays.
         if key != Key::Esc {
             self.messages.clear();
-            // An editor waited for opens only while the user still waits
-            // for it: one that opened later would take the keys typed for
-            // the TUI (a `d`, a `J`) as editing commands on the file. Esc
-            // keeps the wait, as it does everything else.
-            if self.edit_wanted.take().is_some() && key != Key::Char('e') {
-                self.say(
-                    "the editor is called off: a key came first; e asks again".to_owned(),
-                    false,
-                );
-            }
+            self.call_off_edit(key == Key::Char('e'));
         }
         let pending_g = std::mem::take(&mut self.pending_g);
         let pending_y = std::mem::take(&mut self.pending_y);
@@ -540,14 +557,7 @@ impl State {
         // nothing else (SPEC.md, TUI), so the move waits for the next key.
         let mut commands = match key {
             Key::Char('J' | 'K') | Key::Esc => Vec::new(),
-            _ if self.moving.is_some() => {
-                let sent = self.end_moving();
-                // A dropped run puts the row back: the cursor's place is
-                // where its item is now, for the key to move it from.
-                self.settle();
-                sent
-            }
-            _ => Vec::new(),
+            _ => self.end_run(),
         };
         let half = isize::try_from((self.page() / 2).max(1)).unwrap_or(isize::MAX);
         match key {
@@ -609,6 +619,120 @@ impl State {
             _ => {}
         }
         commands
+    }
+
+    /// An editor waited for opens only while the user still waits for it:
+    /// one that opened later would take the keys typed for the TUI (a `d`,
+    /// a `J`) as editing commands on the file. Called off by any key but
+    /// Esc, which keeps the wait as it keeps everything else, and but `e`
+    /// (`again`), which asks anew.
+    fn call_off_edit(&mut self, again: bool) {
+        if self.edit_wanted.take().is_some() && !again {
+            self.say(
+                "the editor is called off: a key or click came first; e asks again".to_owned(),
+                false,
+            );
+        }
+    }
+
+    /// Ends a run of `J`/`K`, as every key but those and Esc does: its move
+    /// is sent first, so the key's own command comes after.
+    fn end_run(&mut self) -> Vec<Command> {
+        if self.moving.is_none() {
+            return Vec::new();
+        }
+        let sent = self.end_moving();
+        // A dropped run puts the row back: the cursor's place is where its
+        // item is now, for the key to move it from.
+        self.settle();
+        sent
+    }
+
+    /// A click or the wheel (owner, 2026-11-25: mouse capture, as LazyGit
+    /// has it). A left click focuses the pane it hits and selects the item
+    /// it hits ([`State::hit`]); the preview takes the focus only when `0`
+    /// would, with an item under the cursor. One rule: a mouse event is first an unrelated key, then
+    /// itself, so no pending state gets a second way out. Where a key is
+    /// taken by what waits for it (the filter being typed, a question, help,
+    /// a quit waiting for the writes) it does nothing at all: a question is
+    /// not answered no by a click beside it. Elsewhere it clears what an
+    /// unrelated key clears (the messages, a `g` or `y` waiting for its
+    /// second key, an edit waited for) and ends a run of `J`/`K`.
+    fn mouse(&mut self, mouse: Mouse) -> Vec<Command> {
+        if self.quitting || self.typing || self.question.is_some() || self.help {
+            return Vec::new();
+        }
+        // Where the click is, on the screen as drawn: ending a run can put
+        // its row back before the click applies.
+        let hit = match mouse {
+            Mouse::Click { column, row } => Some(self.hit(column, row)),
+            Mouse::WheelUp | Mouse::WheelDown => None,
+        };
+        self.messages.clear();
+        self.call_off_edit(false);
+        self.pending_g = false;
+        self.pending_y = None;
+        let commands = self.end_run();
+        match (mouse, hit) {
+            // What `k` and `j` do: capture ends the terminal's own wheel,
+            // which some sent as Up and Down.
+            (Mouse::WheelUp, _) => self.go_by(-1),
+            (Mouse::WheelDown, _) => self.go_by(1),
+            (Mouse::Click { .. }, Some(Hit::Panel(panel, item))) => {
+                self.focus_on(panel);
+                let source = self.source_of(panel);
+                let items = self.items(source);
+                if let Some((at, key)) = item.and_then(|key| {
+                    let at = items.iter().position(|shown| *shown == key)?;
+                    Some((at, key))
+                }) {
+                    let cursor = &mut self.cursors[source as usize];
+                    cursor.at = at;
+                    cursor.key = Some(key);
+                }
+            }
+            // As `0`: only with an item under the cursor.
+            (Mouse::Click { .. }, Some(Hit::Preview)) => {
+                if self.cursor(self.source()).key.is_some() {
+                    self.in_preview = true;
+                }
+            }
+            (Mouse::Click { .. }, Some(Hit::Nothing) | None) => {}
+        }
+        commands
+    }
+
+    /// What a left click hits, as the screen draws it: the pane under it
+    /// and, for a list panel, the item on the row under it. A border or a
+    /// title is the pane's; a heading, a row below the last and the status
+    /// line hit no item. By [`State::areas`], the layout the view draws, so
+    /// the two cannot disagree.
+    fn hit(&self, column: u16, row: u16) -> Hit {
+        let at = ratatui::layout::Position::new(column, row);
+        let areas = self.areas();
+        if let Some(panel) = Panel::ALL
+            .into_iter()
+            .find(|panel| areas.panel(*panel).contains(at))
+        {
+            let area = areas.panel(panel);
+            let inside = ratatui::layout::Rect::new(
+                area.x.saturating_add(1),
+                area.y.saturating_add(1),
+                area.width.saturating_sub(2),
+                area.height.saturating_sub(2),
+            );
+            let source = self.source_of(panel);
+            let item = inside
+                .contains(at)
+                .then(|| self.offset(source) + usize::from(row - inside.y))
+                .and_then(|index| self.rows(source).into_iter().nth(index))
+                .and_then(|row| row.key);
+            Hit::Panel(panel, item)
+        } else if areas.preview.contains(at) {
+            Hit::Preview
+        } else {
+            Hit::Nothing
+        }
     }
 
     /// Esc leaves the preview, closes help, answers no, or clears a filter,

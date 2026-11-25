@@ -40,7 +40,15 @@
 //! - T12 the editor never opens while a write is out, and on the item `e`
 //!   was pressed on; one waited for opens at the load after the last
 //!   write, unless its item is gone, and any key but Esc calls it off
-//!   (only `e` asks again).
+//!   (only `e` asks again);
+//! - T13 a click lands where the screen drew what it hit: it focuses the
+//!   pane drawn under it and selects the item drawn on its row; the wheel
+//!   moves as `j`/`k`; either is an unrelated key first (it ends a run,
+//!   calls off an edit waited for, clears a pending `g` or `y`), and does
+//!   nothing at all while the filter is typed, a question is asked, help
+//!   is open or a quit waits. Where a click lands comes from the frame
+//!   drawn before it (the panes' boxes found by their `[n]` titles and
+//!   corners), not from the state's own hit test.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -80,6 +88,7 @@ enum ChoreLine {
 #[derive(Debug, Clone)]
 enum Step {
     Key(Key),
+    Mouse(Mouse),
     Resize(u16, u16),
     /// The clock, this many seconds on.
     Tick(u64),
@@ -230,6 +239,13 @@ fn step() -> impl Strategy<Value = Step> {
         2 => Just(Step::LoadFailed),
         4 => prop::option::weighted(0.9, prop::collection::vec(1u32..10, 0..4)).prop_map(Step::Unpushed),
         1 => Just(Step::InputGone),
+        // Anywhere, off the screen too: the sizes go up to 200 x 50.
+        6 => prop_oneof![
+            4 => (0u16..220, 0u16..56).prop_map(|(column, row)| Mouse::Click { column, row }),
+            1 => Just(Mouse::WheelUp),
+            1 => Just(Mouse::WheelDown),
+        ]
+        .prop_map(Step::Mouse),
     ]
 }
 
@@ -401,6 +417,36 @@ fn previewed() -> impl Strategy<Value = Vec<Step>> {
         })
 }
 
+/// `yy` on some item of a panel: a `y` from [`key`] is seldom followed by
+/// another with nothing between.
+fn yanked_whole() -> impl Strategy<Value = Vec<Step>> {
+    use Key::Char;
+    (prop::sample::select(vec!['1', '2', '3']), 0usize..4).prop_map(|(panel, down)| {
+        let mut steps = vec![Step::Key(Char(panel))];
+        steps.extend((0..down).map(|_| Step::Key(Char('j'))));
+        steps.extend([Step::Key(Char('y')), Step::Key(Char('y'))]);
+        steps
+    })
+}
+
+/// A run of `J`/`K` ended by a click on the left column, where the panels
+/// are: a random click seldom comes during a run.
+fn moved_then_clicked() -> impl Strategy<Value = Vec<Step>> {
+    use Key::Char;
+    (
+        prop::sample::select(vec!['2', '3']),
+        prop::collection::vec(prop::sample::select(vec![Char('J'), Char('K')]), 1..4),
+        0u16..70,
+        0u16..40,
+    )
+        .prop_map(|(panel, presses, column, row)| {
+            let mut steps = vec![Step::Key(Char(panel))];
+            steps.extend(presses.into_iter().map(Step::Key));
+            steps.push(Step::Mouse(Mouse::Click { column, row }));
+            steps
+        })
+}
+
 fn trace() -> impl Strategy<Value = (Files, Vec<Step>)> {
     let steps = prop_oneof![
         30 => step().prop_map(|step| vec![step]),
@@ -411,6 +457,8 @@ fn trace() -> impl Strategy<Value = (Files, Vec<Step>)> {
         1 => moved_next_to_hand_typed(),
         1 => edited_hand_typed(),
         1 => previewed(),
+        1 => yanked_whole(),
+        1 => moved_then_clicked(),
     ];
     (
         files(),
@@ -626,6 +674,17 @@ struct Depth {
     quit_waited: u32,
     quit_after_writes: u32,
     quit_forced: u32,
+    /// A click that moved the focus to another pane.
+    click_focused: u32,
+    /// A click that put a cursor on another item.
+    click_selected: u32,
+    /// A click into the preview.
+    click_previewed: u32,
+    /// A click or the wheel while a key is waited for: nothing.
+    mouse_waited: u32,
+    /// A click that ended a run of `J`/`K`.
+    click_ended_run: u32,
+    wheeled: u32,
 }
 
 impl Depth {
@@ -680,7 +739,13 @@ impl Depth {
             wrote_failed,
             quit_waited,
             quit_after_writes,
-            quit_forced
+            quit_forced,
+            click_focused,
+            click_selected,
+            click_previewed,
+            mouse_waited,
+            click_ended_run,
+            wheeled
         );
     }
 }
@@ -739,6 +804,7 @@ fn run_trace(first: &Files, steps: &[Step]) -> Result<Depth, TestCaseError> {
     for step in steps {
         let event = match step {
             Step::Key(key) => Event::Key(*key),
+            Step::Mouse(mouse) => Event::Mouse(*mouse),
             Step::Resize(width, height) => Event::Resize {
                 width: *width,
                 height: *height,
@@ -1052,6 +1118,28 @@ fn judge(
         Event::Key(key) => Some(*key),
         _ => None,
     };
+    let mouse = match event {
+        Event::Mouse(mouse) => Some(*mouse),
+        _ => None,
+    };
+    // T13: a mouse event while a key is waited for does nothing at all.
+    let waited = before.quitting || before.typing || before.question.is_some() || before.help;
+    let acts = mouse.is_some() && !waited;
+    if mouse.is_some() && waited {
+        prop_assert!(commands.is_empty(), "{commands:?} after {event:?}");
+        prop_assert_eq!(untouched(after), untouched(before));
+        prop_assert_eq!(&after.cursors, &before.cursors);
+        prop_assert_eq!(
+            (after.pending_g, &after.pending_y),
+            (before.pending_g, &before.pending_y)
+        );
+        depth.mouse_waited += 1;
+    }
+    // Where the frame drawn before it shows the click.
+    let drawn = match mouse {
+        Some(Mouse::Click { column, row }) if acts => drawn_hit(before, column, row),
+        _ => Drawn::Unknown,
+    };
     let quit_key = matches!(key, Some(Key::Ctrl('c')))
         || (key == Some(Key::Char('q'))
             && (before.quitting || (!before.typing && before.question.is_none())));
@@ -1074,6 +1162,9 @@ fn judge(
             .then(|| cursor_key.clone())
             .flatten();
     }
+    if acts {
+        oracle.y_armed = None;
+    }
 
     let sent: Vec<&Move> = commands
         .iter()
@@ -1084,8 +1175,26 @@ fn judge(
         .collect();
 
     // T3
-    let moved = match key {
-        Some(key) if navigates(key) && plain && !before.in_preview => Some((before.source(), key)),
+    let moved = match (key, mouse) {
+        (Some(key), _) if navigates(key) && plain && !before.in_preview => {
+            Some((before.source(), key))
+        }
+        // The wheel is `k` and `j`.
+        (_, Some(Mouse::WheelUp)) if acts && !before.in_preview => {
+            Some((before.source(), Key::Char('k')))
+        }
+        (_, Some(Mouse::WheelDown)) if acts && !before.in_preview => {
+            Some((before.source(), Key::Char('j')))
+        }
+        _ => None,
+    };
+    if acts && matches!(mouse, Some(Mouse::WheelUp | Mouse::WheelDown)) {
+        depth.wheeled += 1;
+    }
+    // T13: the click's item, drawn on the row clicked, gets its panel's
+    // cursor; the rest of T3 holds for every other list.
+    let clicked = match &drawn {
+        Drawn::Panel(panel, Some(item)) => Some((before.source_of(*panel), item.clone())),
         _ => None,
     };
     for source in Source::ALL {
@@ -1102,6 +1211,21 @@ fn judge(
         }
         let item = &item;
         let items = after.items(source);
+        if let Some((on, clicked)) = &clicked
+            && *on == source
+            && items.contains(clicked)
+        {
+            prop_assert_eq!(
+                after.cursor(source).key.as_ref(),
+                Some(clicked),
+                "{:?}",
+                source
+            );
+            if clicked != item {
+                depth.click_selected += 1;
+            }
+            continue;
+        }
         match moved {
             Some((moved, navigation)) if moved == source => {
                 // The key ended a run first: it moves the cursor from where
@@ -1234,6 +1358,11 @@ fn judge(
         Event::Key(Key::Esc) => prop_assert!(commands.is_empty(), "{commands:?} after Esc"),
         Event::Key(key) if navigates(*key) => {
             prop_assert!(commands.len() == sent.len(), "{commands:?} after {key:?}");
+        }
+        // A click or the wheel gives no command of its own: the move of
+        // the run it ends.
+        Event::Mouse(_) => {
+            prop_assert!(commands.len() == sent.len(), "{commands:?} after {event:?}");
         }
         // The question of what is unpushed goes with it, unless one is out.
         Event::FilesChanged => {
@@ -1434,6 +1563,12 @@ fn judge(
                     depth.dropped_on_reload += 1;
                 }
             }
+            if acts {
+                prop_assert!(!goes_on, "{event:?} did not end the run");
+                if matches!(mouse, Some(Mouse::Click { .. })) {
+                    depth.click_ended_run += 1;
+                }
+            }
             if goes_on {
                 prop_assert!(sent.is_empty(), "{commands:?} while the run goes on");
                 prop_assert!(
@@ -1540,7 +1675,12 @@ fn judge(
         let (on, row) = before.cursor_item().expect("e on an item");
         prop_assert_eq!((on, row.key.as_ref()), (*source, Some(item)));
     }
-    if before.edit_wanted.is_some() && key.is_some_and(|key| key != Key::Esc && !pressed('e')) {
+    if acts {
+        prop_assert!(after.edit_wanted.is_none(), "{event:?} kept the wait");
+    }
+    if before.edit_wanted.is_some()
+        && (acts || key.is_some_and(|key| key != Key::Esc && !pressed('e')))
+    {
         depth.edit_called_off += 1;
     }
     for command in commands {
@@ -1591,7 +1731,105 @@ fn judge(
             depth.edits += 1;
         }
     }
+
+    // T13: the focus goes where the frame drew the click.
+    if acts {
+        prop_assert!(!after.pending_g && after.pending_y.is_none());
+        match &drawn {
+            Drawn::Panel(panel, _) => {
+                prop_assert_eq!((after.focus, after.in_preview), (*panel, false));
+                if *panel != before.focus || before.in_preview {
+                    depth.click_focused += 1;
+                }
+            }
+            Drawn::Preview => {
+                // As `0`: with an item under the cursor, in the preview;
+                // without, the focus stays.
+                let item = after.cursor(after.source()).key.is_some();
+                prop_assert_eq!(after.focus, before.focus);
+                prop_assert_eq!(after.in_preview, before.in_preview || item);
+                if item && !before.in_preview {
+                    depth.click_previewed += 1;
+                }
+            }
+            Drawn::Nothing => {
+                prop_assert_eq!(
+                    (after.focus, after.in_preview),
+                    (before.focus, before.in_preview)
+                );
+            }
+            Drawn::Unknown if matches!(mouse, Some(Mouse::Click { .. })) => {}
+            Drawn::Unknown => {
+                // The wheel: the focus stays.
+                prop_assert_eq!(
+                    (after.focus, after.in_preview),
+                    (before.focus, before.in_preview)
+                );
+            }
+        }
+    }
     Ok(())
+}
+
+/// Where a click lands, read off the frame the state drew.
+#[derive(Debug)]
+enum Drawn {
+    /// A list panel's box, and the item on the row clicked inside it.
+    Panel(Panel, Option<ItemKey>),
+    Preview,
+    /// Outside every box, with all four found.
+    Nothing,
+    /// A box was not found whole (a screen too small for it): not judged.
+    Unknown,
+}
+
+/// The pane drawn under a click, by the boxes in the frame: each found by
+/// its title (`╭─[1]`, the jump key the view writes) and its corners, not
+/// by the state's areas. The row inside a list panel's box is the drawn
+/// line: the panel's rows from its offset, as the view draws them.
+fn drawn_hit(state: &State, column: u16, row: u16) -> Drawn {
+    let mut terminal = Terminal::new(TestBackend::new(state.width, state.height)).unwrap();
+    terminal.draw(|frame| view::draw(frame, state)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let (width, height) = (state.width, state.height);
+    let cell = |x: u16, y: u16| buffer[(x, y)].symbol().to_owned();
+    // The box titled `[key]`: its top-left and bottom-right corners.
+    let find = |key: char| -> Option<(u16, u16, u16, u16)> {
+        let title = ["╭", "─", "[", &key.to_string(), "]"];
+        for y in 0..height {
+            for x in 0..width.saturating_sub(4) {
+                if (0..5).all(|i| cell(x + i, y) == title[usize::from(i)]) {
+                    let right = (x + 1..width).find(|&x| cell(x, y) == "╮")?;
+                    let bottom = (y + 1..height).find(|&y| cell(x, y) == "╰")?;
+                    return Some((x, y, right, bottom));
+                }
+            }
+        }
+        None
+    };
+    let boxes = ['1', '2', '3', '0'].map(find);
+    let inside = |(left, top, right, bottom): (u16, u16, u16, u16)| {
+        (left..=right).contains(&column) && (top..=bottom).contains(&row)
+    };
+    for (panel, found) in Panel::ALL.into_iter().zip(boxes) {
+        if let Some(found @ (left, top, right, bottom)) = found
+            && inside(found)
+        {
+            let item = (column > left && column < right && row > top && row < bottom)
+                .then(|| {
+                    let source = state.source_of(panel);
+                    let line = state.offset(source) + usize::from(row - top - 1);
+                    state.rows(source).into_iter().nth(line)?.key
+                })
+                .flatten();
+            return Drawn::Panel(panel, item);
+        }
+    }
+    match boxes[3] {
+        Some(found) if inside(found) => Drawn::Preview,
+        _ if boxes.iter().all(Option::is_some) => Drawn::Nothing,
+        _ => Drawn::Unknown,
+    }
 }
 
 fn config(cases: u32) -> Config {
@@ -1691,6 +1929,12 @@ fn the_traces_get_deep() {
         ("quit_waited", depth.quit_waited > 0),
         ("quit_after_writes", depth.quit_after_writes > 0),
         ("quit_forced", depth.quit_forced > 0),
+        ("click_focused", depth.click_focused > 0),
+        ("click_selected", depth.click_selected > 0),
+        ("click_previewed", depth.click_previewed > 0),
+        ("mouse_waited", depth.mouse_waited > 0),
+        ("click_ended_run", depth.click_ended_run > 0),
+        ("wheeled", depth.wheeled > 0),
     ];
     let missed: Vec<&str> = reached
         .iter()

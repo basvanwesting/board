@@ -35,6 +35,19 @@ fn tui(machine: &Machine, keys: &str) -> Vec<u8> {
     board::tui::run_headless(board, keys).expect("the TUI ran")
 }
 
+/// What the TUI writes to turn the terminal's mouse capture on or off.
+fn mouse(on: bool) -> Vec<u8> {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let mut bytes = Vec::new();
+    if on {
+        ratatui::crossterm::execute!(bytes, EnableMouseCapture)
+    } else {
+        ratatui::crossterm::execute!(bytes, DisableMouseCapture)
+    }
+    .expect("into a Vec");
+    bytes
+}
+
 fn script(path: &Path, body: &str) {
     fs::write(path, format!("#!/bin/sh\n{body}")).expect("write a script");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -126,8 +139,11 @@ fn main() {
     assert_eq!(order, ["c3", "c4", "c1"]);
 
     // e: the editor on chores.md at c1's line; on return a sync commits
-    // what it added, and gives that line an id.
-    tui(&a, "2Ge");
+    // what it added, and gives that line an id. The mouse is captured
+    // while the TUI runs and given back around the editor.
+    let raw = tui(&a, "2Ge");
+    let (on, off) = (mouse(true), mouse(false));
+    assert_eq!(raw, [&on[..], &off, &on, &off].concat());
     let args = fs::read_to_string(&editor_args).expect("the editor ran");
     let line = chores
         .lines()
@@ -150,7 +166,15 @@ fn main() {
 
     // y, Y: the id and the line, through OSC 52 and the clipboard helper.
     let raw = tui(&a, "3yY");
-    assert_eq!(raw, b"\x1b]52;c;YjE=\x07\x1b]52;c;YjEgZnJvbSBi\x07");
+    assert_eq!(
+        raw,
+        [
+            &on[..],
+            b"\x1b]52;c;YjE=\x07\x1b]52;c;YjEgZnJvbSBi\x07",
+            &off
+        ]
+        .concat()
+    );
     assert_eq!(
         fs::read_to_string(&clipboard).expect("wl-copy ran"),
         "b1\nb1 from b\n"

@@ -39,7 +39,10 @@ use std::time::{Duration, Instant};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{self as terminal, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self as terminal, DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::{DefaultTerminal, Terminal};
@@ -49,7 +52,7 @@ use crate::brief::Stamp;
 use crate::error::Error;
 use crate::project::{Project, ProjectName};
 use data::Data;
-use state::{Action, Command, Event, Key, State};
+use state::{Action, Command, Event, Key, Mouse, State};
 
 /// How often the clock ticks: the ages on screen, and the fetch timer.
 const TICK: Duration = Duration::from_secs(1);
@@ -91,6 +94,31 @@ trait Screen {
     fn lend<T>(&mut self, outside: impl FnOnce() -> T) -> Result<T, Error>;
     /// Bytes for the terminal itself, outside any frame: OSC 52.
     fn write_raw(&mut self, bytes: &[u8]) -> Result<(), Error>;
+    /// Asks the terminal to send the mouse's clicks and wheel as events,
+    /// or to keep them again: [`capture`]'s bytes, through
+    /// [`Screen::write_raw`], so a screen in memory records them.
+    fn capture_mouse(&mut self, on: bool) -> Result<(), Error> {
+        let mut bytes = Vec::new();
+        capture(&mut bytes, on).map_err(terminal_error)?;
+        self.write_raw(&bytes)
+    }
+}
+
+/// The bytes that turn the terminal's mouse capture on or off.
+///
+/// On where the TUI takes the terminal (its start, the return from the
+/// editor) and off wherever it gives it back (its end, the editor, a
+/// panic): ratatui's own restore knows nothing of the mouse, and a
+/// terminal left capturing it after `board` ends, or clicks dead after
+/// `e`, are the two failures this pairing prevents. The cost of capture,
+/// accepted by the owner (2026-11-25): the terminal's own selection needs
+/// its bypass (Shift-drag in most); `y`, `Y` and `yy` copy.
+fn capture(out: &mut impl Write, on: bool) -> std::io::Result<()> {
+    if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    }
 }
 
 /// The project's files, as each load reads them.
@@ -122,7 +150,9 @@ pub fn run(board: Board) -> Result<(), Error> {
     let (asks, _asker) = spawn_worker(asker(&board), messages.clone());
     let (jobs, _worker) = spawn_worker(worker(board, messages.clone()), messages.clone());
     let terminal = ratatui::try_init().map_err(terminal_error)?;
-    let panicked = note_panics();
+    let panicked = note_panics(Box::new(|| {
+        let _ = capture(&mut std::io::stdout(), false);
+    }));
     let input = spawn_input(messages);
     let mut screen = Tty {
         terminal,
@@ -306,18 +336,39 @@ impl Screen for Headless {
 /// drawn, or begun while the hook prints, can still land; closing that
 /// needs a lock the hook shares with the draw, and a draw that panics
 /// while it holds it would deadlock its own hook.
-fn note_panics() -> Arc<AtomicBool> {
+///
+/// `release` gives back what ratatui's hook does not know of (the mouse),
+/// first, while the TUI's screen is still up, so the message the hook
+/// prints lands on a terminal that is the shell's in full.
+fn note_panics(release: Box<dyn Fn() + Send + Sync>) -> Arc<AtomicBool> {
     let panicked = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&panicked);
     let hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        release();
         hook(info);
         flag.store(true, Ordering::SeqCst);
     }));
     panicked
 }
 
+/// The loop, with the mouse captured while it runs: on at its start, off
+/// on every way out but a panic, whose hook gives it back.
 fn run_loop(
+    screen: &mut impl Screen,
+    files: &Files,
+    inbox: &Receiver<Message>,
+    workers: (&Sender<Job>, &Sender<()>),
+    pending: &AtomicBool,
+    panicked: &AtomicBool,
+) -> Result<(), Error> {
+    screen.capture_mouse(true)?;
+    let result = run_captured(screen, files, inbox, workers, pending, panicked);
+    let released = screen.capture_mouse(false);
+    result.and(released)
+}
+
+fn run_captured(
     screen: &mut impl Screen,
     files: &Files,
     inbox: &Receiver<Message>,
@@ -352,7 +403,14 @@ fn run_loop(
                 Command::Edit { path, line } => {
                     let file = files.root.join(path.to_string());
                     let editor = std::env::var_os("EDITOR");
+                    // The editor gets the mouse as the shell has it; taken
+                    // back after, unless a panic meanwhile gave the
+                    // terminal back for good (`Tty::lend`).
+                    screen.capture_mouse(false)?;
                     let edited = screen.lend(|| outside::edit(editor.as_deref(), &file, line))?;
+                    if !panicked.load(Ordering::SeqCst) {
+                        screen.capture_mouse(true)?;
+                    }
                     answers.push_back(Event::Edited(edited));
                     // The terminal may have changed size meanwhile.
                     let (width, height) = screen.size()?;
@@ -370,6 +428,9 @@ fn run_loop(
                 // why; the process ends as that panic ends it. Not
                 // `resume_unwind`: a panic on the input thread sends no
                 // payload, and the worker's may be behind other messages.
+                // The mouse once more: the editor's return can have taken
+                // it again between the hook's release and its flag.
+                let _ = screen.capture_mouse(false);
                 process::exit(101);
             }
             screen.draw(&state)?;
@@ -379,8 +440,12 @@ fn run_loop(
             None if Instant::now() >= next_tick => tick(&mut next_tick, &state),
             None => match inbox.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
                 Ok(Message::Event(event)) => event,
-                // Not the hook again: it ran on the worker.
-                Ok(Message::WorkerPanicked(payload)) => panic::resume_unwind(payload),
+                // Not the hook again: it ran on the worker. The mouse once
+                // more, as above.
+                Ok(Message::WorkerPanicked(payload)) => {
+                    let _ = screen.capture_mouse(false);
+                    panic::resume_unwind(payload)
+                }
                 Err(RecvTimeoutError::Timeout) => tick(&mut next_tick, &state),
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             },
@@ -550,6 +615,10 @@ fn spawn_input(messages: Sender<Message>) -> Sender<Pause> {
                     Some(key) => Event::Key(key),
                     None => continue,
                 },
+                Ok(Some(terminal::Event::Mouse(mouse))) => match mouse_of(mouse) {
+                    Some(mouse) => Event::Mouse(mouse),
+                    None => continue,
+                },
                 Ok(Some(terminal::Event::Resize(width, height))) => Event::Resize { width, height },
                 Ok(Some(_)) => continue,
                 // No more keys will come: the TUI could not be quit.
@@ -583,6 +652,20 @@ fn key_of(key: KeyEvent) -> Option<Key> {
         KeyCode::Down => Key::Down,
         _ => return None,
     })
+}
+
+/// The state's mouse event for a terminal's; `None` for one the TUI has
+/// no use for: a release, a drag, a move, another button.
+fn mouse_of(mouse: MouseEvent) -> Option<Mouse> {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(Mouse::Click {
+            column: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::ScrollUp => Some(Mouse::WheelUp),
+        MouseEventKind::ScrollDown => Some(Mouse::WheelDown),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +750,103 @@ mod tests {
         // Its last message: the third job is not run.
         assert!(inbox.recv().is_err());
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_left_press_and_the_wheel_map_to_the_states_mouse() {
+        use ratatui::crossterm::event::MouseEventKind::{
+            Down, Drag, Moved, ScrollDown, ScrollUp, Up,
+        };
+        let at = |kind| {
+            mouse_of(MouseEvent {
+                kind,
+                column: 7,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(
+            at(Down(MouseButton::Left)),
+            Some(Mouse::Click { column: 7, row: 3 })
+        );
+        assert_eq!(at(ScrollUp), Some(Mouse::WheelUp));
+        assert_eq!(at(ScrollDown), Some(Mouse::WheelDown));
+        for kind in [
+            Up(MouseButton::Left),
+            Drag(MouseButton::Left),
+            Moved,
+            Down(MouseButton::Right),
+            Down(MouseButton::Middle),
+        ] {
+            assert_eq!(at(kind), None, "{kind:?}");
+        }
+    }
+
+    /// A panic gives the mouse back before ratatui's hook gives the rest:
+    /// the release runs in the hook that `note_panics` sets, then the hook
+    /// it found, then the flag.
+    #[test]
+    fn a_panic_releases_the_mouse_before_the_old_hook_runs() {
+        use std::sync::Mutex;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let previous = panic::take_hook();
+        // Each entry with its thread: other tests' panics (`should_panic`
+        // ones) run these hooks too, on their own threads, at any time.
+        let mine = thread::current().id();
+        let old = Arc::clone(&seen);
+        panic::set_hook(Box::new(move |_| {
+            old.lock()
+                .unwrap()
+                .push((thread::current().id(), "old hook"));
+        }));
+        let released = Arc::clone(&seen);
+        let panicked = note_panics(Box::new(move || {
+            let mut bytes = Vec::new();
+            capture(&mut bytes, false).unwrap();
+            let what = if bytes == off() { "mouse off" } else { "?" };
+            released
+                .lock()
+                .unwrap()
+                .push((thread::current().id(), what));
+        }));
+        let _ = panic::catch_unwind(|| panic!("a bug"));
+        panic::set_hook(previous);
+        let ours: Vec<&str> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(thread, _)| *thread == mine)
+            .map(|(_, what)| *what)
+            .collect();
+        assert_eq!(ours, ["mouse off", "old hook"]);
+        assert!(panicked.load(Ordering::SeqCst));
+    }
+
+    fn off() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        execute!(bytes, DisableMouseCapture).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn capture_writes_what_crossterm_writes() {
+        let mut on = Vec::new();
+        execute!(on, EnableMouseCapture).unwrap();
+        let mut bytes = Vec::new();
+        capture(&mut bytes, true).unwrap();
+        assert_eq!(bytes, on);
+        let mut bytes = Vec::new();
+        capture(&mut bytes, false).unwrap();
+        assert_eq!(bytes, off());
+        assert_ne!(on, off());
+        // The headless screen records it as written.
+        let mut screen = Headless {
+            terminal: Terminal::new(TestBackend::new(10, 5)).unwrap(),
+            raw: Vec::new(),
+        };
+        screen.capture_mouse(true).unwrap();
+        screen.capture_mouse(false).unwrap();
+        assert_eq!(screen.raw, [on, off()].concat());
     }
 
     #[test]

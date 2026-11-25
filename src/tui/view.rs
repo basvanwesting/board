@@ -12,12 +12,14 @@ use super::state::{Panel, Row, Source, State, Tab};
 use crate::board::Shown;
 use crate::brief::Status;
 
-const HELP: [(&str, &str); 19] = [
+const HELP: [(&str, &str); 21] = [
     ("j k", "down, up"),
+    ("wheel", "down, up, as j k"),
     ("gg G", "first, last"),
     ("ctrl-d ctrl-u", "half a page down, up"),
     ("1 2 3", "Briefs, Chores, Backlog"),
     ("h l S-Tab Tab", "previous, next panel"),
+    ("click", "focus the pane, select the row clicked"),
     ("[ ]", "the Briefs tabs: Briefs, Filed"),
     ("0 Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
@@ -406,7 +408,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::super::data::{BriefItem, Data, ListLine};
-    use super::super::state::{Action, Command, Event, Key};
+    use super::super::state::{Action, Command, Event, Key, Mouse};
     use super::*;
     use crate::board::{BriefRow, ListRow};
     use crate::brief::{Stamp, Status};
@@ -959,5 +961,294 @@ mod tests {
         assert_eq!(age(3_600), "1h");
         assert_eq!(age(86_399), "23h");
         assert_eq!(age(86_400), "1d");
+    }
+
+    /// The mouse tests' board: two open briefs, chores in two groups, a
+    /// backlog long enough to scroll.
+    fn mouse_data() -> Data {
+        let mut data = data();
+        data.chores = ListLine::numbered(
+            ListKind::Chores,
+            vec![
+                ListRow::Group(b"deploy".to_vec()),
+                ListRow::Item(b"c12 Rotate the key. Check: the old one fails".to_vec()),
+                ListRow::Item(b"c13 Renew the cert. Check: it expires later".to_vec()),
+                ListRow::Group(b"home".to_vec()),
+                ListRow::Item(b"c14 Water the plants. Check: wet soil".to_vec()),
+            ],
+        );
+        data.backlog = ListLine::numbered(
+            ListKind::Backlog,
+            (1..=12)
+                .map(|n| ListRow::Item(format!("b{n} item {n}").into_bytes()))
+                .collect(),
+        );
+        data
+    }
+
+    fn mouse_state(width: u16, height: u16) -> State {
+        let (state, _) = State::new(mouse_data(), width, height, Stamp::from_unix(NOW).unwrap());
+        state.step(Event::Loaded(Box::new(mouse_data()))).0
+    }
+
+    fn click(state: State, column: u16, row: u16) -> (State, Vec<Command>) {
+        state.step(Event::Mouse(Mouse::Click { column, row }))
+    }
+
+    fn clicked(state: State, column: u16, row: u16) -> State {
+        let (state, commands) = click(state, column, row);
+        assert_eq!(commands, Vec::<Command>::new());
+        state
+    }
+
+    /// The focused pane, and the line of the item under its cursor, as
+    /// the state holds them.
+    fn on(state: &State) -> (Panel, bool, Option<String>) {
+        let source = state.source();
+        let row = state
+            .cursor_row(source)
+            .map(|at| state.rows(source)[at].text.clone());
+        (state.focus(), state.in_preview(), row)
+    }
+
+    fn on_row(panel: Panel, text: &str) -> (Panel, bool, Option<String>) {
+        (panel, false, Some(text.to_owned()))
+    }
+
+    // At 100 x 16: the left column is 45 wide, the status line is row 15,
+    // and an unfocused panel is 3 high (a quarter of 15). Briefs focused:
+    // Briefs rows 0-8, Chores 9-11, Backlog 12-14. Backlog focused: Briefs
+    // 0-2, Chores 3-5, Backlog 6-14, its items on rows 7-13. Chores
+    // focused: Chores 3-11, its rows deploy, c12, c13, home, c14 on 4-8.
+
+    #[test]
+    fn a_click_focuses_the_pane_under_it() {
+        let state = mouse_state(100, 16);
+        assert_eq!(on(&state), on_row(Panel::Briefs, "128 started   some-slug"));
+        // Chores' title, on its top border.
+        let state = clicked(state, 10, 9);
+        assert_eq!(
+            on(&state),
+            on_row(
+                Panel::Chores,
+                "c12 Rotate the key. Check: the old one fails"
+            )
+        );
+        // Backlog's left border, now rows 12-14 again.
+        let state = clicked(state, 0, 13);
+        assert_eq!(on(&state).0, Panel::Backlog);
+        // Briefs, from the preview's left: column 44 is Briefs' right border.
+        let state = clicked(state, 44, 1);
+        assert_eq!(on(&state).0, Panel::Briefs);
+        // The preview, with an item under the cursor: as `0`.
+        let state = clicked(state, 70, 5);
+        assert_eq!(
+            on(&state),
+            (
+                Panel::Briefs,
+                true,
+                Some("128 started   some-slug".to_owned())
+            )
+        );
+        // A list pane from the preview leaves it.
+        let state = clicked(state, 3, 2);
+        assert!(!on(&state).1);
+    }
+
+    #[test]
+    fn a_click_on_a_row_selects_its_item_and_no_other() {
+        let state = press(mouse_state(100, 16), "3");
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b1 item 1"));
+        // Row 10 is the fourth item row: b4.
+        let state = clicked(state, 5, 10);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b4 item 4"));
+        // Scrolled to the end: b6 to b12 on rows 7-13.
+        let state = press(state, "G");
+        assert_eq!(state.offset(state.source()), 5);
+        let state = clicked(state, 5, 7);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b6 item 6"));
+        let state = clicked(state, 5, 13);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b12 item 12"));
+        // From another pane: the row clicked in Chores (rows 3-5 now, its
+        // one item row 4 shows c12, scrolled to its cursor) is selected
+        // there.
+        let state = clicked(state, 5, 4);
+        assert_eq!(
+            on(&state),
+            on_row(
+                Panel::Chores,
+                "c12 Rotate the key. Check: the old one fails"
+            )
+        );
+        // Chores focused: c14 is on row 8.
+        let state = clicked(state, 5, 8);
+        assert_eq!(
+            on(&state),
+            on_row(Panel::Chores, "c14 Water the plants. Check: wet soil")
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_heading_or_below_the_rows_only_focuses() {
+        let state = press(mouse_state(100, 16), "2j");
+        assert_eq!(
+            on(&state),
+            on_row(Panel::Chores, "c13 Renew the cert. Check: it expires later")
+        );
+        // `home` on row 7, `deploy` on row 4, nothing on row 9.
+        for row in [7, 4, 9] {
+            let state = clicked(state.clone(), 5, row);
+            assert_eq!(
+                on(&state),
+                on_row(Panel::Chores, "c13 Renew the cert. Check: it expires later")
+            );
+        }
+        // From Briefs: a heading focuses Chores, the cursor stays.
+        let state = clicked(press(state, "1"), 5, 9);
+        assert_eq!(on(&state).0, Panel::Chores);
+        let state = clicked(state, 5, 7);
+        assert_eq!(
+            on(&state),
+            on_row(Panel::Chores, "c13 Renew the cert. Check: it expires later")
+        );
+    }
+
+    #[test]
+    fn the_status_line_and_off_the_screen_change_nothing() {
+        let state = press(mouse_state(100, 16), "3j");
+        for (column, row) in [(5, 15), (80, 15), (100, 3), (5, 16), (u16::MAX, u16::MAX)] {
+            let after = clicked(state.clone(), column, row);
+            assert_eq!(on(&after), on(&state), "{column},{row}");
+            assert_eq!(screen(&after), screen(&state), "{column},{row}");
+        }
+    }
+
+    #[test]
+    fn the_preview_takes_a_click_only_with_an_item() {
+        // A filter that hides every brief: no item, no preview.
+        let state = press(mouse_state(100, 16), "/zzz");
+        let state = state.step(Event::Key(Key::Enter)).0;
+        assert_eq!(state.cursor_row(state.source()), None);
+        let state = clicked(state, 70, 5);
+        assert_eq!(on(&state), (Panel::Briefs, false, None));
+    }
+
+    #[test]
+    fn the_hit_follows_the_layout_at_another_size() {
+        // At 80 x 24: left 36 wide, status row 23, unfocused panels 5 high
+        // (a quarter of 23). Briefs focused: Briefs 0-12, Chores 13-17,
+        // Backlog 18-22. Chores shows deploy, c12, c13 on rows 14-16.
+        let state = mouse_state(80, 24);
+        let state = clicked(state, 5, 16);
+        assert_eq!(
+            on(&state),
+            on_row(Panel::Chores, "c13 Renew the cert. Check: it expires later")
+        );
+        // Chores focused: Briefs 0-3, Chores 4-17, Backlog 18-22; its rows
+        // on 5-9, c14 on row 9; backlog's b1 to b3 on rows 19-21.
+        let state = clicked(state, 5, 9);
+        assert_eq!(
+            on(&state),
+            on_row(Panel::Chores, "c14 Water the plants. Check: wet soil")
+        );
+        let state = clicked(state, 5, 21);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b3 item 3"));
+        // Backlog focused: Briefs 0-3, Chores 4-8, Backlog 9-22; b1 on 10.
+        let state = clicked(state, 35, 12);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b3 item 3"));
+        let state = clicked(state, 1, 10);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b1 item 1"));
+        // Column 36 is the preview's border.
+        let state = clicked(state, 36, 12);
+        assert_eq!(
+            on(&state),
+            (Panel::Backlog, true, Some("b1 item 1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_mouse_does_nothing_where_a_key_is_waited_for() {
+        let waits = [
+            // The filter being typed.
+            press(mouse_state(100, 16), "3/item"),
+            // A question.
+            press(mouse_state(100, 16), "3x"),
+            // Help.
+            press(mouse_state(100, 16), "3?"),
+        ];
+        for state in waits {
+            for mouse in [
+                Mouse::Click { column: 5, row: 2 },
+                Mouse::WheelDown,
+                Mouse::WheelUp,
+            ] {
+                let (after, commands) = state.clone().step(Event::Mouse(mouse));
+                assert_eq!(commands, Vec::<Command>::new());
+                assert_eq!(screen(&after), screen(&state), "{mouse:?}");
+                assert_eq!(
+                    (
+                        after.typing(),
+                        after.question().cloned(),
+                        after.help(),
+                        on(&after)
+                    ),
+                    (
+                        state.typing(),
+                        state.question().cloned(),
+                        state.help(),
+                        on(&state)
+                    )
+                );
+            }
+        }
+        // A quit waiting for a write.
+        let (state, _) = press(mouse_state(100, 16), "3x").step(Event::Key(Key::Char('y')));
+        let (state, commands) = state.step(Event::Key(Key::Char('q')));
+        assert_eq!(commands, Vec::<Command>::new());
+        assert!(state.quitting());
+        for mouse in [Mouse::Click { column: 5, row: 2 }, Mouse::WheelDown] {
+            let (after, commands) = state.clone().step(Event::Mouse(mouse));
+            assert_eq!(commands, Vec::<Command>::new());
+            assert_eq!(on(&after), on(&state));
+        }
+    }
+
+    #[test]
+    fn a_click_clears_a_pending_g_and_ends_a_run() {
+        // `g`, a click, `g`: no `gg`.
+        let state = press(mouse_state(100, 16), "3Gg");
+        let state = clicked(state, 5, 15);
+        let state = press(state, "g");
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b12 item 12"));
+        // A run of `J` ended by a click, as by an unrelated key: its move
+        // first, then the click.
+        let state = press(mouse_state(100, 16), "3J");
+        let (state, commands) = click(state, 5, 9);
+        assert!(state.moving().is_none());
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(
+            matches!(&commands[0], Command::Run(Action::Move(wanted)) if (wanted.item().get(), wanted.side(), wanted.target().get()) == (1, crate::list::Side::Before, 3)),
+            "{commands:?}"
+        );
+        // Row 9 is the third row: b2, b1, b3 as the run left them.
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b3 item 3"));
+    }
+
+    #[test]
+    fn the_wheel_moves_as_j_and_k() {
+        let state = press(mouse_state(100, 16), "3");
+        let wheel = |state: State, mouse| {
+            let (state, commands) = state.step(Event::Mouse(mouse));
+            assert_eq!(commands, Vec::<Command>::new());
+            state
+        };
+        let state = wheel(state, Mouse::WheelDown);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b2 item 2"));
+        let state = wheel(wheel(state, Mouse::WheelDown), Mouse::WheelUp);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b2 item 2"));
+        assert_eq!(
+            on(&wheel(state.clone(), Mouse::WheelDown)),
+            on(&press(state, "j"))
+        );
     }
 }
