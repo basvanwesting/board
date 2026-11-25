@@ -68,6 +68,36 @@ pub(crate) enum Failure {
     Said(String),
 }
 
+impl Failure {
+    /// Whether a push lost a race: the remote's `main` moved after the fetch
+    /// the push was built on. git tells it in two places, by the ` ! ` line
+    /// [`succeeded`] keeps (`LC_ALL=C`, so the words are git's own): before
+    /// sending, as not a fast-forward of what the remote advertised (`fetch
+    /// first` when that tip is unknown here, `non-fast-forward` when it is
+    /// known); or, when `main` moved after the advertisement, as the remote's
+    /// failed ref update (`incorrect old value provided`, or `cannot lock
+    /// ref`, `failed to lock` and `failed to update ref` from other servers
+    /// and versions; the last is also what a full disk on the remote gives,
+    /// and a bounded wait costs nothing there). A hook
+    /// that declines, a dropped connection or any other refusal is not one.
+    /// Rejected: `push --porcelain`, whose stdout says the same and moves the
+    /// line out of stderr, the reason a refused write quotes.
+    pub(crate) fn lost_race(&self) -> bool {
+        match self {
+            Failure::NotRun(_) => false,
+            Failure::Said(line) => {
+                (line.starts_with("! [rejected] ")
+                    && (line.ends_with(" (fetch first)") || line.ends_with(" (non-fast-forward)")))
+                    || (line.starts_with("! [remote rejected] ")
+                        && (line.ends_with(" (incorrect old value provided)")
+                            || line.contains(" (cannot lock ref ")
+                            || line.contains(" (failed to lock ")
+                            || line.ends_with(" (failed to update ref)")))
+            }
+        }
+    }
+}
+
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -884,6 +914,44 @@ fn succeeded(args: &[&str], output: Output) -> Result<Vec<u8>, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// git's refusals as `succeeded` keeps them: only the two of a moved
+    /// `main` are a lost race.
+    #[test]
+    fn a_push_lost_a_race_only_when_main_moved() {
+        let said = |line: &str| Failure::Said(line.to_owned());
+        let sha = "a3f139b345287d3eaaedf65c219d0a836c65c9e6";
+        assert!(said(&format!("! [rejected]        {sha} -> main (fetch first)")).lost_race());
+        assert!(
+            said(&format!(
+                "! [rejected]        {sha} -> main (non-fast-forward)"
+            ))
+            .lost_race()
+        );
+        assert!(
+            said(&format!(
+                "! [remote rejected] {sha} -> main (incorrect old value provided)"
+            ))
+            .lost_race()
+        );
+        assert!(said("! [remote rejected] main -> main (failed to update ref)").lost_race());
+        assert!(
+            said(&format!(
+                "! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': \
+                 is at {sha} but expected {sha})"
+            ))
+            .lost_race()
+        );
+        for other in [
+            format!("! [remote rejected] {sha} -> main (pre-receive hook declined)"),
+            format!("! [rejected]        {sha} -> main (stale info)"),
+            "fatal: unable to access 'https://example.org/board-data.git/'".to_owned(),
+            "error: failed to push some refs to 'origin'".to_owned(),
+        ] {
+            assert!(!said(&other).lost_race(), "{other}");
+        }
+        assert!(!Failure::NotRun(io::Error::other("gone")).lost_race());
+    }
 
     /// A variable a newer git adds and this list lacks would be inherited by
     /// every call. One the installed git does not know yet is removed for

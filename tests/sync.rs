@@ -763,30 +763,30 @@ fn a_refused_push_is_retried_on_fresh_state() {
     let ran = a.board(&["add", "backlog", "x"]);
     assert_eq!(
         (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
-        (0, &b"b1\n"[..], "board: retry 2/4\n")
+        (0, &b"b1\n"[..], "board: retry 2/8\n")
     );
     assert_eq!(on_remote(&world, "proj/backlog.md", "x"), 1);
     in_step(&world, &a);
 }
 
-/// Four refused pushes count as offline: an id is refused, since only a
+/// Eight refused pushes count as offline: an id is refused, since only a
 /// push may publish it, and any other write is committed on the clone and
 /// pushed by the next write that gets through.
 #[test]
-fn four_refused_pushes_refuse_an_id_and_keep_other_writes_on_the_clone() {
+fn eight_refused_pushes_refuse_an_id_and_keep_other_writes_on_the_clone() {
     let world = World::new();
     let a = world.a();
     a.board(&["add", "chore", "x", "--group", "g", "--check", "x"])
         .ok();
     let before = world.remote_main();
-    world.reject_pushes(9);
-    let retries = "board: retry 2/4\nboard: retry 3/4\nboard: retry 4/4\n";
+    world.reject_pushes(17);
+    let retries: String = (2..=8).map(|n| format!("board: retry {n}/8\n")).collect();
     let refused = " -> main (pre-receive hook declined))\n";
 
     let said = a.board(&["add", "backlog", "x"]).failed(3);
     assert!(
         said.starts_with(&format!(
-            "{retries}board: add backlog: not pushed after 4 attempts (! [remote rejected] "
+            "{retries}board: add backlog: not pushed after 8 attempts (! [remote rejected] "
         )),
         "{said}"
     );
@@ -835,7 +835,7 @@ fn two_clones_writing_at_once_get_different_ids() {
     );
     assert_eq!(
         (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
-        (0, &b"b2\n"[..], "board: retry 2/4\n")
+        (0, &b"b2\n"[..], "board: retry 2/8\n")
     );
     assert_eq!(
         text(world.remote_file("proj/backlog.md")),
@@ -857,7 +857,7 @@ fn a_push_that_landed_unheard_is_not_applied_twice() {
     let ran = a.board(&["add", "backlog", "once"]);
     assert_eq!(
         (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
-        (0, &b"b1\n"[..], "board: retry 2/4\n")
+        (0, &b"b1\n"[..], "board: retry 2/8\n")
     );
     assert_eq!(on_remote(&world, "proj/backlog.md", "once"), 1);
 
@@ -866,7 +866,7 @@ fn a_push_that_landed_unheard_is_not_applied_twice() {
     let ran = a.board(&["done", "c1"]);
     assert_eq!(
         (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
-        (0, &b"done c1\n"[..], "board: retry 2/4\n")
+        (0, &b"done c1\n"[..], "board: retry 2/8\n")
     );
     assert_eq!(
         world.remote_log()[..3],
@@ -886,7 +886,7 @@ fn a_push_that_landed_late_is_not_applied_again() {
     let ran = a.board(&["add", "backlog", "once"]);
     assert_eq!(
         (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
-        (0, &b"b1\n"[..], "board: retry 2/4\nboard: retry 3/4\n")
+        (0, &b"b1\n"[..], "board: retry 2/8\nboard: retry 3/8\n")
     );
     assert_eq!(text(world.remote_file("proj/backlog.md")), "- b1 once\n");
     assert_eq!(world.remote_log(), ["proj: add b1", "start"]);

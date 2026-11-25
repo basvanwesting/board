@@ -424,7 +424,7 @@ fn two_clones_claiming_at_once_get_different_briefs() {
     );
     let ran = a.board(&["next"]);
     assert_eq!(ran.code, 0, "{ran:?}");
-    assert!(ran.stderr.contains("board: retry 2/4"), "{ran:?}");
+    assert!(ran.stderr.contains("board: retry 2/8"), "{ran:?}");
     let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
     assert_eq!(window("window.code"), "0\n");
     assert!(window("window.out").ends_with("/proj/briefs/1-one.md\n"));
@@ -653,7 +653,7 @@ fn a_report_made_while_an_amendment_lands_keeps_the_amendment() {
     );
     let ran = a.board_with_input(&["report", "1"], b"All done.\n");
     assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"reported 1\n"[..]));
-    assert!(ran.stderr.contains("board: retry 2/4"), "{ran:?}");
+    assert!(ran.stderr.contains("board: retry 2/8"), "{ran:?}");
     let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
     assert_eq!(window("window.code"), "0\n");
     assert_eq!(window("window.out"), "amended 1\n");
@@ -863,7 +863,7 @@ fn an_item_dropped_while_file_pushes_is_skipped() {
     );
     let ran = a.board(&["file", "1"]);
     assert_eq!(ran.code, 0, "{ran:?}");
-    assert!(ran.stderr.contains("board: retry 2/4"), "{ran:?}");
+    assert!(ran.stderr.contains("board: retry 2/8"), "{ran:?}");
     assert_eq!(ran.stdout, b"filed 1 (1 commit) closed b2\n");
     let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
     assert_eq!(window("window.code"), "0\n");

@@ -305,7 +305,9 @@ fn step() -> impl Strategy<Value = Step> {
         5 => (who(), edit()).prop_map(|(who, edit)| Step::HandEdit { who, edit }),
         3 => (who(), prop::bool::weighted(0.65)).prop_map(|(who, online)| Step::Net { who, online }),
         2 => who().prop_map(|who| Step::Sync { who }),
-        1 => (0..6u8).prop_map(Step::RejectPushes),
+        // Up to 11: a write's eight pushes, a lost ack's own push and more,
+        // so a trace can still give up while online.
+        1 => (0..12u8).prop_map(Step::RejectPushes),
         1 => Just(Step::Quiesce),
     ]
 }
@@ -580,6 +582,12 @@ struct Effect {
     body_added: Vec<String>,
 }
 
+/// Whether a write tried all eight rounds and none was pushed: the last
+/// retry noted, and the write's commit left on the clone (`not pushed`).
+fn given_up_online(run: &Run) -> bool {
+    run.stderr.contains("board: retry 8/8") && run.stderr.contains("not pushed")
+}
+
 /// Counts of what the trace went through, for the depth check.
 #[derive(Debug, Default, Clone, Copy)]
 struct Depth {
@@ -588,6 +596,8 @@ struct Depth {
     retried_then_succeeded: u32,
     raced_in_the_window: u32,
     not_pushed: u32,
+    /// Every round's push refused with the remote there: given up online.
+    given_up_online: u32,
     refused: u32,
     offline_refused: u32,
     not_pushed_then_pushed: u32,
@@ -633,6 +643,7 @@ impl Depth {
         self.retried_then_succeeded += other.retried_then_succeeded;
         self.raced_in_the_window += other.raced_in_the_window;
         self.not_pushed += other.not_pushed;
+        self.given_up_online += other.given_up_online;
         self.refused += other.refused;
         self.offline_refused += other.offline_refused;
         self.not_pushed_then_pushed += other.not_pushed_then_pushed;
@@ -1617,6 +1628,7 @@ impl<'w> Oracle<'w> {
             stderr: String::from_utf8(output.stderr).unwrap(),
         };
         self.depth.commands += 1;
+        self.depth.given_up_online += u32::from(given_up_online(&run));
         match run.code {
             Some(0) => {
                 self.depth.succeeded += 1;
@@ -1907,6 +1919,7 @@ impl<'w> Oracle<'w> {
 
         // Depth: what this command went through.
         let slot = who.slot();
+        self.depth.given_up_online += u32::from(given_up_online(&run));
         if run.code == Some(0) {
             if std::mem::take(&mut self.healing[slot]) {
                 self.depth.kill_after_push_healed += 1;
@@ -1916,7 +1929,7 @@ impl<'w> Oracle<'w> {
             }
             if matches!(fault, Some(Fault::LateLanding))
                 && !rejecting
-                && run.stderr.contains("retry 3/4")
+                && run.stderr.contains("retry 3/8")
             {
                 self.depth.late_landing_recognised += 1;
             }
@@ -3077,6 +3090,7 @@ fn the_traces_get_deep() {
     assert!(depth.retried_then_succeeded > 0, "{depth:?}");
     assert!(depth.raced_in_the_window > 0, "{depth:?}");
     assert!(depth.not_pushed > 0, "{depth:?}");
+    assert!(depth.given_up_online > 0, "{depth:?}");
     assert!(depth.refused > 0, "{depth:?}");
     assert!(depth.offline_refused > 0, "{depth:?}");
     assert!(depth.not_pushed_then_pushed > 0, "{depth:?}");
@@ -3247,7 +3261,7 @@ fn next_after_a_queue_whose_brief_was_saved_during_the_push() {
             },
             fault: Some(Fault::WindowEdit(Edit::Brief(BriefPick::First))),
         },
-        Step::RejectPushes(5),
+        Step::RejectPushes(9),
         Step::Cmd {
             who: Who::A,
             op: Op::Next,

@@ -6,14 +6,15 @@
 //! check    a clone on main with origin and a commit, not shallow;
 //!          git's stale .git/index.lock and .git/board.index.lock removed
 //! absorb   board files changed by hand -> one commit on main, `board: hand edits`
-//! round    at most 4:
+//! round    at most 8:
 //!            fetch; M = main, U = origin/main
 //!            any failed T found in U -> the command landed; it is not run again
 //!            X = integrate(M, U): U, M, or a merge commit of the two
 //!            X = normalise(X): an id for every item without one, every project
 //!            T = the command's commit on X (built in the object store), else X
-//!            T == U -> done;  push T -> done, or the next round
-//! offline  no fetch, or four failed pushes: X = integrate(M, U) and the
+//!            T == U -> done;  push T -> done, or the next round,
+//!            after a random wait when the push lost a race
+//! offline  no fetch, or eight failed pushes: X = integrate(M, U) and the
 //!          command once more, on main only; allocating an id is refused
 //! advance  main fast-forwards to T; a file saved meanwhile is absorbed and
 //!          merged in, at most 3 times
@@ -39,7 +40,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
 use crate::git::{Failure, Git, Oid, TreeEntry};
@@ -51,9 +52,13 @@ use crate::project::{BoardPath, Project, ProjectName, copy_paths};
 use crate::raw;
 
 /// Pushes per write. An agent's command has to end rather than retry
-/// without limit, and an id not yet published may not be printed; four
-/// failed pushes are given up on even with a working fetch.
-const ROUNDS: u8 = 4;
+/// without limit, and an id not yet published may not be printed; eight
+/// failed pushes are given up on even with a working fetch. Eight, where
+/// there were four (owner, 2026-11-25): with the waits of [`backoff`] the
+/// rounds are independent tries against a writer that keeps pushing, and
+/// enough of them get one through; the waits add at most 11.75 s to the
+/// rounds' own fetches and pushes.
+const ROUNDS: u8 = 8;
 
 /// Merges of a file saved during the write before the fast-forward is given
 /// up on. A save is a person's or an agent's, so a few are plenty; a loop
@@ -65,7 +70,8 @@ const SETTLES: u8 = 3;
 pub enum Note {
     /// Another write on this clone holds the lock; this one waits for it.
     LockWait,
-    /// A push failed; round `round` of the four starts over from a fetch.
+    /// A push failed; round `round` of [`ROUNDS`] starts over from a fetch,
+    /// after a wait when the push lost a race.
     Retry { round: u8 },
     /// The clone's own commits were merged with the remote's; `lists` were
     /// merged line by line.
@@ -122,7 +128,7 @@ enum Offline {
     Unreached(Failure),
     /// The fetch failed after a push that failed: the push may have landed.
     UnreachedAfterPush(Failure),
-    /// Four pushes failed with the remote reachable.
+    /// Every round's push failed with the remote reachable.
     Refused(Failure),
 }
 
@@ -347,6 +353,57 @@ pub(crate) fn write<T>(
     notes: &dyn Fn(Note),
     apply: Option<Apply<'_, T>>,
 ) -> Result<Option<T>, Error> {
+    write_waiting(root, project, what, notes, apply, &std::thread::sleep)
+}
+
+/// The wait after a write's `race`th lost race (1 to 7, whatever round it
+/// fell on), before its retry: a random part of a ceiling that doubles per
+/// lost race, `random` spread over it.
+///
+/// A retry made the instant a push is refused can fall in step with a
+/// writer that pushes on a steady cycle: when a round takes about as long as
+/// that cycle, every retry starts at the same losing point of it, and every
+/// round is lost, not most (the case measured: one session's 107 writes in
+/// eight minutes). A random wait makes each round an independent try. The
+/// first lost race is retried at once (owner, 2026-11-25): one collision is
+/// the common case and is best retried at once, and the retries after it
+/// start at a random point, which is what breaks the step. Counted in lost
+/// races, not rounds: a round lost otherwise (a declined push, a lost
+/// answer) says nothing about a writer in step, so a first collision after
+/// one is still retried at once. Rejected: a fixed wait (two
+/// starved writers would stay in step with each other); a time budget
+/// instead of a count (the rounds bound it already); a wait after a failed
+/// fetch or a declined push (neither is a lost race, and a wait helps
+/// nothing there).
+fn backoff(race: u8, random: u64) -> Duration {
+    // Ceilings after lost race 1, 2, … in milliseconds: none, then 0.25 s
+    // doubling, then flat.
+    const CEILINGS: [u64; 7] = [0, 250, 500, 1000, 2000, 4000, 4000];
+    let ceiling = CEILINGS[usize::from(race.saturating_sub(1)).min(CEILINGS.len() - 1)];
+    Duration::from_millis(random % (ceiling + 1))
+}
+
+/// A random value for [`backoff`], fresh per call.
+fn random() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    RandomState::new().hash_one((nanos, std::process::id()))
+}
+
+/// [`write`] with the wait of a retry after a lost race given: a test
+/// records it instead of sleeping. The clone's lock stays held across the
+/// wait, as a round assumes it holds `main`: other writes on this machine
+/// queue behind it for as long, at most the waits' 11.75 s in all, the
+/// accepted cost.
+fn write_waiting<T>(
+    root: &Path,
+    project: &ProjectName,
+    what: &str,
+    notes: &dyn Fn(Note),
+    apply: Option<Apply<'_, T>>,
+    wait: &dyn Fn(Duration),
+) -> Result<Option<T>, Error> {
     let git = Git::at(root);
     let _lock = lock(root, notes)?;
     check(root, &git)?;
@@ -373,6 +430,8 @@ pub(crate) fn write<T>(
     // Every round whose push failed: each may have reached the remote all
     // the same.
     let mut failed: Vec<Built<T>> = Vec::new();
+    // Lost races so far, for the wait of the next: see [`backoff`].
+    let mut races = 0;
     let mut last_refusal = None;
     let mut offline = None;
     let mut pushed = None;
@@ -410,10 +469,14 @@ pub(crate) fn write<T>(
             }
             Err(failure) => {
                 failed.push(built);
-                last_refusal = Some(failure);
                 if round < ROUNDS {
                     notes(Note::Retry { round: round + 1 });
+                    if failure.lost_race() {
+                        races += 1;
+                        wait(backoff(races, random()));
+                    }
                 }
+                last_refusal = Some(failure);
             }
         }
     }
@@ -441,7 +504,7 @@ pub(crate) fn write<T>(
         Some(built) => built,
         // The remote is out of reach: the command runs once more, on the
         // clone's own commits and what was last fetched, and its commit
-        // stays on `main` for the next write to push. Four refused pushes
+        // stays on `main` for the next write to push. Eight refused pushes
         // count the same: an agent's command has to end.
         None => {
             let offline = offline.as_ref().expect("a write not pushed is offline");
@@ -1036,4 +1099,269 @@ fn advance(ctx: &Ctx<'_>, tip: Oid, pushed: bool) -> Result<(), Error> {
 
 fn git_error(failure: Failure) -> Error {
     Error::Git(format!("git in the board-data clone: {failure}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::process::Command;
+
+    use super::*;
+
+    /// The ceilings after lost races 1 to 7, whatever their rounds (owner,
+    /// 2026-11-25): the first retried at once, then 0.25 s doubling to 4 s.
+    const CEILINGS: [(u8, u64); 7] = [
+        (1, 0),
+        (2, 250),
+        (3, 500),
+        (4, 1000),
+        (5, 2000),
+        (6, 4000),
+        (7, 4000),
+    ];
+
+    #[test]
+    fn the_wait_is_random_within_a_ceiling_that_doubles_per_lost_race() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for (race, ceiling) in CEILINGS {
+            let ceiling = Duration::from_millis(ceiling);
+            // The ceiling itself is reached: it is the ceiling, not below.
+            assert_eq!(backoff(race, ceiling.as_millis() as u64), ceiling);
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..200 {
+                // xorshift: many values, the same on every run.
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let wait = backoff(race, state);
+                assert!(wait <= ceiling, "race {race}: {wait:?}");
+                seen.insert(wait);
+            }
+            assert_eq!(seen.len() > 1, !ceiling.is_zero(), "race {race}: {seen:?}");
+        }
+        assert_eq!(ROUNDS, 8);
+    }
+
+    /// A remote and a clone of it in a temp dir, for [`write_waiting`].
+    ///
+    /// The library's git inherits this process's environment, so the
+    /// developer's global configuration reaches it; the clone's own
+    /// configuration fixes what a write here depends on (the identity of its
+    /// commits, where its hooks are).
+    struct Clone {
+        dir: tempfile::TempDir,
+    }
+
+    impl Clone {
+        fn new() -> Clone {
+            let clone = Clone {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            let dir = clone.dir.path();
+            git(dir, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+            git(dir, &["init", "-q", "-b", "main", "data"]);
+            let data = clone.data();
+            let hooks = data.join(".git").join("hooks");
+            for (key, value) in [
+                ("user.name", "t"),
+                ("user.email", "t@example.org"),
+                ("core.hooksPath", hooks.to_str().unwrap()),
+            ] {
+                git(&data, &["config", key, value]);
+            }
+            git(&data, &["remote", "add", "origin", "../remote.git"]);
+            git(&data, &["commit", "-q", "--allow-empty", "-m", "start"]);
+            git(&data, &["push", "-q", "-u", "origin", "main"]);
+            clone
+        }
+
+        fn data(&self) -> PathBuf {
+            self.dir.path().join("data")
+        }
+
+        /// Every push of the clone's loses a race, `races` times: its
+        /// `pre-push` hook first puts a commit of its own on the remote's
+        /// `main`, on what the clone fetched.
+        fn lose_races(&self, races: usize) {
+            self.pushes(&vec!["race"; races]);
+        }
+
+        /// What the clone's pushes meet, one word per push, then nothing:
+        /// `race`, a commit of the hook's own put on the remote's `main`
+        /// first, on what the clone fetched; `fail`, the push failed before
+        /// it leaves.
+        fn pushes(&self, words: &[&str]) {
+            let plan = self.dir.path().join("pushes");
+            fs::write(
+                &plan,
+                words.iter().map(|w| format!("{w}\n")).collect::<String>(),
+            )
+            .unwrap();
+            hook(
+                &self.data().join(".git/hooks/pre-push"),
+                &format!(
+                    "plan={plan}\n\
+                     word=$(head -n 1 \"$plan\")\n\
+                     tail -n +2 \"$plan\" >\"$plan.next\"\n\
+                     mv \"$plan.next\" \"$plan\"\n\
+                     case $word in\n\
+                     fail) exit 1 ;;\n\
+                     race)\n\
+                     \ttip=$(git rev-parse refs/remotes/origin/main)\n\
+                     \tnew=$(git commit-tree -p \"$tip\" -m race \"$tip^{{tree}}\")\n\
+                     \tgit push -q --no-verify origin \"$new:refs/heads/main\" >/dev/null 2>&1 ;;\n\
+                     esac\n",
+                    plan = plan.display()
+                ),
+            );
+        }
+
+        /// A `sync` of a hand edit, with the waits it asked for.
+        fn sync(&self, line: &str) -> (Result<(), Error>, Vec<Duration>, Vec<Note>) {
+            let data = self.data();
+            fs::create_dir_all(data.join("shop")).unwrap();
+            fs::write(data.join("shop/backlog.md"), format!("- {line}\n")).unwrap();
+            let waits = RefCell::new(Vec::new());
+            let notes = RefCell::new(Vec::new());
+            let ran = write_waiting::<()>(
+                &data,
+                &ProjectName::parse("shop").unwrap(),
+                "sync",
+                &|note| notes.borrow_mut().push(note),
+                None,
+                &|wait| waits.borrow_mut().push(wait),
+            );
+            (ran.map(drop), waits.into_inner(), notes.into_inner())
+        }
+
+        fn remote_has(&self, line: &str) -> bool {
+            let out = git(
+                &self.dir.path().join("remote.git"),
+                &["show", "main:shop/backlog.md"],
+            );
+            out.lines().any(|l| l.ends_with(line))
+        }
+    }
+
+    /// Setup git, away from the developer's configuration.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test's setup, not the product's git"
+        )]
+        let output = Command::new("git")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("LC_ALL", "C")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn hook(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn retries(notes: &[Note]) -> Vec<u8> {
+        notes
+            .iter()
+            .filter_map(|note| match note {
+                Note::Retry { round } => Some(*round),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each wait within the ceiling of its lost race, in order from the
+    /// first.
+    fn assert_within_ceilings(waits: &[Duration]) {
+        for (wait, (race, ceiling)) in waits.iter().zip(CEILINGS) {
+            assert!(
+                *wait <= Duration::from_millis(ceiling),
+                "race {race}: {wait:?}"
+            );
+        }
+    }
+
+    /// The owner's case: a writer that keeps losing gets through on a later
+    /// round. Five lost races, then the sixth push lands; with four rounds
+    /// it would have given up.
+    #[test]
+    fn a_write_that_loses_five_races_gets_through() {
+        let clone = Clone::new();
+        clone.lose_races(5);
+        let (ran, waits, notes) = clone.sync("b1 one");
+        assert!(ran.is_ok(), "{ran:?} {notes:?}");
+        assert!(clone.remote_has("b1 one"));
+        assert_eq!(retries(&notes), [2, 3, 4, 5, 6]);
+        assert_eq!(waits.len(), 5, "{waits:?}");
+        assert_within_ceilings(&waits);
+    }
+
+    /// Eight lost races: a wait before each of the seven retries, in order,
+    /// the first of them zero; then the write is given up on.
+    #[test]
+    fn eight_lost_races_wait_before_every_retry_and_give_up() {
+        let clone = Clone::new();
+        clone.lose_races(8);
+        let (ran, waits, notes) = clone.sync("b1 one");
+        assert!(
+            matches!(&ran, Err(Error::NeedsRemote(why)) if why.contains("not pushed after 8 attempts")),
+            "{ran:?}"
+        );
+        assert_eq!(retries(&notes), [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(waits.len(), 7, "{waits:?}");
+        assert_eq!(waits[0], Duration::ZERO);
+        assert_within_ceilings(&waits);
+    }
+
+    /// The wait goes by the write's lost races, not its rounds: a first
+    /// lost race after a failed push is still retried at once, the second
+    /// waits.
+    #[test]
+    fn the_first_lost_race_is_retried_at_once_whatever_the_round() {
+        let clone = Clone::new();
+        clone.pushes(&["fail", "fail", "race", "race"]);
+        let (ran, waits, notes) = clone.sync("b1 one");
+        assert!(ran.is_ok(), "{ran:?} {notes:?}");
+        assert_eq!(retries(&notes), [2, 3, 4, 5]);
+        assert_eq!(waits.len(), 2, "{waits:?}");
+        assert_eq!(waits[0], Duration::ZERO);
+        assert_within_ceilings(&waits);
+    }
+
+    /// No race lost, no wait: a remote whose hook declines every push is
+    /// retried at once, and a remote out of reach goes offline at once.
+    #[test]
+    fn a_declined_push_and_a_failed_fetch_ask_for_no_wait() {
+        let clone = Clone::new();
+        hook(
+            &clone.dir.path().join("remote.git/hooks/pre-receive"),
+            "exit 1\n",
+        );
+        let (ran, waits, notes) = clone.sync("b1 one");
+        assert!(
+            matches!(&ran, Err(Error::NeedsRemote(why)) if why.contains("hook declined")),
+            "{ran:?}"
+        );
+        assert_eq!(retries(&notes), [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(waits, []);
+
+        let clone = Clone::new();
+        git(
+            &clone.data(),
+            &["remote", "set-url", "origin", "../gone.git"],
+        );
+        let (ran, waits, notes) = clone.sync("b1 one");
+        assert!(matches!(ran, Err(Error::NeedsRemote(_))), "{ran:?}");
+        assert_eq!(retries(&notes), []);
+        assert_eq!(waits, []);
+    }
 }
