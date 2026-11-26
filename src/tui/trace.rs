@@ -1276,15 +1276,25 @@ fn judge(
     // T11: the editor, on what `e` was pressed on, with no write out; an
     // edit waited for opens at the load after the last write, unless its
     // item is gone (or a filter hides it).
-    if let (Event::Loaded(_), Some((source, item))) = (event, &before.edit_wanted)
+    if let (Event::Loaded(_), Some((source, item, path))) = (event, &before.edit_wanted)
         && after.writes.is_empty()
     {
-        let there = followed(*source, after, item).is_some_and(|found| {
-            after
-                .rows(*source)
-                .iter()
-                .any(|row| row.key == Some(found.clone()))
-        });
+        let there = match path {
+            // A brief: its file, in either tab (an unpushed one moves to
+            // Filed when pushed), never another file with its number.
+            Some(path) => [Source::Open, Source::Filed].into_iter().any(|source| {
+                after
+                    .rows(source)
+                    .iter()
+                    .any(|row| row.key.is_some() && after.brief(source, row).path == *path)
+            }),
+            None => followed(*source, after, item).is_some_and(|found| {
+                after
+                    .rows(*source)
+                    .iter()
+                    .any(|row| row.key == Some(found.clone()))
+            }),
+        };
         let opened = commands
             .iter()
             .any(|command| matches!(command, Command::Edit { .. }));
@@ -1294,11 +1304,17 @@ fn judge(
     // the item under the cursor.
     if let Some(key) = key
         && key != Key::Esc
-        && let Some((source, item)) = &after.edit_wanted
+        && let Some((source, item, path)) = &after.edit_wanted
     {
         prop_assert!(pressed('e'), "{:?} kept the wait for {:?}", key, item);
         let (on, row) = before.cursor_item().expect("e on an item");
         prop_assert_eq!((on, row.key.as_ref()), (*source, Some(item)));
+        // The file of the brief it was pressed on.
+        let file = on
+            .list()
+            .is_none()
+            .then(|| before.brief(on, &row).path.clone());
+        prop_assert_eq!(path, &file);
     }
     if acts {
         prop_assert!(after.edit_wanted.is_none(), "{event:?} kept the wait");
@@ -1315,23 +1331,29 @@ fn judge(
                 "edit with {:?} out",
                 oracle.writes
             );
-            let (source, item) = if pressed('e') {
+            let (source, item, file) = if pressed('e') {
                 let (source, row) = before.cursor_item().expect("e on an item");
-                (source, row.key.expect("an item"))
+                let file = source
+                    .list()
+                    .is_none()
+                    .then(|| before.brief(source, &row).path.clone());
+                (source, row.key.expect("an item"), file)
             } else {
                 depth.edits_waited += 1;
                 before.edit_wanted.clone().expect("an edit was waited for")
             };
-            let row = after
-                .rows(source)
-                .into_iter()
-                .find(|row| row.key.as_ref() == Some(&item))
-                .expect("the item is there");
             prop_assert_eq!(*line, None);
-            match source.list() {
-                None => prop_assert_eq!(path, &after.brief(source, &row).path),
+            match (source.list(), file) {
+                // The file `e` was pressed on.
+                (None, Some(file)) => prop_assert_eq!(path, &file),
+                (None, None) => prop_assert!(false, "a brief's edit without its file"),
                 // The item's own file, by the id on its row.
-                Some(kind) => {
+                (Some(kind), _) => {
+                    let row = after
+                        .rows(source)
+                        .into_iter()
+                        .find(|row| row.key.as_ref() == Some(&item))
+                        .expect("the item is there");
                     let id = cli_id(kind, &row).expect("a row with an id");
                     prop_assert_eq!(
                         path.to_string(),
@@ -1723,4 +1745,74 @@ fn yy_yanks_the_whole_item_and_y_still_the_id() {
             vec!["c2 chore v2\n".to_owned()],
         ]
     );
+}
+
+/// The shrunk case of a random trace: an edit waited for on a filed brief
+/// whose number an open brief has too (lint reports it), and the load
+/// after the write has the filed file gone. T11: the editor does not open
+/// on the other file of that number.
+#[test]
+fn a_waited_edit_of_a_filed_brief_does_not_open_its_namesake() {
+    use Key::Char;
+    let files = Files {
+        open: vec![(1, Some(Status::Queued), 0)],
+        filed: vec![(1, 0)],
+        chores: Vec::new(),
+        backlog: Vec::new(),
+    };
+    let key = |c| Step::Key(Char(c));
+    let mut steps = vec![
+        key('1'),
+        key('r'),
+        key('e'),
+        Step::Wrote(false),
+        Step::LoadSame,
+        Step::Edited(0),
+    ];
+    steps.extend(['2', 'j', '3', 'l', '[', '1', 'r', 'e'].map(key));
+    steps.extend([
+        Step::Wrote(false),
+        Step::LoadSame,
+        Step::Edited(0),
+        Step::Wrote(false),
+        Step::Load(Files {
+            open: vec![(1, Some(Status::Draft), 0)],
+            filed: Vec::new(),
+            chores: Vec::new(),
+            backlog: Vec::new(),
+        }),
+    ]);
+    if let Err(error) = run_trace(&files, &steps) {
+        panic!("{error}");
+    }
+}
+
+/// An unpushed brief whose number an open brief has too: `e` on it while a
+/// write is out, then it is pushed and moves to Filed, renumbered there
+/// (`nth` 0). The editor still opens on its file.
+#[test]
+fn a_waited_edit_follows_its_brief_s_file_into_the_other_tab() {
+    use Key::Char;
+    let files = Files {
+        open: vec![(1, Some(Status::Started), 0)],
+        filed: vec![(1, 0)],
+        chores: Vec::new(),
+        backlog: Vec::new(),
+    };
+    let steps = [
+        Step::Unpushed(Some(vec![1])),
+        Step::Key(Char('1')),
+        Step::Key(Char('j')),
+        Step::Key(Char('r')),
+        Step::Key(Char('e')),
+        Step::Tick(61),
+        Step::Unpushed(Some(Vec::new())),
+        Step::Wrote(true),
+        Step::LoadSame,
+    ];
+    let depth = match run_trace(&files, &steps) {
+        Ok(depth) => depth,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!((depth.edits_waited, depth.edits), (1, 1), "{depth:?}");
 }

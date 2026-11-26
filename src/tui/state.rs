@@ -379,8 +379,9 @@ pub(crate) struct State {
     quitting: bool,
     /// `e` was pressed while writes were out: the editor opens on this
     /// item once they are done and the files are read again, unless a key
-    /// but Esc came first.
-    edit_wanted: Option<(Source, ItemKey)>,
+    /// but Esc came first. A brief's file path with it: the editor opens
+    /// on that file only.
+    edit_wanted: Option<(Source, ItemKey, Option<BoardPath>)>,
     /// Since the last key.
     messages: Vec<Message>,
 }
@@ -857,11 +858,15 @@ impl State {
             self.say("nothing to edit here".to_owned(), true);
             return Vec::new();
         };
+        let path = source
+            .list()
+            .is_none()
+            .then(|| self.brief(source, &row).path.clone());
         let key = row.key.expect("the cursor is on an item");
         if self.writes.is_empty() {
-            return self.edit(source, &key);
+            return self.edit(source, &key, path.as_ref());
         }
-        self.edit_wanted = Some((source, key));
+        self.edit_wanted = Some((source, key, path));
         self.say(
             "the editor opens once the writes are done; a key but Esc calls it off".to_owned(),
             false,
@@ -869,11 +874,15 @@ impl State {
         Vec::new()
     }
 
-    /// The editor on the brief's file, or on the list file at the item's
-    /// line.
-    fn edit(&mut self, source: Source, key: &ItemKey) -> Vec<Command> {
+    /// The editor on the brief's file (`path`, the one `e` was pressed
+    /// on), or on the item's file.
+    fn edit(&mut self, source: Source, key: &ItemKey, path: Option<&BoardPath>) -> Vec<Command> {
         // A brief may have changed tabs meanwhile: pushed, an unpushed one
-        // goes to Filed. It is the same file.
+        // goes to Filed. It is the same file, so a brief's row is followed
+        // by its file alone: a brief on two files of one name, one open and
+        // one in `briefs/done/` (lint reports it), has a key in each tab,
+        // renumbered (`nth`) as one moves, and the other file is not the
+        // one `e` was pressed on.
         let other = match source {
             Source::Open => Some(Source::Filed),
             Source::Filed => Some(Source::Open),
@@ -885,7 +894,12 @@ impl State {
             .find_map(|source| {
                 self.rows(source)
                     .into_iter()
-                    .find(|row| row.key.as_ref() == Some(key))
+                    .find(|row| match (source.list(), path) {
+                        (None, Some(path)) => {
+                            row.key.is_some() && self.brief(source, row).path == *path
+                        }
+                        _ => row.key.as_ref() == Some(key),
+                    })
                     .map(|row| (source, row))
             });
         let Some((source, row)) = found else {
@@ -1053,9 +1067,9 @@ impl State {
     /// After a reload: the editor waited for opens.
     fn loaded(&mut self) -> Vec<Command> {
         if self.writes.is_empty()
-            && let Some((source, key)) = self.edit_wanted.take()
+            && let Some((source, key, path)) = self.edit_wanted.take()
         {
-            return self.edit(source, &key);
+            return self.edit(source, &key, path.as_ref());
         }
         Vec::new()
     }
