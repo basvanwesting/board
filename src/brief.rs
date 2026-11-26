@@ -23,6 +23,9 @@ use crate::raw;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Status {
     Draft,
+    /// A finished brief that waits in `briefs/parked/` for the owner's word
+    /// (owner, 2026-11-26); only `queue` moves on from it.
+    Parked,
     Queued,
     Started,
     Blocked,
@@ -31,8 +34,9 @@ pub enum Status {
 }
 
 impl Status {
-    pub const ALL: [Status; 6] = [
+    pub const ALL: [Status; 7] = [
         Status::Draft,
+        Status::Parked,
         Status::Queued,
         Status::Started,
         Status::Blocked,
@@ -44,6 +48,7 @@ impl Status {
     pub const fn as_str(self) -> &'static str {
         match self {
             Status::Draft => "draft",
+            Status::Parked => "parked",
             Status::Queued => "queued",
             Status::Started => "started",
             Status::Blocked => "blocked",
@@ -86,6 +91,7 @@ impl std::error::Error for UnknownStatus {}
 /// The moves a command can make on a brief's status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Transition {
+    Park,
     Queue,
     Claim,
     Block,
@@ -95,7 +101,8 @@ pub enum Transition {
 }
 
 impl Transition {
-    pub const ALL: [Transition; 6] = [
+    pub const ALL: [Transition; 7] = [
+        Transition::Park,
         Transition::Queue,
         Transition::Claim,
         Transition::Block,
@@ -110,21 +117,23 @@ impl Transition {
     /// new status or transition does not compile until its place here is
     /// decided.
     pub const fn apply(self, from: Status) -> Option<Status> {
-        use Status::{Blocked, Draft, Filed, Queued, Reported, Started};
-        use Transition::{Block, Claim, File, Queue, Report, Resume};
+        use Status::{Blocked, Draft, Filed, Parked, Queued, Reported, Started};
+        use Transition::{Block, Claim, File, Park, Queue, Report, Resume};
         match (self, from) {
-            (Queue, Draft) => Some(Queued),
+            (Park, Draft) => Some(Parked),
+            (Queue, Draft | Parked) => Some(Queued),
             (Claim, Queued) => Some(Started),
             (Block, Started) => Some(Blocked),
             (Resume, Blocked) => Some(Started),
             (Report, Started) => Some(Reported),
             (File, Reported) => Some(Filed),
-            (Queue, Queued | Started | Blocked | Reported | Filed)
-            | (Claim, Draft | Started | Blocked | Reported | Filed)
-            | (Block, Draft | Queued | Blocked | Reported | Filed)
-            | (Resume, Draft | Queued | Started | Reported | Filed)
-            | (Report, Draft | Queued | Blocked | Reported | Filed)
-            | (File, Draft | Queued | Started | Blocked | Filed) => None,
+            (Park, Parked | Queued | Started | Blocked | Reported | Filed)
+            | (Queue, Queued | Started | Blocked | Reported | Filed)
+            | (Claim, Draft | Parked | Started | Blocked | Reported | Filed)
+            | (Block, Draft | Parked | Queued | Blocked | Reported | Filed)
+            | (Resume, Draft | Parked | Queued | Started | Reported | Filed)
+            | (Report, Draft | Parked | Queued | Blocked | Reported | Filed)
+            | (File, Draft | Parked | Queued | Started | Blocked | Filed) => None,
         }
     }
 
@@ -134,7 +143,8 @@ impl Transition {
     /// first start, which is what "in flight for how long" counts from.
     const fn stamps(self) -> bool {
         match self {
-            Transition::Queue
+            Transition::Park
+            | Transition::Queue
             | Transition::Claim
             | Transition::Block
             | Transition::Report
@@ -787,6 +797,17 @@ impl Brief {
         now: Stamp,
     ) -> Result<Status, TransitionError> {
         let from = self.status().map_err(TransitionError::BadStatus)?;
+        self.transition_from(from, transition, now)
+    }
+
+    /// The move from `from`, which the place of the file may decide over
+    /// what the header says ([`crate::project::BriefFile::transition`]).
+    pub(crate) fn transition_from(
+        &mut self,
+        from: Status,
+        transition: Transition,
+        now: Stamp,
+    ) -> Result<Status, TransitionError> {
         let to = transition
             .apply(from)
             .ok_or(TransitionError::NotFrom(from))?;
@@ -821,7 +842,7 @@ mod tests {
         }
         assert_eq!(
             "Started".parse::<Status>().unwrap_err().to_string(),
-            "`Started` is not a status (draft, queued, started, blocked, reported, filed)"
+            "`Started` is not a status (draft, parked, queued, started, blocked, reported, filed)"
         );
     }
 
@@ -832,22 +853,24 @@ mod tests {
         for (index, status) in Status::ALL.into_iter().enumerate() {
             let expected = match status {
                 Status::Draft => 0,
-                Status::Queued => 1,
-                Status::Started => 2,
-                Status::Blocked => 3,
-                Status::Reported => 4,
-                Status::Filed => 5,
+                Status::Parked => 1,
+                Status::Queued => 2,
+                Status::Started => 3,
+                Status::Blocked => 4,
+                Status::Reported => 5,
+                Status::Filed => 6,
             };
             assert_eq!(index, expected);
         }
         for (index, transition) in Transition::ALL.into_iter().enumerate() {
             let expected = match transition {
-                Transition::Queue => 0,
-                Transition::Claim => 1,
-                Transition::Block => 2,
-                Transition::Resume => 3,
-                Transition::Report => 4,
-                Transition::File => 5,
+                Transition::Park => 0,
+                Transition::Queue => 1,
+                Transition::Claim => 2,
+                Transition::Block => 3,
+                Transition::Resume => 4,
+                Transition::Report => 5,
+                Transition::File => 6,
             };
             assert_eq!(index, expected);
         }
@@ -855,17 +878,18 @@ mod tests {
 
     #[test]
     fn the_transition_table() {
-        use Status::{Blocked, Filed, Queued, Reported, Started};
+        use Status::{Blocked, Filed, Parked, Queued, Reported, Started};
         const NO: Option<Status> = None;
         #[rustfmt::skip]
-        let table: [(Transition, [Option<Status>; 6]); 6] = [
-            // from:              draft         queued         started         blocked        reported     filed
-            (Transition::Queue,  [Some(Queued), NO,            NO,             NO,            NO,          NO]),
-            (Transition::Claim,  [NO,           Some(Started), NO,             NO,            NO,          NO]),
-            (Transition::Block,  [NO,           NO,            Some(Blocked),  NO,            NO,          NO]),
-            (Transition::Resume, [NO,           NO,            NO,             Some(Started), NO,          NO]),
-            (Transition::Report, [NO,           NO,            Some(Reported), NO,            NO,          NO]),
-            (Transition::File,   [NO,           NO,            NO,             NO,            Some(Filed), NO]),
+        let table: [(Transition, [Option<Status>; 7]); 7] = [
+            // from:              draft         parked        queued         started         blocked        reported     filed
+            (Transition::Park,   [Some(Parked), NO,           NO,            NO,             NO,            NO,          NO]),
+            (Transition::Queue,  [Some(Queued), Some(Queued), NO,            NO,             NO,            NO,          NO]),
+            (Transition::Claim,  [NO,           NO,           Some(Started), NO,             NO,            NO,          NO]),
+            (Transition::Block,  [NO,           NO,           NO,            Some(Blocked),  NO,            NO,          NO]),
+            (Transition::Resume, [NO,           NO,           NO,            NO,             Some(Started), NO,          NO]),
+            (Transition::Report, [NO,           NO,           NO,            Some(Reported), NO,            NO,          NO]),
+            (Transition::File,   [NO,           NO,           NO,            NO,             NO,            Some(Filed), NO]),
         ];
         assert_eq!(table.map(|(transition, _)| transition), Transition::ALL);
         for (transition, row) in table {

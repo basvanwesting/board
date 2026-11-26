@@ -200,7 +200,7 @@ fn a_status_goes_with_briefs_only() {
     }
     let unknown = a.board(&["ls", "--status", "done"]).failed(2);
     assert!(
-        unknown.starts_with("board: invalid value 'done' for '--status <STATUS>': `done` is not a status (draft, queued, started, blocked, reported, filed, unpushed)"),
+        unknown.starts_with("board: invalid value 'done' for '--status <STATUS>': `done` is not a status (draft, parked, queued, started, blocked, reported, filed, unpushed)"),
         "{unknown}"
     );
     let no_kind = a.board(&["ls", "ideas"]).failed(2);
@@ -402,13 +402,13 @@ proj/chores/c1.md: no `group:` line, or an empty one; `board migrate` gives it `
 proj/chores/c2.md: header id `c3` differs from the file name's c2
 proj/backlog/b1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`
 proj/backlog/b1.md: no `# ` title line after the header
-proj/briefs/127-search.md: unknown status `strated`; a brief outside briefs/done/ is draft, queued, started, blocked or reported
+proj/briefs/127-search.md: unknown status `strated`; a brief outside briefs/parked/ and briefs/done/ is draft, queued, started, blocked or reported
 proj/briefs/128-export.md: header id `129` differs from the file name's 128
 proj/briefs/done/129-b.md: duplicate brief number 129, also proj/briefs/129-a.md; give one of the two another number
-proj/briefs/130-bare.md: no `status:` line; a brief outside briefs/done/ is draft, queued, started, blocked or reported
-proj/briefs/notes.md: not named as the board names its files (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is not synced
-proj/briefs/sent/126-old.md: not named as the board names its files (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is not synced
-proj/chores/notes.md: not named as the board names its files (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is not synced
+proj/briefs/130-bare.md: no `status:` line; a brief outside briefs/parked/ and briefs/done/ is draft, queued, started, blocked or reported
+proj/briefs/notes.md: not named as the board names its files (briefs/[parked/|done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is not synced
+proj/briefs/sent/126-old.md: not named as the board names its files (briefs/[parked/|done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is not synced
+proj/chores/notes.md: not named as the board names its files (briefs/[parked/|done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is not synced
 "
     );
 }

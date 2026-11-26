@@ -110,6 +110,7 @@ impl Preview {
 pub(crate) fn preview(data: &Data, source: Source, row: &Row) -> Preview {
     let brief = match source {
         Source::Open => data.open.get(row.at),
+        Source::Parked => data.parked.get(row.at),
         Source::Filed => data.filed.get(row.at),
         Source::Chores | Source::Backlog => None,
     };

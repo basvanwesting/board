@@ -46,9 +46,14 @@ enum Command {
         item: NewItem,
     },
     /// Hand a draft brief to the worker, or put a queued brief first
+    #[command(group(ArgGroup::new("which").required(true).args(["id", "parked"])))]
     Queue {
-        /// Like 128
-        id: BriefId,
+        /// Like 128: a draft or a parked brief, or a queued one with --first
+        id: Option<BriefId>,
+        /// Every parked brief of the project, in one commit; no id and no
+        /// other flag
+        #[arg(long, conflicts_with_all = ["id", "closes", "after", "first"])]
+        parked: bool,
         /// The backlog items the brief resolves, deleted when it is filed
         #[arg(long, value_name = "IDS", value_delimiter = ',')]
         closes: Option<Vec<BacklogId>>,
@@ -60,6 +65,18 @@ enum Command {
         /// queued already, alone. The latest --first wins
         #[arg(long)]
         first: bool,
+    },
+    /// Park a written draft in briefs/parked/ until the owner's word queues
+    /// it (`queue <id>`, or `queue --parked` for all)
+    Park {
+        /// Like 128
+        id: BriefId,
+        /// The backlog items the brief resolves, deleted when it is filed
+        #[arg(long, value_name = "IDS", value_delimiter = ',')]
+        closes: Option<Vec<BacklogId>>,
+        /// What it waits on, as for `queue`
+        #[arg(long, value_name = "ID")]
+        after: Option<ItemId>,
     },
     /// Claim the first queued brief that waits on nothing; prints its path,
     /// or `queue empty` (with what the queued briefs wait on, if any)
@@ -95,8 +112,12 @@ enum Command {
         id: BriefId,
         /// The brief changed nothing in the repository: no commit with its
         /// `Brief: <id>` trailer is asked for
-        #[arg(long)]
+        #[arg(long, conflicts_with = "not_built")]
         no_commits: bool,
+        /// The brief built nothing, as a premise failed: no commit is asked
+        /// for, and the backlog items it closes stay
+        #[arg(long)]
+        not_built: bool,
     },
     /// Add a chore or a backlog item; prints its new id
     Add {
@@ -142,8 +163,8 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         to: Line,
     },
-    /// Make a chore, a backlog item or a draft or queued brief wait on
-    /// another item of the board, or on nothing
+    /// Make a chore, a backlog item or a draft, parked or queued brief wait
+    /// on another item of the board, or on nothing
     #[command(group(ArgGroup::new("wait").required(true).args(["target", "none"])))]
     After {
         /// Like 128, c12 or b41
@@ -300,22 +321,29 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::New {
             item: NewItem::Brief { slug },
         }) => Run::NewBrief(slug),
+        Some(Command::Queue { id: None, .. }) => Run::QueueParked,
         Some(Command::Queue {
-            id,
+            id: Some(id),
             closes,
             after,
             first,
+            ..
         }) => Run::Queue(id, closes, after, first),
+        Some(Command::Park { id, closes, after }) => Run::Park(id, closes, after),
         Some(Command::Next) => Run::Next,
         Some(Command::Block { id, question }) => Run::Block(id, question),
         Some(Command::Amend { id, replace }) => amend(id, replace)?,
         Some(Command::Report { id }) => Run::Report(id, stdin_text(&format!("report {id}"))?),
-        Some(Command::File { id, no_commits }) => Run::File(
+        Some(Command::File {
             id,
-            if no_commits {
-                CommitCheck::Skip
-            } else {
-                CommitCheck::Trailer
+            no_commits,
+            not_built,
+        }) => Run::File(
+            id,
+            match (no_commits, not_built) {
+                (true, _) => CommitCheck::Skip,
+                (false, true) => CommitCheck::NotBuilt,
+                (false, false) => CommitCheck::Trailer,
             },
         ),
         Some(Command::Add {
@@ -383,6 +411,8 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
                 first,
             },
         )?),
+        Run::QueueParked => line(board.queue_parked()?),
+        Run::Park(id, closes, after) => line(board.park(id, closes.as_deref(), after)?),
         Run::Next => match board.next()? {
             Next::Claimed(path) => Ok((path_line(&path), Exit::Ok)),
             Next::Nothing(said) => line(said),
@@ -433,6 +463,8 @@ enum Run {
     Lint,
     NewBrief(Slug),
     Queue(BriefId, Option<Vec<BacklogId>>, Option<ItemId>, bool),
+    QueueParked,
+    Park(BriefId, Option<Vec<BacklogId>>, Option<ItemId>),
     Next,
     Block(BriefId, Text),
     Amend(BriefId, Text),

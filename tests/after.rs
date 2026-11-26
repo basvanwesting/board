@@ -173,7 +173,7 @@ fn first_puts_a_queued_brief_first_and_the_latest_wins() {
     queued(&a, 4, &[]);
     assert_eq!(
         a.board(&["queue", "4"]).failed(1),
-        "board: queue 4: it is queued, not draft\n"
+        "board: queue 4: it is queued, not draft or parked\n"
     );
 }
 
@@ -289,7 +289,7 @@ fn a_wait_on_itself_a_loop_or_by_a_started_brief_is_refused() {
         ),
         (
             &["after", "1", "c1"],
-            "board: after 1: it is started; only a draft or a queued brief waits, as a \
+            "board: after 1: it is started; only a draft, a parked or a queued brief waits, as a \
              started one no longer waits for anything\n",
         ),
     ] {
@@ -531,6 +531,6 @@ fn first_on_the_first_brief_changes_nothing() {
     assert_eq!(a.board(&["next"]).ok().rsplit('/').next(), Some("2-b.md\n"));
     assert_eq!(
         a.board(&["queue", "2", "--first"]).failed(1),
-        "board: queue 2: it is started; --first is for a draft or a queued brief\n"
+        "board: queue 2: it is started; --first is for a draft, a parked or a queued brief\n"
     );
 }

@@ -12,7 +12,7 @@ use super::state::{Panel, Row, Source, State, Tab};
 use crate::board::Shown;
 use crate::brief::Status;
 
-const HELP: [(&str, &str); 21] = [
+const HELP: [(&str, &str); 22] = [
     ("j k", "down, up"),
     ("wheel", "down, up, as j k"),
     ("gg G", "first, last"),
@@ -20,12 +20,13 @@ const HELP: [(&str, &str); 21] = [
     ("1 2 3", "Briefs, Chores, Backlog"),
     ("h l S-Tab Tab", "previous, next panel"),
     ("click", "focus the pane, select the row clicked"),
-    ("[ ]", "the Briefs tabs: Briefs, Filed"),
+    ("[ ]", "the Briefs tabs: Briefs, Parked, Filed"),
     ("0 Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
     ("d", "done: delete the chore, asked first (y/n)"),
     ("x", "drop: delete the backlog item, asked first (y/n)"),
     ("F", "put the queued brief first in the queue"),
+    ("Q", "queue the parked brief, asked first (y/n)"),
     ("e", "edit the brief, or the list at the item, in $EDITOR"),
     ("r", "sync: commit hand edits, fetch, push"),
     ("y Y yy", "yank the id, the line, the whole item"),
@@ -88,7 +89,9 @@ fn status_style(shown: Shown) -> Style {
         Shown::Status(Status::Started) => Style::new().fg(Color::Green),
         Shown::Unpushed => Style::new().fg(Color::Yellow),
         Shown::Status(Status::Draft) => Style::new().add_modifier(Modifier::DIM),
-        Shown::Status(Status::Reported | Status::Queued | Status::Filed) => Style::new(),
+        Shown::Status(Status::Reported | Status::Queued | Status::Filed | Status::Parked) => {
+            Style::new()
+        }
     }
 }
 
@@ -99,14 +102,18 @@ fn key_span(key: &str, focused: bool) -> Span<'static> {
     Span::styled(format!("─[{key}]─"), border(focused))
 }
 
-/// A panel's title as LazyGit draws it: `─[1]─Briefs - Filed`, the jump key
+/// A panel's title as LazyGit draws it: `─[1]─Briefs - Parked - Filed`, the jump key
 /// in brackets, then the tabs; the panel's name is its first tab. The tab
 /// shown is bold, and green with the border when the panel has the focus.
 fn panel_title(state: &State, panel: Panel, focused: bool) -> Line<'static> {
     let (key, tabs): (&str, &[(&'static str, Option<Tab>)]) = match panel {
         Panel::Briefs => (
             "1",
-            &[("Briefs", Some(Tab::Open)), ("Filed", Some(Tab::Filed))],
+            &[
+                ("Briefs", Some(Tab::Open)),
+                ("Parked", Some(Tab::Parked)),
+                ("Filed", Some(Tab::Filed)),
+            ],
         ),
         Panel::Chores => ("2", &[("Chores", None)]),
         Panel::Backlog => ("3", &[("Backlog", None)]),
@@ -197,6 +204,7 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
         let empty = match (source, state.filter(panel)) {
             (_, Some(filter)) if !filter.is_empty() => "nothing matches",
             (Source::Open, _) => "no open briefs",
+            (Source::Parked, _) => "no parked briefs",
             (Source::Filed, _) => "no filed briefs",
             (Source::Chores, _) => "no chores",
             (Source::Backlog, _) => "no backlog items",
@@ -404,7 +412,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::super::data::{BriefItem, Data, ListLine};
-    use super::super::state::{Action, Command, Event, Key, Mouse};
+    use super::super::state::{Action, Command, Event, Key, Mouse, Question};
     use super::*;
     use crate::board::{BriefRow, ListRow};
     use crate::brief::{Stamp, Status};
@@ -450,6 +458,7 @@ mod tests {
                 ),
                 brief(127, Status::Reported, "other-slug", None, "# Other\n"),
             ],
+            parked: Vec::new(),
             filed: vec![brief(100, Status::Filed, "old", None, "# Old\n")],
             chores: ListLine::numbered(
                 ListKind::Chores,
@@ -518,7 +527,7 @@ mod tests {
         assert_eq!(
             screen(&state(100, 12)),
             [
-                "╭─[1]─Briefs - Filed────────────────────────╮╭─[0]─128 some-slug───────────────────────────────────╮",
+                "╭─[1]─Briefs - Parked - Filed───────────────╮╭─[0]─128 some-slug───────────────────────────────────╮",
                 "│▶128 started   some-slug                42m││id: 128                                              │",
                 "│ 127 reported  other-slug                  ││status: started                                      │",
                 "│                                           ││                                                     │",
@@ -558,9 +567,9 @@ mod tests {
 
     #[test]
     fn the_filed_tab_shows_the_filed_briefs() {
-        let lines = screen(&press(state(100, 12), "]"));
+        let lines = screen(&press(state(100, 12), "]]"));
         assert!(
-            lines[0].starts_with("╭─[1]─Briefs - Filed──"),
+            lines[0].starts_with("╭─[1]─Briefs - Parked - Filed──"),
             "{}",
             lines[0]
         );
@@ -733,9 +742,9 @@ mod tests {
             .iter()
             .map(
                 |(path, text)| match BoardPath::parse(&format!("shop/{path}")) {
-                    Some(BoardPath::Brief { name, filed, .. }) => BriefFile {
+                    Some(BoardPath::Brief { name, place, .. }) => BriefFile {
                         name,
-                        filed,
+                        place,
                         brief: crate::brief::Brief::parse(text.as_bytes()),
                     },
                     _ => panic!("{path} is no brief path"),
@@ -862,6 +871,64 @@ mod tests {
         }
     }
 
+    /// The Parked tab: second of three, the parked brief on it only; `Q`
+    /// and `y` on it send one `queue <id>`, `Q` then another key none, `Q`
+    /// anywhere else none, and `F` on a parked row none.
+    #[test]
+    fn q_releases_a_parked_brief_once_asked() {
+        let data = from_files(
+            &[
+                (
+                    "briefs/1-open.md",
+                    "status: queued\nqueued: 2026-11-26T10:00:00Z\n",
+                ),
+                ("briefs/parked/2-wait.md", "status: parked\n"),
+                ("briefs/done/3-old.md", "status: filed\n"),
+            ],
+            &[(1, "id: c1\ngroup: g\n\n# chore\n")],
+            &[(1, "id: b1\ngroup: g\n\n# item\n")],
+        );
+        let (state, _) = State::new(data, 100, 20, Stamp::from_unix(NOW).unwrap());
+        let lines = screen(&state);
+        assert!(
+            lines[0].starts_with("╭─[1]─Briefs - Parked - Filed"),
+            "{}",
+            lines[0]
+        );
+        let tab = |keys: &str| -> Vec<String> {
+            let lines = screen(&press(state.clone(), keys));
+            lines
+                .iter()
+                .take_while(|line| !line.starts_with("╰"))
+                .skip(1)
+                .map(|line| line.split('│').nth(1).unwrap().trim_end().to_owned())
+                .filter(|row| !row.trim().is_empty())
+                .collect()
+        };
+        assert_eq!(tab(""), ["▶1 queued    open"]);
+        assert_eq!(tab("]"), ["▶2 parked    wait"]);
+        assert_eq!(tab("]]"), ["▶3 filed     old"]);
+        let step = |state: State, key: char| state.step(Event::Key(Key::Char(key)));
+        let asked = press(state.clone(), "]Q");
+        assert_eq!(
+            asked.question().map(Question::prompt).as_deref(),
+            Some("queue 2 parked wait? y/n")
+        );
+        let (_, commands) = step(asked.clone(), 'y');
+        assert_eq!(commands, [Command::Run(Action::Queue(BriefId::new(2)))]);
+        for other in ['n', 'Q', 'j'] {
+            let (_, commands) = step(asked.clone(), other);
+            assert_eq!(commands, Vec::<Command>::new(), "{other}");
+        }
+        for keys in ["", "]]", "2", "3"] {
+            let (after, commands) = step(press(state.clone(), keys), 'Q');
+            assert_eq!(commands, Vec::<Command>::new(), "{keys:?}");
+            assert!(after.question().is_none(), "{keys:?}");
+        }
+        let (_, commands) = step(press(state, "]"), 'F');
+        assert_eq!(commands, Vec::<Command>::new());
+    }
+
     /// The state drawn, to read the cells' styles.
     fn cells(state: &State) -> ratatui::buffer::Buffer {
         let size = state.areas().status;
@@ -905,7 +972,7 @@ mod tests {
     fn a_panel_title_names_its_key_in_brackets_then_its_tabs() {
         let lines = screen(&state(100, 12));
         assert!(
-            lines[0].starts_with("╭─[1]─Briefs - Filed─────"),
+            lines[0].starts_with("╭─[1]─Briefs - Parked - Filed─────"),
             "{}",
             lines[0]
         );
@@ -939,11 +1006,11 @@ mod tests {
             all("Chores", (Color::Reset, true))
         );
         // The Filed tab shown, and Chores focused.
-        let filed = cells(&press(state(100, 12), "]2"));
+        let filed = cells(&press(state(100, 12), "]]2"));
         assert_eq!(
-            styles(&filed, "Briefs - Filed"),
+            styles(&filed, "Briefs - Parked - Filed"),
             [
-                all("Briefs - ", (Color::Reset, false)),
+                all("Briefs - Parked - ", (Color::Reset, false)),
                 all("Filed", (Color::Reset, true)),
             ]
             .concat()
@@ -1044,7 +1111,7 @@ mod tests {
                 "▶131 queued    next-up",
             ]
         );
-        let filed = screen(&press(pushing.clone(), "]"));
+        let filed = screen(&press(pushing.clone(), "]]"));
         assert!(
             !filed.iter().any(|line| line.contains("100 ")),
             "{filed:#?}"
@@ -1058,7 +1125,7 @@ mod tests {
                 "▶131 queued    next-up"
             ]
         );
-        let filed = screen(&press(pushed, "]"));
+        let filed = screen(&press(pushed, "]]"));
         assert!(filed[1].contains("100 filed     old"), "{filed:#?}");
     }
 
@@ -1097,7 +1164,7 @@ mod tests {
         assert_eq!(fg("some-slug "), Color::Reset);
         // A filed brief's status stays plain; once pushed, 100 is one.
         let (state, _) = state.step(Event::Unpushed(Ok(BTreeSet::new())));
-        let filed = cells(&press(state, "]"));
+        let filed = cells(&press(state, "]]"));
         let (x, y) = find(&filed, "filed ");
         assert_eq!(filed[(x, y)].fg, Color::Reset);
     }

@@ -6,13 +6,15 @@ use crate::board::{BriefRow, arrange, item_waits};
 use crate::brief::Stamp;
 use crate::id::{BriefId, ItemId, ListKind};
 use crate::item::Row;
-use crate::project::{BoardPath, BriefFile, Project, ProjectName};
+use crate::project::{BoardPath, BriefFile, Place, Project, ProjectName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Data {
     pub project: ProjectName,
     /// In the board's order: in flight first (SPEC.md, TUI).
     pub open: Vec<BriefItem>,
+    /// In `briefs/parked/`, by number.
+    pub parked: Vec<BriefItem>,
     pub filed: Vec<BriefItem>,
     pub chores: Vec<ListLine>,
     pub backlog: Vec<ListLine>,
@@ -54,10 +56,13 @@ pub enum ListEntry {
 }
 
 impl BriefItem {
-    /// Its row, and whether its file is in `briefs/done/`.
-    fn row_in_done(&mut self) -> (&mut BriefRow, bool) {
-        let in_done = matches!(self.path, BoardPath::Brief { filed: true, .. });
-        (&mut self.row, in_done)
+    /// Its row, and where its file is.
+    fn row_place(&mut self) -> (&mut BriefRow, Place) {
+        let place = match self.path {
+            BoardPath::Brief { place, .. } => place,
+            BoardPath::Item { .. } => unreachable!("a brief's path"),
+        };
+        (&mut self.row, place)
     }
 
     fn of(project: &Project, file: &BriefFile) -> BriefItem {
@@ -83,11 +88,12 @@ impl Data {
             .briefs()
             .iter()
             .map(|file| BriefItem::of(project, file));
-        let (open, filed) = arrange(briefs, &BTreeSet::new(), BriefItem::row_in_done);
+        let arranged = arrange(briefs, &BTreeSet::new(), BriefItem::row_place);
         Data {
             project: name.clone(),
-            open,
-            filed,
+            open: arranged.open,
+            parked: arranged.parked,
+            filed: arranged.filed,
             chores: list_lines(project, ListKind::Chores),
             backlog: list_lines(project, ListKind::Backlog),
         }
@@ -99,8 +105,10 @@ impl Data {
     pub fn label(&mut self, unpushed: &BTreeSet<BriefId>) {
         let briefs = std::mem::take(&mut self.open)
             .into_iter()
+            .chain(std::mem::take(&mut self.parked))
             .chain(std::mem::take(&mut self.filed));
-        (self.open, self.filed) = arrange(briefs, unpushed, BriefItem::row_in_done);
+        let arranged = arrange(briefs, unpushed, BriefItem::row_place);
+        (self.open, self.parked, self.filed) = (arranged.open, arranged.parked, arranged.filed);
     }
 
     /// The board before its first load.
@@ -153,7 +161,11 @@ impl BriefItem {
             path: BoardPath::Brief {
                 project: project.clone(),
                 name,
-                filed: row.status == Some(crate::brief::Status::Filed),
+                place: match row.status {
+                    Some(crate::brief::Status::Filed) => Place::Done,
+                    Some(crate::brief::Status::Parked) => Place::Parked,
+                    _ => Place::Open,
+                },
             },
             row,
             started,

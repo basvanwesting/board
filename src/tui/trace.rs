@@ -68,6 +68,8 @@ use crate::project::ProjectName;
 struct Files {
     /// Number, status, lines of text past the header.
     open: Vec<(u32, Option<Status>, u8)>,
+    /// Number, lines: briefs in `briefs/parked/`.
+    parked: Vec<(u32, u8)>,
     filed: Vec<(u32, u8)>,
     /// Group, id, and a variant of the text: the same item edited (2: no
     /// check). An id given twice is one item, the first.
@@ -127,12 +129,14 @@ fn status() -> impl Strategy<Value = Option<Status>> {
 fn files() -> impl Strategy<Value = Files> {
     (
         prop::collection::vec((1u32..10, status(), 0u8..60), 0..8),
+        prop::collection::vec((1u32..10, 0u8..10), 0..3),
         prop::collection::vec((1u32..10, 0u8..10), 0..4),
         prop::collection::vec((0u8..3, 1u32..12, 0u8..3), 0..14),
         prop::collection::vec((0u8..3, 1u32..14, 0u8..2), 0..30),
     )
-        .prop_map(|(open, filed, chores, backlog)| Files {
+        .prop_map(|(open, parked, filed, chores, backlog)| Files {
             open,
+            parked,
             filed,
             chores,
             backlog,
@@ -194,6 +198,8 @@ fn key() -> impl Strategy<Value = Key> {
         Char('Y'),
         Char('F'),
         Char('F'),
+        Char('Q'),
+        Char('Q'),
         Ctrl('c'),
     ])
 }
@@ -277,6 +283,35 @@ fn asked() -> impl Strategy<Value = Vec<Step>> {
         })
 }
 
+/// `Q` on the Parked tab, on some brief, and an answer: random keys seldom
+/// reach that tab and then ask there.
+fn released() -> impl Strategy<Value = Vec<Step>> {
+    use Key::{Char, Esc};
+    (
+        0usize..3,
+        prop::sample::select(vec![Char('y'), Char('y'), Char('n'), Esc, Char('Q')]),
+    )
+        .prop_map(|(down, answer)| {
+            // From any tab: `[` twice reaches Briefs, `]` then Parked.
+            let mut steps: Vec<Step> = ['1', '[', '[', ']'].map(|c| Step::Key(Char(c))).into();
+            steps.extend((0..down).map(|_| Step::Key(Char('j'))));
+            steps.extend([Step::Key(Char('Q')), Step::Key(answer)]);
+            steps
+        })
+}
+
+/// `F` on some brief of the Briefs tab: random keys seldom land it on a
+/// queued one.
+fn put_first() -> impl Strategy<Value = Vec<Step>> {
+    use Key::Char;
+    (0usize..5).prop_map(|down| {
+        let mut steps: Vec<Step> = ['1', '[', '['].map(|c| Step::Key(Char(c))).into();
+        steps.extend((0..down).map(|_| Step::Key(Char('j'))));
+        steps.push(Step::Key(Char('F')));
+        steps
+    })
+}
+
 /// `e` while a write is out: the editor waits for its answer and the load
 /// after it, which may give the item an id. Random steps rarely bring the
 /// three in that order.
@@ -342,6 +377,8 @@ fn trace() -> impl Strategy<Value = (Files, Vec<Step>)> {
         30 => step().prop_map(|step| vec![step]),
         1 => filter_typed(),
         3 => asked(),
+        1 => released(),
+        1 => put_first(),
         1 => edit_waits(),
         1 => previewed(),
         1 => yanked_whole(),
@@ -394,6 +431,11 @@ fn data(files: &Files) -> Data {
             .open
             .iter()
             .map(|(number, status, lines)| brief(*number, *status, *lines))
+            .collect(),
+        parked: files
+            .parked
+            .iter()
+            .map(|(number, lines)| brief(*number, Some(Status::Parked), *lines))
             .collect(),
         filed: files
             .filed
@@ -554,6 +596,8 @@ struct Depth {
     firsts: u32,
     /// `F` on a brief that is not queued: a note, nothing sent.
     first_refused: u32,
+    /// A parked brief released by `y` to the question `Q` asked.
+    released: u32,
 }
 
 impl Depth {
@@ -604,7 +648,8 @@ impl Depth {
             wheeled,
             upper_jk,
             firsts,
-            first_refused
+            first_refused,
+            released
         );
     }
 }
@@ -1066,7 +1111,9 @@ fn judge(
                 depth.syncs += 1;
             }
             // T9 and T13, below.
-            Command::Run(Action::Done(_) | Action::Drop(_) | Action::First(_)) => {}
+            Command::Run(
+                Action::Done(_) | Action::Drop(_) | Action::First(_) | Action::Queue(_),
+            ) => {}
             Command::Edit { .. } => {
                 prop_assert!(pressed('e') || matches!(event, Event::Loaded(_)));
             }
@@ -1239,9 +1286,13 @@ fn judge(
         );
     }
 
-    // T9: a done or a drop only by `y`, to the question that asked it.
+    // T9: a done, a drop or the release of a parked brief only by `y`, to
+    // the question that asked it: no key releases a parked brief
+    // unconfirmed.
     for command in commands {
-        if let Command::Run(action @ (Action::Done(_) | Action::Drop(_))) = command {
+        if let Command::Run(action @ (Action::Done(_) | Action::Drop(_) | Action::Queue(_))) =
+            command
+        {
             prop_assert!(
                 key == Some(Key::Char('y'))
                     && !before.quitting
@@ -1251,26 +1302,35 @@ fn judge(
             );
             prop_assert_eq!(commands.len(), 1);
             depth.confirmed += 1;
+            if matches!(action, Action::Queue(_)) {
+                depth.released += 1;
+            }
         }
     }
     if let Some(question) = &after.question
         && before.question.as_ref() != Some(question)
     {
-        let (ask, kind) = match question.action {
-            Action::Done(_) => ('d', ListKind::Chores),
-            Action::Drop(_) => ('x', ListKind::Backlog),
-            Action::First(_) | Action::Sync => panic!("asked {question:?}"),
-        };
-        prop_assert!(pressed(ask), "asked {question:?} after {event:?}");
         let (source, row) = before.cursor_item().expect("asked about an item");
-        prop_assert_eq!(source.list(), Some(kind));
-        let number = match question.action {
-            Action::Done(id) => id.get(),
-            Action::Drop(id) => id.get(),
-            Action::First(_) | Action::Sync => unreachable!(),
-        };
-        // The id the CLI reads on the line: the command names this item.
-        prop_assert_eq!(cli_id(kind, &row), Some(number), "{:?}", row);
+        match question.action {
+            Action::Done(id) => {
+                prop_assert!(pressed('d'), "asked {question:?} after {event:?}");
+                prop_assert_eq!(source.list(), Some(ListKind::Chores));
+                // The id the CLI reads on the line: the command names this item.
+                prop_assert_eq!(cli_id(ListKind::Chores, &row), Some(id.get()), "{:?}", row);
+            }
+            Action::Drop(id) => {
+                prop_assert!(pressed('x'), "asked {question:?} after {event:?}");
+                prop_assert_eq!(source.list(), Some(ListKind::Backlog));
+                prop_assert_eq!(cli_id(ListKind::Backlog, &row), Some(id.get()), "{:?}", row);
+            }
+            // `Q`, on a brief of the Parked tab, by its number.
+            Action::Queue(id) => {
+                prop_assert!(pressed('Q'), "asked {question:?} after {event:?}");
+                prop_assert_eq!(source, Source::Parked);
+                prop_assert_eq!(before.brief(source, &row).row.number, id);
+            }
+            Action::First(_) | Action::Sync => panic!("asked {question:?}"),
+        }
         depth.asked += 1;
     }
     // T13: `queue --first` only by `F`, on the queued brief under the
@@ -1360,12 +1420,14 @@ fn judge(
         let there = match path {
             // A brief: its file, in either tab (an unpushed one moves to
             // Filed when pushed), never another file with its number.
-            Some(path) => [Source::Open, Source::Filed].into_iter().any(|source| {
-                after
-                    .rows(source)
-                    .iter()
-                    .any(|row| row.key.is_some() && after.brief(source, row).path == *path)
-            }),
+            Some(path) => [Source::Open, Source::Parked, Source::Filed]
+                .into_iter()
+                .any(|source| {
+                    after
+                        .rows(source)
+                        .iter()
+                        .any(|row| row.key.is_some() && after.brief(source, row).path == *path)
+                }),
             None => followed(*source, after, item).is_some_and(|found| {
                 after
                     .rows(*source)
@@ -1645,6 +1707,7 @@ fn the_traces_get_deep() {
         ("upper_jk", depth.upper_jk > 0),
         ("firsts", depth.firsts > 0),
         ("first_refused", depth.first_refused > 0),
+        ("released", depth.released > 0),
     ];
     let missed: Vec<&str> = reached
         .iter()
@@ -1659,6 +1722,7 @@ fn focus_along(keys: &[Key]) -> Vec<(Panel, bool)> {
     focus_along_in(
         &Files {
             open: vec![(1, None, 1)],
+            parked: Vec::new(),
             filed: Vec::new(),
             chores: vec![(0, 1, 0)],
             backlog: vec![(0, 1, 0)],
@@ -1727,6 +1791,7 @@ fn zero_needs_an_item_and_does_nothing_in_the_preview() {
     use Key::Char;
     let files = Files {
         open: vec![(1, None, 1)],
+        parked: Vec::new(),
         filed: Vec::new(),
         chores: Vec::new(),
         backlog: Vec::new(),
@@ -1751,6 +1816,7 @@ fn zero_needs_an_item_and_does_nothing_in_the_preview() {
 fn zero_typed_into_a_filter_is_filter_text() {
     let files = Files {
         open: vec![(1, None, 1)],
+        parked: Vec::new(),
         filed: Vec::new(),
         chores: Vec::new(),
         backlog: Vec::new(),
@@ -1768,6 +1834,7 @@ fn zero_typed_into_a_filter_is_filter_text() {
 fn yanks_along(keys: &[Key]) -> Vec<Vec<String>> {
     let files = Files {
         open: vec![(1, Some(Status::Queued), 0)],
+        parked: Vec::new(),
         filed: Vec::new(),
         chores: vec![(0, 1, 0), (0, 2, 2)],
         backlog: Vec::new(),
@@ -1845,6 +1912,7 @@ fn a_waited_edit_of_a_filed_brief_does_not_open_its_namesake() {
     use Key::Char;
     let files = Files {
         open: vec![(1, Some(Status::Queued), 0)],
+        parked: Vec::new(),
         filed: vec![(1, 0)],
         chores: Vec::new(),
         backlog: Vec::new(),
@@ -1866,6 +1934,7 @@ fn a_waited_edit_of_a_filed_brief_does_not_open_its_namesake() {
         Step::Wrote(false),
         Step::Load(Files {
             open: vec![(1, Some(Status::Draft), 0)],
+            parked: Vec::new(),
             filed: Vec::new(),
             chores: Vec::new(),
             backlog: Vec::new(),
@@ -1884,6 +1953,7 @@ fn a_waited_edit_follows_its_brief_s_file_into_the_other_tab() {
     use Key::Char;
     let files = Files {
         open: vec![(1, Some(Status::Started), 0)],
+        parked: Vec::new(),
         filed: vec![(1, 0)],
         chores: Vec::new(),
         backlog: Vec::new(),
@@ -1913,6 +1983,7 @@ fn a_waited_edit_follows_its_brief_s_file_into_the_other_tab() {
 fn a_click_below_a_box_cut_to_one_row_is_the_next_box_s() {
     let empty = Files {
         open: Vec::new(),
+        parked: Vec::new(),
         filed: Vec::new(),
         chores: Vec::new(),
         backlog: Vec::new(),

@@ -10,8 +10,9 @@
 //!   cannot conflict with each other. Rejected: `git rebase` with a merge
 //!   driver, which rewrites the local commits (after a kill the clone could no
 //!   longer tell what it had published) and needs rebase recovery.
-//! - A brief is one key under `briefs/` and `briefs/done/`: a brief filed on
-//!   one side is the same brief the other side edited. Rejected: git's rename
+//! - A brief is one key under `briefs/`, `briefs/parked/` and
+//!   `briefs/done/`: a brief filed or parked on one side is the same brief
+//!   the other side edited. Rejected: git's rename
 //!   detection, whose modify/delete and rename cases would have to be
 //!   untangled again here.
 //! - A chore or backlog item is one key, its file, named by its id. Changed
@@ -34,7 +35,7 @@ pub type Tree<B> = BTreeMap<String, B>;
 enum Key {
     /// A chore's or backlog item's file.
     Item(ProjectName, ListId),
-    /// Open or filed, under any slug.
+    /// Open, parked or filed, under any slug.
     Brief(ProjectName, BriefId),
     /// A list file of the storage before item files.
     OldList(String),
@@ -324,6 +325,32 @@ mod tests {
         assert_eq!((merge.tree, merge.copies), (ours, vec![]));
     }
 
+    /// A parked brief is the same key as the open one it becomes: released
+    /// on one side and edited by hand in `briefs/parked/` on the other, the
+    /// remote's stands and the clone's edit is its copy, not dropped.
+    #[test]
+    fn a_parked_brief_is_one_key_with_its_open_and_filed_files() {
+        let base = tree(&[("shop/briefs/parked/1-a.md", "v0")]);
+        let ours = tree(&[("shop/briefs/1-a.md", "v1")]);
+        let theirs = tree(&[("shop/briefs/parked/1-a.md", "v2")]);
+        let merge = merge_trees(&base, &ours, &theirs);
+        assert_eq!(merge.tree, ours);
+        assert_eq!(
+            merge.copies,
+            [LocalCopy {
+                of: ItemId::Brief(BriefId::new(1)),
+                path: "shop/briefs/parked/1-a.md".to_owned(),
+                blob: "v2".to_owned(),
+            }]
+        );
+        // Parked on one side only: that side's.
+        let base = tree(&[("shop/briefs/1-a.md", "v0")]);
+        let ours = tree(&[("shop/briefs/1-a.md", "v0")]);
+        let theirs = tree(&[("shop/briefs/parked/1-a.md", "v1")]);
+        let merge = merge_trees(&base, &ours, &theirs);
+        assert_eq!((merge.tree, merge.copies), (theirs, vec![]));
+    }
+
     #[test]
     fn a_file_outside_the_board_changed_on_both_sides_keeps_ours() {
         let base = tree(&[("README.md", "r0"), ("shop/chores.md", "c0")]);
@@ -340,6 +367,7 @@ mod tests {
             "shop/backlog/b1.md",
             "shop/briefs/1-a.md",
             "shop/briefs/done/1-a.md",
+            "shop/briefs/parked/1-a.md",
             "shop/briefs/2-b.md",
             "shop/chores.md",
             "README.md",

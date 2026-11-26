@@ -333,7 +333,7 @@ impl std::error::Error for InvalidSlug {}
 ///
 /// ```text
 /// <project>/chores/c<id>.md | <project>/backlog/b<id>.md
-/// <project>/briefs/<brief> | <project>/briefs/done/<brief>
+/// <project>/briefs/<brief> | <project>/briefs/parked/<brief> | <project>/briefs/done/<brief>
 /// ```
 ///
 /// An item's file is named by its id only (owner, 2026-11-25): a retitle
@@ -348,9 +348,40 @@ pub enum BoardPath {
     Brief {
         project: ProjectName,
         name: BriefName,
-        /// Under `briefs/done/`.
-        filed: bool,
+        place: Place,
     },
+}
+
+/// Where a brief's file sits below `briefs/`. The place decides two
+/// statuses whatever the header says: a brief in `done/` is filed, one in
+/// `parked/` parked.
+///
+/// A folder for the parked briefs and not only a status (owner,
+/// 2026-11-26): "If we have a folder (planned) it would be much easier to
+/// distinguish briefs during daily build cycles. Otherwise the planned
+/// state would be interleaved and messy"; "A git move isn't expensive and
+/// briefs don't change much".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Place {
+    /// `briefs/`.
+    Open,
+    /// `briefs/parked/`: a finished brief that waits for the owner's word.
+    Parked,
+    /// `briefs/done/`.
+    Done,
+}
+
+impl Place {
+    pub const ALL: [Place; 3] = [Place::Open, Place::Parked, Place::Done];
+
+    /// The folder below `briefs/`, with its slash; empty for `briefs/`.
+    pub fn dir(self) -> &'static str {
+        match self {
+            Place::Open => "",
+            Place::Parked => "parked/",
+            Place::Done => "done/",
+        }
+    }
 }
 
 /// Whether `path` is `<project>/chores.md` or `<project>/backlog.md`, a list
@@ -388,15 +419,15 @@ impl BoardPath {
             }
         }
         let brief = rest.strip_prefix("briefs/")?;
-        let (filed, file_name) = match brief.strip_prefix("done/") {
-            Some(file_name) => (true, file_name),
-            None => (false, brief),
-        };
+        let (place, file_name) = [Place::Done, Place::Parked]
+            .into_iter()
+            .find_map(|place| Some((place, brief.strip_prefix(place.dir())?)))
+            .unwrap_or((Place::Open, brief));
         let name = BriefName::parse(file_name)?;
         Some(BoardPath::Brief {
             project,
             name,
-            filed,
+            place,
         })
     }
 
@@ -431,13 +462,8 @@ impl fmt::Display for BoardPath {
             BoardPath::Brief {
                 project,
                 name,
-                filed: false,
-            } => write!(f, "{project}/briefs/{}", name.as_str()),
-            BoardPath::Brief {
-                project,
-                name,
-                filed: true,
-            } => write!(f, "{project}/briefs/done/{}", name.as_str()),
+                place,
+            } => write!(f, "{project}/briefs/{}{}", place.dir(), name.as_str()),
         }
     }
 }
@@ -446,8 +472,7 @@ impl fmt::Display for BoardPath {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BriefFile {
     pub name: BriefName,
-    /// Under `briefs/done/`.
-    pub filed: bool,
+    pub place: Place,
     pub brief: Brief,
 }
 
@@ -494,18 +519,22 @@ impl BriefFile {
 
     /// The brief's status on the board.
     ///
-    /// Where the file sits decides whether a brief is filed, not its header:
-    /// an archived brief placed in `briefs/done/` by hand has no header, and
-    /// a file has one place where a header can say anything. So `filed` in
-    /// the header of a brief outside `done/` is no status either: nothing
-    /// moves on from it, and the board would show a filed brief among the
-    /// open ones.
+    /// Where the file sits decides whether a brief is filed or parked, not
+    /// its header: an archived brief placed in `briefs/done/` by hand has no
+    /// header, and a file has one place where a header can say anything. So
+    /// `filed` or `parked` in the header of a brief outside its folder is no
+    /// status either: nothing moves on from it, and the board would show it
+    /// among the open ones.
     pub fn status(&self) -> Result<Status, BadStatus> {
-        if self.filed {
-            return Ok(Status::Filed);
+        match self.place {
+            Place::Done => return Ok(Status::Filed),
+            Place::Parked => return Ok(Status::Parked),
+            Place::Open => {}
         }
         match self.brief.status()? {
-            Status::Filed => Err(BadStatus::Unknown(Status::Filed.as_str().to_owned())),
+            status @ (Status::Filed | Status::Parked) => {
+                Err(BadStatus::Unknown(status.as_str().to_owned()))
+            }
             status @ (Status::Draft
             | Status::Queued
             | Status::Started
@@ -516,12 +545,14 @@ impl BriefFile {
 
     /// Makes the move from the brief's status on the board. Not the header's
     /// alone: a brief in `briefs/done/` is filed whatever its header says,
-    /// and no move leaves filed.
+    /// and no move leaves filed; one in `briefs/parked/` is parked, and
+    /// only `queue` moves on from it.
     ///
-    /// Filing moves the file to `briefs/done/` too, in the same step: a
-    /// header that says `filed` anywhere else is no status (see
-    /// [`BriefFile::status`]), so the two cannot be separate edits.
-    /// [`Project::changed_paths`] then commits the move.
+    /// Filing moves the file to `briefs/done/` too, parking to
+    /// `briefs/parked/`, queueing a parked one back to `briefs/`, each in the
+    /// same step: a header that says `filed` or `parked` anywhere else is no
+    /// status (see [`BriefFile::status`]), so the two cannot be separate
+    /// edits. [`Project::changed_paths`] then commits the move.
     pub fn transition(
         &mut self,
         transition: Transition,
@@ -531,10 +562,19 @@ impl BriefFile {
         if transition.apply(from).is_none() {
             return Err(TransitionError::NotFrom(from));
         }
-        let to = self.brief.transition(transition, now)?;
-        if to == Status::Filed {
-            self.filed = true;
-        }
+        // From the status on the board, not the header's: a brief placed in
+        // `briefs/parked/` by hand with another `status:` is parked, so its
+        // release goes, as it lists and lints.
+        let to = self.brief.transition_from(from, transition, now)?;
+        self.place = match to {
+            Status::Filed => Place::Done,
+            Status::Parked => Place::Parked,
+            Status::Draft
+            | Status::Queued
+            | Status::Started
+            | Status::Blocked
+            | Status::Reported => Place::Open,
+        };
         Ok(to)
     }
 
@@ -542,7 +582,7 @@ impl BriefFile {
         BoardPath::Brief {
             project: project.clone(),
             name: self.name.clone(),
-            filed: self.filed,
+            place: self.place,
         }
     }
 }
@@ -553,7 +593,8 @@ pub struct Project {
     pub(crate) name: ProjectName,
     pub(crate) chores: Items,
     pub(crate) backlog: Items,
-    /// By number, an open brief before a filed one, then by file name.
+    /// By number, an open brief before a parked one before a filed one,
+    /// then by file name.
     pub(crate) briefs: Vec<BriefFile>,
     /// The `.md` files below `briefs/`, `chores/` and `backlog/` that are
     /// outside the path grammar, as paths relative to the board-data root.
@@ -647,7 +688,7 @@ impl Project {
         &self.briefs
     }
 
-    /// The one brief file with this number, open or filed: a number on two
+    /// The one brief file with this number, open, parked or filed: a number on two
     /// files names no brief until one of them is renamed.
     pub fn find_brief(&self, number: BriefId) -> Result<&BriefFile, FindError> {
         let mut files = self
@@ -741,11 +782,11 @@ impl Project {
             BoardPath::Brief {
                 project,
                 name,
-                filed,
+                place,
             } if *project == self.name => self
                 .briefs
                 .iter()
-                .find(|file| file.name == *name && file.filed == *filed)
+                .find(|file| file.name == *name && file.place == *place)
                 .map(|file| file.brief.to_bytes()),
             BoardPath::Item { .. } | BoardPath::Brief { .. } => None,
         }
@@ -848,9 +889,9 @@ impl Project {
                 self.list_mut(id.kind())
                     .insert(id.get(), Item::parse(bytes));
             }
-            BoardPath::Brief { name, filed, .. } => self.briefs.push(BriefFile {
+            BoardPath::Brief { name, place, .. } => self.briefs.push(BriefFile {
                 name,
-                filed,
+                place,
                 brief: Brief::parse(bytes),
             }),
         }
@@ -873,9 +914,10 @@ impl Project {
     }
 }
 
-/// By number, an open brief before a filed one, then by file name.
+/// By number, an open brief before a parked one before a filed one, then
+/// by file name.
 fn brief_order(a: &BriefFile, b: &BriefFile) -> std::cmp::Ordering {
-    (a.name.number(), a.filed, &a.name).cmp(&(b.name.number(), b.filed, &b.name))
+    (a.name.number(), a.place, &a.name).cmp(&(b.name.number(), b.place, &b.name))
 }
 
 /// The paths a merge saves the local version of a brief at: `<path>.local`,
@@ -939,12 +981,12 @@ mod tests {
             BoardPath::Brief {
                 project,
                 name,
-                filed,
+                place,
             } => Some((
                 project.to_string(),
                 name.number().get(),
                 name.slug().to_owned(),
-                filed,
+                place == Place::Done,
             )),
             BoardPath::Item { .. } => None,
         }
@@ -1074,9 +1116,9 @@ mod tests {
     fn a_brief_in_done_moves_from_filed_whatever_its_header_says() {
         let now: Stamp = "2026-11-20T16:40:12Z".parse().unwrap();
         let file = |path: &str| match BoardPath::parse(path) {
-            Some(BoardPath::Brief { name, filed, .. }) => BriefFile {
+            Some(BoardPath::Brief { name, place, .. }) => BriefFile {
                 name,
-                filed,
+                place,
                 brief: Brief::parse(b"status: draft\n"),
             },
             _ => panic!("{path} is no brief path"),
@@ -1152,7 +1194,7 @@ mod tests {
         prop_oneof![
             (project, "(chores/c|backlog/b)[1-9][0-9]{0,8}\\.md")
                 .prop_map(|(p, f)| format!("{p}/{f}")),
-            (project, "(done/)?", brief).prop_map(|(p, d, b)| format!("{p}/briefs/{d}{b}")),
+            (project, "(done/|parked/)?", brief).prop_map(|(p, d, b)| format!("{p}/briefs/{d}{b}")),
         ]
     }
 
@@ -1161,7 +1203,7 @@ mod tests {
     fn almost_a_board_path() -> impl Strategy<Value = String> {
         prop_oneof![
             "[a-z0-9.]{1,3}/(chores|backlog|notes)(/[bc]0?[0-9]{0,2})?\\.md/?",
-            "[a-z0-9.]{1,3}/briefs/(done/){0,3}[0-9]{0,3}-?[a-z/]{0,2}\\.md",
+            "[a-z0-9.]{1,3}/briefs/((done|parked)/){0,3}[0-9]{0,3}-?[a-z/]{0,2}\\.md",
             "([a-z.]{0,3}/){0,2}(chores\\.md|briefs/|done/|[0-9]{0,2}-[a-z]{0,2}(\\.md)?){0,3}",
         ]
     }
@@ -1227,8 +1269,8 @@ mod tests {
                 // Each part is one path segment.
                 let segments = match parsed {
                     BoardPath::Item { .. } => 3,
-                    BoardPath::Brief { filed: false, .. } => 3,
-                    BoardPath::Brief { filed: true, .. } => 4,
+                    BoardPath::Brief { place: Place::Open, .. } => 3,
+                    BoardPath::Brief { place: Place::Parked | Place::Done, .. } => 4,
                 };
                 prop_assert_eq!(path.split('/').count(), segments);
             }

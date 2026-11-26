@@ -261,7 +261,7 @@ fn queue_refuses_what_is_not_a_written_draft() {
     a.board(&["queue", "1"]).ok();
     assert_eq!(
         a.board(&["queue", "1"]).failed(1),
-        "board: queue 1: it is queued, not draft\n"
+        "board: queue 1: it is queued, not draft or parked\n"
     );
     assert_eq!(
         a.board(&["queue", "2"]).failed(1),

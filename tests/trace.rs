@@ -146,6 +146,16 @@ enum Op {
     },
     /// `queue <id> --first` on a queued brief of the clone or the remote.
     First(Index),
+    /// `park` of a draft of the clone or the remote, its sections written
+    /// first, closing a backlog item when there is one.
+    Park {
+        pick: Index,
+        closes: Option<Index>,
+    },
+    /// `queue <id>` on a parked brief of the clone or the remote.
+    Release(Index),
+    /// `queue --parked`.
+    ReleaseAll,
     /// `after <id> <target>`, or `--none`: an item or a brief of the clone
     /// or the remote, of a kind: 0 a brief, 1 a chore, 2 a backlog item.
     After {
@@ -271,6 +281,10 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (any::<Index>(), prop::option::of((0..3u8, any::<Index>())), any::<bool>())
             .prop_map(|(pick, after, first)| Op::Queue { pick, write: true, closes: None, after, first }),
         1 => any::<Index>().prop_map(Op::First),
+        2 => (any::<Index>(), prop::option::of(any::<Index>()))
+            .prop_map(|(pick, closes)| Op::Park { pick, closes }),
+        1 => any::<Index>().prop_map(Op::Release),
+        1 => Just(Op::ReleaseAll),
         2 => ((0..3u8, any::<Index>()), prop::option::weighted(0.8, (0..3u8, any::<Index>())))
             .prop_map(|(item, target)| Op::After { item, target }),
         2 => Just(Op::Next),
@@ -444,6 +458,11 @@ fn waited() -> impl Strategy<Value = Vec<Step>> {
             let mut steps = vec![
                 cmd(Op::AddChore { group: true }),
                 cmd(Op::NewBrief),
+                // A wait set on the draft, then `--after` at the queue.
+                cmd(Op::After {
+                    item: (0, brief),
+                    target: Some((1, chore)),
+                }),
                 cmd(Op::Queue {
                     pick: brief,
                     write: true,
@@ -458,12 +477,48 @@ fn waited() -> impl Strategy<Value = Vec<Step>> {
         })
 }
 
+/// A brief parked to close a backlog item, released with the others by
+/// `queue --parked`, claimed, at times blocked and resumed, reported and
+/// filed: left to chance, a parked
+/// brief is seldom released whole, let alone filed.
+fn parked_through() -> impl Strategy<Value = Vec<Step>> {
+    (who(), any::<Index>(), any::<bool>(), any::<bool>()).prop_map(|(who, pick, two, blocked)| {
+        let cmd = |op| Step::Cmd {
+            who,
+            op,
+            fault: None,
+        };
+        let mut steps = vec![cmd(Op::AddBacklog), cmd(Op::NewBrief)];
+        steps.push(cmd(Op::Park {
+            pick,
+            closes: Some(pick),
+        }));
+        if two {
+            steps.extend([cmd(Op::NewBrief), cmd(Op::Park { pick, closes: None })]);
+        }
+        steps.extend([cmd(Op::ReleaseAll), cmd(Op::Next)]);
+        // At times the worker stops on a question, and the answer resumes it.
+        if blocked {
+            steps.extend([cmd(Op::Block(pick)), cmd(Op::Amend(pick))]);
+        }
+        steps.extend([
+            cmd(Op::Report(pick)),
+            cmd(Op::File {
+                pick,
+                trailer: false,
+            }),
+        ]);
+        steps
+    })
+}
+
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     prop::collection::vec(
         prop_oneof![
             12 => step().prop_map(|step| vec![step]),
             1 => scene(),
             1 => waited(),
+            1 => parked_through(),
         ],
         1..=30,
     )
@@ -478,10 +533,11 @@ const GROUPS: [&str; 3] = ["Home", "Work", "Later"];
 const KINDS: [(&str, char); 2] = [("proj/chores", 'c'), ("proj/backlog", 'b')];
 
 /// The directories of a clone the oracle reads.
-const DIRS: [&str; 4] = [
+const DIRS: [&str; 5] = [
     "proj/chores",
     "proj/backlog",
     "proj/briefs",
+    "proj/briefs/parked",
     "proj/briefs/done",
 ];
 
@@ -496,8 +552,10 @@ const SECTIONS: &str = "# By hand\n\n## Task\nt\n## Design\nd\n## Premises\np\n\
 
 /// The legal moves of a brief's status, as SPEC.md draws them; written out
 /// here rather than taken from the tool.
-const EDGES: [(&str, &str); 6] = [
+const EDGES: [(&str, &str); 8] = [
     ("draft", "queued"),
+    ("draft", "parked"),
+    ("parked", "queued"),
     ("queued", "started"),
     ("started", "blocked"),
     ("blocked", "started"),
@@ -524,9 +582,11 @@ fn reachable(from: &str, to: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BriefSeen {
     number: u32,
-    /// The file name, without `done/`.
+    /// The file name, without `done/` or `parked/`.
     name: String,
     filed: bool,
+    /// In `briefs/parked/`.
+    parked: bool,
     /// The value of the first `status:` line of the header.
     status: Option<String>,
     text: String,
@@ -558,9 +618,10 @@ fn brief_number(file_name: &str) -> Option<u32> {
 
 fn brief_seen(path: &str, text: String) -> Option<BriefSeen> {
     let rest = path.strip_prefix("proj/briefs/")?;
-    let (filed, name) = match rest.strip_prefix("done/") {
-        Some(name) => (true, name),
-        None => (false, rest),
+    let (filed, parked, name) = match (rest.strip_prefix("done/"), rest.strip_prefix("parked/")) {
+        (Some(name), _) => (true, false, name),
+        (None, Some(name)) => (false, true, name),
+        (None, None) => (false, false, rest),
     };
     if name.contains('/') {
         return None;
@@ -575,6 +636,7 @@ fn brief_seen(path: &str, text: String) -> Option<BriefSeen> {
         number,
         name: name.to_owned(),
         filed,
+        parked,
         status,
         text,
     })
@@ -765,6 +827,12 @@ enum Subject {
     Queue(u32),
     /// `queue <n> --first`.
     First(u32),
+    /// `park <n>`.
+    Park(u32),
+    /// `queue <n>` of a parked brief.
+    Release(u32),
+    /// `queue --parked`.
+    QueueParked,
     /// `after <id> …`: the id.
     After(String),
     Next,
@@ -793,6 +861,9 @@ impl Subject {
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::First(_)
+            | Subject::Park(_)
+            | Subject::Release(_)
+            | Subject::QueueParked
             | Subject::After(_)
             | Subject::Next
             | Subject::File(..) => None,
@@ -809,6 +880,9 @@ impl Subject {
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::First(_)
+            | Subject::Park(_)
+            | Subject::Release(_)
+            | Subject::QueueParked
             | Subject::After(_)
             | Subject::Next
             | Subject::Block(..)
@@ -830,6 +904,9 @@ impl Subject {
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::First(_)
+            | Subject::Park(_)
+            | Subject::Release(_)
+            | Subject::QueueParked
             | Subject::After(_)
             | Subject::Next
             | Subject::Block(..)
@@ -852,6 +929,9 @@ impl Subject {
             | Subject::NewBrief(_)
             | Subject::Queue(_)
             | Subject::First(_)
+            | Subject::Park(_)
+            | Subject::Release(_)
+            | Subject::QueueParked
             | Subject::After(_)
             | Subject::Next
             | Subject::File(..) => None,
@@ -948,6 +1028,10 @@ struct Depth {
     /// `next` with only waiting briefs queued.
     queue_waiting: u32,
     briefs_put_first: u32,
+    briefs_parked: u32,
+    briefs_released: u32,
+    /// A `queue --parked` that released briefs, judged.
+    all_released: u32,
     /// `after` runs that set or removed a wait.
     waits_set: u32,
     queue_empty: u32,
@@ -1012,6 +1096,9 @@ impl Depth {
         self.claimed_after_wait += other.claimed_after_wait;
         self.queue_waiting += other.queue_waiting;
         self.briefs_put_first += other.briefs_put_first;
+        self.briefs_parked += other.briefs_parked;
+        self.briefs_released += other.briefs_released;
+        self.all_released += other.all_released;
         self.waits_set += other.waits_set;
         self.queue_empty += other.queue_empty;
         self.briefs_blocked += other.briefs_blocked;
@@ -1550,6 +1637,38 @@ impl<'w> Oracle<'w> {
                 }
                 (args, Subject::Queue(number))
             }
+            Op::Park {
+                pick: draft,
+                closes,
+            } => {
+                let drafts = self.drafts(who);
+                let number = if drafts.is_empty() {
+                    999_999
+                } else {
+                    *draft.get(&drafts)
+                };
+                let mut args = owned(&["park", &number.to_string()]);
+                if let Some(index) = closes {
+                    let (_, item) = pick(self, 'b', index);
+                    if item != 999_999 {
+                        args.extend(["--closes".to_owned(), format!("b{item}")]);
+                    }
+                }
+                (args, Subject::Park(number))
+            }
+            Op::Release(index) => {
+                let numbers = self.open_with(who, &["parked"]);
+                let number = if numbers.is_empty() {
+                    999_999
+                } else {
+                    *index.get(&numbers)
+                };
+                (
+                    owned(&["queue", &number.to_string()]),
+                    Subject::Release(number),
+                )
+            }
+            Op::ReleaseAll => (owned(&["queue", "--parked"]), Subject::QueueParked),
             Op::First(index) => {
                 let numbers = self.open_with(who, &["queued"]);
                 let number = if numbers.is_empty() {
@@ -1868,8 +1987,14 @@ impl<'w> Oracle<'w> {
                     }
                 };
                 let (path, number, mut lines) = match chosen {
+                    // A parked brief is edited by hand in its folder, as a
+                    // draft is in `briefs/`.
                     Some(brief) => (
-                        format!("proj/briefs/{}", brief.name),
+                        format!(
+                            "proj/briefs/{}{}",
+                            if brief.parked { "parked/" } else { "" },
+                            brief.name
+                        ),
                         brief.number,
                         brief.text.lines().map(str::to_owned).collect(),
                     ),
@@ -2054,8 +2179,10 @@ impl<'w> Oracle<'w> {
         op: &Op,
         subject: &Subject,
     ) -> Result<(), TestCaseError> {
-        let (Op::Queue { write: true, .. }, Subject::Queue(number)) = (op, subject) else {
-            return Ok(());
+        let number = match (op, subject) {
+            (Op::Queue { write: true, .. }, Subject::Queue(number))
+            | (Op::Park { .. }, Subject::Park(number)) => number,
+            _ => return Ok(()),
         };
         let unwritten = self
             .briefs(who.slot())
@@ -2114,6 +2241,7 @@ impl<'w> Oracle<'w> {
             Op::Block(_) | Op::Report(_) => &["started"],
             Op::Amend(_) => &["queued", "started", "blocked"],
             Op::File { .. } => &["reported"],
+            Op::Release(_) => &["parked"],
             Op::AddChore { .. }
             | Op::AddBacklog
             | Op::AddWithBody { .. }
@@ -2121,6 +2249,8 @@ impl<'w> Oracle<'w> {
             | Op::Drop(_)
             | Op::NewBrief
             | Op::Queue { .. }
+            | Op::Park { .. }
+            | Op::ReleaseAll
             | Op::First(_)
             | Op::After { .. }
             | Op::Next => return Ok(()),
@@ -2141,7 +2271,16 @@ impl<'w> Oracle<'w> {
             if !self.open_with(who, wanted).is_empty() {
                 break;
             }
-            let before = if !self.open_with(who, &["started"]).is_empty() {
+            let before = if wanted == ["parked"] {
+                if self.drafts(who).is_empty() {
+                    Op::NewBrief
+                } else {
+                    Op::Park {
+                        pick: first(),
+                        closes: None,
+                    }
+                }
+            } else if !self.open_with(who, &["started"]).is_empty() {
                 Op::Report(first())
             } else if !self.open_with(who, &["queued"]).is_empty() {
                 Op::Next
@@ -2487,6 +2626,8 @@ impl<'w> Oracle<'w> {
                             | Subject::Retitle(..)
                             | Subject::Queue(_)
                             | Subject::First(_)
+                            | Subject::Park(_)
+                            | Subject::Release(_)
                             | Subject::After(_)
                             | Subject::File(..)
                     ) || subject.brief_line().is_some(),
@@ -2687,6 +2828,94 @@ impl<'w> Oracle<'w> {
                     }
                 }
             }
+            Subject::Park(number) => match run.code {
+                Some(0) => {
+                    prop_assert_eq!(&run.stdout, &format!("parked {number}\n"));
+                    // Parked, or released since by the other clone's run in
+                    // the window, which the retry ran on.
+                    let place = if pushed { 2 } else { slot };
+                    let found: Vec<BriefSeen> = self
+                        .briefs(place)
+                        .into_iter()
+                        .filter(|brief| brief.number == *number)
+                        .collect();
+                    prop_assert!(
+                        matches!(&found[..], [brief] if (brief.parked
+                            && brief.status.as_deref() == Some("parked"))
+                            || (window
+                                && brief.status.as_deref().is_some_and(|s| reachable("queued", s)))),
+                        "{:?} after {:?}",
+                        found,
+                        run
+                    );
+                    self.depth.briefs_parked += 1;
+                }
+                Some(1) => prop_assert!(
+                    run.stderr
+                        .lines()
+                        .last()
+                        .is_some_and(|last| last.starts_with(&format!("board: park {number}: "))),
+                    "{:?}",
+                    run
+                ),
+                Some(_) | None => {}
+            },
+            Subject::Release(number) => match run.code {
+                Some(0) => {
+                    prop_assert!(
+                        run.stdout.starts_with(&format!("queued {number}")),
+                        "{run:?}"
+                    );
+                    let place = if pushed { 2 } else { slot };
+                    let found: Vec<BriefSeen> = self
+                        .briefs(place)
+                        .into_iter()
+                        .filter(|brief| brief.number == *number)
+                        .collect();
+                    prop_assert!(
+                        matches!(&found[..], [brief] if !brief.parked
+                            && brief.status.as_deref().is_some_and(|s| reachable("queued", s))),
+                        "{:?} after {:?}",
+                        found,
+                        run
+                    );
+                    self.depth.briefs_released += 1;
+                }
+                Some(1) => prop_assert!(
+                    run.stderr
+                        .lines()
+                        .last()
+                        .is_some_and(|last| last.starts_with(&format!("board: queue {number}: "))),
+                    "{:?}",
+                    run
+                ),
+                Some(_) | None => {}
+            },
+            Subject::QueueParked => {
+                if run.code != Some(0) {
+                    return Ok(());
+                }
+                prop_assert!(
+                    run.stdout == "nothing parked\n" || run.stdout.starts_with("queued "),
+                    "{run:?}"
+                );
+                // One that no other write met leaves `briefs/parked/` empty
+                // where it was the last change.
+                let saved_after = !pushed && matches!(fault, Some(Fault::WindowEdit(_)));
+                if !window && !saved_after {
+                    let place = if pushed { 2 } else { slot };
+                    let left: Vec<u32> = self
+                        .briefs(place)
+                        .iter()
+                        .filter(|brief| brief.parked)
+                        .map(|brief| brief.number)
+                        .collect();
+                    prop_assert!(left.is_empty(), "{:?} parked after {:?}", left, run);
+                    if run.stdout != "nothing parked\n" {
+                        self.depth.all_released += 1;
+                    }
+                }
+            }
             Subject::First(number) => match run.code {
                 Some(0) => {
                     // Picked as queued; a draft when it ran (the remote's
@@ -2812,6 +3041,23 @@ impl<'w> Oracle<'w> {
                     self.waits_on(2, claimed[0]),
                     run
                 );
+                // Never from `briefs/parked/`: the remote had it queued, not
+                // parked, before this step, unless the other clone's run in
+                // the window released it.
+                let released_meanwhile = matches!(
+                    fault,
+                    Some(Fault::WindowOp(Op::Release(_) | Op::ReleaseAll))
+                );
+                if !released_meanwhile
+                    && let Some((_, Some(was))) = self.remote_briefs.get(&claimed[0].number)
+                {
+                    prop_assert!(
+                        was != "parked",
+                        "{} started from briefs/parked/: {:?}",
+                        claimed[0].number,
+                        run
+                    );
+                }
                 if after_of(&claimed[0].text).is_some() {
                     self.depth.claimed_after_wait += 1;
                 }
@@ -3231,8 +3477,11 @@ impl<'w> Oracle<'w> {
             return Ok(());
         }
         for brief in briefs {
+            // The place decides, as the tool reads it.
             let status = if brief.filed {
                 Some("filed".to_owned())
+            } else if brief.parked {
+                Some("parked".to_owned())
             } else {
                 brief.status.clone()
             };
@@ -3579,19 +3828,21 @@ impl<'w> Oracle<'w> {
             // of that number, whatever the remote's is named, and where the
             // clone had it: a brief the clone filed is in `done/`.
             let machine = self.machine(*who);
-            let in_copy = ["proj/briefs", "proj/briefs/done"].into_iter().any(|dir| {
-                let dir = machine.data().join(dir);
-                fs::read_dir(&dir).into_iter().flatten().any(|entry| {
-                    let entry = entry.unwrap();
-                    let file_name = entry.file_name().to_string_lossy().into_owned();
-                    entry.file_type().unwrap().is_file()
-                        && file_name
-                            .split_once(".md.local")
-                            .and_then(|(brief, _)| brief_number(&format!("{brief}.md")))
-                            == Some(*number)
-                        && has_line(&fs::read_to_string(entry.path()).unwrap())
-                })
-            });
+            let in_copy = ["proj/briefs", "proj/briefs/parked", "proj/briefs/done"]
+                .into_iter()
+                .any(|dir| {
+                    let dir = machine.data().join(dir);
+                    fs::read_dir(&dir).into_iter().flatten().any(|entry| {
+                        let entry = entry.unwrap();
+                        let file_name = entry.file_name().to_string_lossy().into_owned();
+                        entry.file_type().unwrap().is_file()
+                            && file_name
+                                .split_once(".md.local")
+                                .and_then(|(brief, _)| brief_number(&format!("{brief}.md")))
+                                == Some(*number)
+                            && has_line(&fs::read_to_string(entry.path()).unwrap())
+                    })
+                });
             prop_assert!(
                 in_brief || in_copy,
                 "{} written by {:?} into brief {} is lost",
@@ -3682,6 +3933,9 @@ fn the_traces_get_deep() {
     assert!(depth.claimed_after_wait > 0, "{depth:?}");
     assert!(depth.queue_waiting > 0, "{depth:?}");
     assert!(depth.briefs_put_first > 0, "{depth:?}");
+    assert!(depth.briefs_parked > 0, "{depth:?}");
+    assert!(depth.briefs_released > 0, "{depth:?}");
+    assert!(depth.all_released > 0, "{depth:?}");
     assert!(depth.waits_set > 0, "{depth:?}");
     assert!(depth.queue_empty > 0, "{depth:?}");
     assert!(depth.briefs_blocked > 0, "{depth:?}");

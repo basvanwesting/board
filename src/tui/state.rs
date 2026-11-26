@@ -143,6 +143,8 @@ pub(crate) enum Action {
     Drop(BacklogId),
     /// `queue <id> --first`: `F` on a queued brief.
     First(BriefId),
+    /// `queue <id>`: `Q` on a parked brief, confirmed.
+    Queue(BriefId),
     Sync,
 }
 
@@ -153,6 +155,7 @@ impl fmt::Display for Action {
             Action::Done(id) => write!(f, "done {id}"),
             Action::Drop(id) => write!(f, "drop {id}"),
             Action::First(id) => write!(f, "queue {id} --first"),
+            Action::Queue(id) => write!(f, "queue {id}"),
             Action::Sync => f.write_str("sync"),
         }
     }
@@ -180,6 +183,7 @@ impl Panel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
     Open,
+    Parked,
     Filed,
 }
 
@@ -188,17 +192,24 @@ pub(crate) enum Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Source {
     Open = 0,
-    Filed = 1,
-    Chores = 2,
-    Backlog = 3,
+    Parked = 1,
+    Filed = 2,
+    Chores = 3,
+    Backlog = 4,
 }
 
 impl Source {
-    pub const ALL: [Source; 4] = [Source::Open, Source::Filed, Source::Chores, Source::Backlog];
+    pub const ALL: [Source; 5] = [
+        Source::Open,
+        Source::Parked,
+        Source::Filed,
+        Source::Chores,
+        Source::Backlog,
+    ];
 
     pub fn panel(self) -> Panel {
         match self {
-            Source::Open | Source::Filed => Panel::Briefs,
+            Source::Open | Source::Parked | Source::Filed => Panel::Briefs,
             Source::Chores => Panel::Chores,
             Source::Backlog => Panel::Backlog,
         }
@@ -207,7 +218,7 @@ impl Source {
     /// The list file the rows are of; `None` for briefs.
     pub fn list(self) -> Option<ListKind> {
         match self {
-            Source::Open | Source::Filed => None,
+            Source::Open | Source::Parked | Source::Filed => None,
             Source::Chores => Some(ListKind::Chores),
             Source::Backlog => Some(ListKind::Backlog),
         }
@@ -332,7 +343,8 @@ impl Question {
         let verb = match self.action {
             Action::Done(_) => "done",
             Action::Drop(_) => "drop",
-            Action::First(_) | Action::Sync => unreachable!("only d and x ask"),
+            Action::Queue(_) => "queue",
+            Action::First(_) | Action::Sync => unreachable!("only d, x and Q ask"),
         };
         format!("{verb} {}? y/n", self.text)
     }
@@ -363,8 +375,8 @@ pub(crate) struct State {
     /// shows.
     in_preview: bool,
     tab: Tab,
-    cursors: [Cursor; 4],
-    /// Per panel; the two tabs of Briefs share one.
+    cursors: [Cursor; 5],
+    /// Per panel; the three tabs of Briefs share one.
     filters: [Option<String>; 3],
     /// Keys go into the focused panel's filter.
     typing: bool,
@@ -561,11 +573,18 @@ impl State {
             Key::Char('l') | Key::Tab => self.focus_on(self.focus.next()),
             // Tab backwards, so from the preview too: `h` only leaves it.
             Key::BackTab => self.focus_on(self.focus.previous()),
-            // Two tabs, so either key goes to the other one.
-            Key::Char('[' | ']') if self.focus == Panel::Briefs => {
+            // Three tabs, Briefs, Parked, Filed: `[` and `]` step through
+            // them and stop at the ends.
+            Key::Char('[') if self.focus == Panel::Briefs => {
                 self.tab = match self.tab {
-                    Tab::Open => Tab::Filed,
-                    Tab::Filed => Tab::Open,
+                    Tab::Open | Tab::Parked => Tab::Open,
+                    Tab::Filed => Tab::Parked,
+                };
+            }
+            Key::Char(']') if self.focus == Panel::Briefs => {
+                self.tab = match self.tab {
+                    Tab::Open => Tab::Parked,
+                    Tab::Parked | Tab::Filed => Tab::Filed,
                 };
             }
             // `0` is the preview's number in its title, as `1` `2` `3` are the
@@ -582,6 +601,7 @@ impl State {
             Key::Char('d') => self.ask(ListKind::Chores),
             Key::Char('x') => self.ask(ListKind::Backlog),
             Key::Char('F') => commands.extend(self.first()),
+            Key::Char('Q') => self.ask_release(),
             Key::Char('e') => commands.extend(self.edit_key()),
             Key::Char('r') => commands.extend(self.run(Action::Sync)),
             // The id at once, as `gg` is read: no timer for a key that can
@@ -845,10 +865,31 @@ impl State {
         }
     }
 
+    /// `Q`: asks, on the bottom line as `d` and `x` do, whether to queue the
+    /// parked brief under the cursor (owner, 2026-11-26: "Q is fine").
+    /// Asked, because nothing takes a brief out of the queue again and `Q`
+    /// is one Shift away from `q`. On any other row it does nothing.
+    fn ask_release(&mut self) {
+        let Some((source, row)) = self.cursor_item() else {
+            return;
+        };
+        if source != Source::Parked {
+            return;
+        }
+        let brief = &self.brief(source, &row).row;
+        if brief.status != Some(Status::Parked) {
+            return;
+        }
+        self.question = Some(Question {
+            action: Action::Queue(brief.number),
+            text: brief.ls_line(),
+        });
+    }
+
     /// `F`: the queued brief under the cursor first in the queue, with no
-    /// question: a second `F` on another brief undoes it. The one action on
-    /// a brief (owner, 2026-11-26: "it needs a single key in the TUI on a
-    /// brief as well"); queueing a draft stays the planner's, so on any
+    /// question: a second `F` on another brief undoes it. One of a brief's
+    /// two actions, with `Q` (owner, 2026-11-26: "it needs a single key in
+    /// the TUI on a brief as well"); queueing a draft stays the planner's, so on any
     /// other brief it says why it does nothing, and on a list item it does
     /// nothing.
     fn first(&mut self) -> Vec<Command> {
@@ -917,25 +958,24 @@ impl State {
         // one in `briefs/done/` (lint reports it), has a key in each tab,
         // renumbered (`nth`) as one moves, and the other file is not the
         // one `e` was pressed on.
-        let other = match source {
-            Source::Open => Some(Source::Filed),
-            Source::Filed => Some(Source::Open),
-            Source::Chores | Source::Backlog => None,
+        let sources: &[Source] = match source {
+            Source::Open | Source::Parked | Source::Filed => {
+                &[Source::Open, Source::Parked, Source::Filed]
+            }
+            Source::Chores => &[Source::Chores],
+            Source::Backlog => &[Source::Backlog],
         };
-        let found = [Some(source), other]
-            .into_iter()
-            .flatten()
-            .find_map(|source| {
-                self.rows(source)
-                    .into_iter()
-                    .find(|row| match (source.list(), path) {
-                        (None, Some(path)) => {
-                            row.key.is_some() && self.brief(source, row).path == *path
-                        }
-                        _ => row.key.as_ref() == Some(key),
-                    })
-                    .map(|row| (source, row))
-            });
+        let found = sources.iter().copied().find_map(|source| {
+            self.rows(source)
+                .into_iter()
+                .find(|row| match (source.list(), path) {
+                    (None, Some(path)) => {
+                        row.key.is_some() && self.brief(source, row).path == *path
+                    }
+                    _ => row.key.as_ref() == Some(key),
+                })
+                .map(|row| (source, row))
+        });
         let Some((source, row)) = found else {
             self.say("the item is gone: nothing to edit".to_owned(), true);
             return Vec::new();
@@ -965,6 +1005,7 @@ impl State {
     fn brief(&self, source: Source, row: &Row) -> &BriefItem {
         match source {
             Source::Open => &self.data.open[row.at],
+            Source::Parked => &self.data.parked[row.at],
             Source::Filed => &self.data.filed[row.at],
             Source::Chores | Source::Backlog => unreachable!("a brief's row"),
         }
@@ -1233,7 +1274,7 @@ impl State {
             .collect()
     }
 
-    fn areas_of(&self, rows: &[Vec<Row>; 4]) -> Areas {
+    fn areas_of(&self, rows: &[Vec<Row>; 5]) -> Areas {
         let shown = Panel::ALL.map(|panel| rows[self.source_of(panel) as usize].len());
         layout::areas(self.width, self.height, self.focus, shown)
     }
@@ -1261,6 +1302,7 @@ impl State {
     pub fn source_of(&self, panel: Panel) -> Source {
         match (panel, self.tab) {
             (Panel::Briefs, Tab::Open) => Source::Open,
+            (Panel::Briefs, Tab::Parked) => Source::Parked,
             (Panel::Briefs, Tab::Filed) => Source::Filed,
             (Panel::Chores, _) => Source::Chores,
             (Panel::Backlog, _) => Source::Backlog,
@@ -1367,6 +1409,7 @@ fn cursor_row(cursor: &Cursor, rows: &[Row]) -> Option<usize> {
 fn all_rows(data: &Data, source: Source) -> Vec<Row> {
     let mut rows = match source {
         Source::Open => brief_rows(&data.open),
+        Source::Parked => brief_rows(&data.parked),
         Source::Filed => brief_rows(&data.filed),
         Source::Chores => list_rows(ListKind::Chores, data),
         Source::Backlog => list_rows(ListKind::Backlog, data),

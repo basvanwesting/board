@@ -216,7 +216,7 @@ fn main() {
     for (keys, id) in [
         ("2/Wash\ryy", chore),
         ("1/yank-me\ryy", open.as_str()),
-        ("1]/old-one\ryy", "77"),
+        ("1]]/old-one\ryy", "77"),
     ] {
         fs::write(&clipboard, "").expect("empty the clipboard");
         tui(&a, keys);

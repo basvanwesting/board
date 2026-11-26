@@ -537,6 +537,7 @@ fn worker(board: Board, messages: Sender<Message>) -> impl FnMut(Job) -> Event +
             let result = match &action {
                 Action::Done(id) => board.done(&[*id]),
                 Action::Drop(id) => board.drop_items(&[*id]),
+                Action::Queue(id) => board.queue(*id, crate::ops::Queueing::default()),
                 Action::First(id) => board.queue(
                     *id,
                     crate::ops::Queueing {

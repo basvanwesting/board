@@ -15,7 +15,9 @@ use crate::lint::{Finding, lint};
 use crate::list::{FindError, Line};
 use crate::migrate;
 use crate::ops::{self, CheckChange, Claim, Commits, Filed, NewBacklog, NewChore, Queueing};
-use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, QueuePlace, Slug, resolve};
+use crate::project::{
+    BoardPath, BriefFile, Env, Place, Project, ProjectName, QueuePlace, Slug, resolve,
+};
 use crate::sync::{self, Fetched, Note};
 
 pub struct Board {
@@ -286,6 +288,33 @@ impl Board {
         })
     }
 
+    /// Parks a written draft; gives what it did, as `parked 128`.
+    pub fn park(
+        &self,
+        id: BriefId,
+        closes: Option<&[BacklogId]>,
+        after: Option<ItemId>,
+    ) -> Result<String, Error> {
+        let now = now()?;
+        self.command("park", &|tx| {
+            if let Some(target) = after {
+                tx.require_given(&format!("park {id}"), target)?;
+            }
+            let parked = ops::park(&mut tx.project, id, closes, after, now)?;
+            Ok((parked.clone(), parked))
+        })
+    }
+
+    /// Queues every parked brief in one commit; gives what it did, as
+    /// `queued 31, 32`, or `nothing parked` with no commit.
+    pub fn queue_parked(&self) -> Result<String, Error> {
+        let now = now()?;
+        self.command("queue --parked", &|tx| {
+            let queued = ops::queue_parked(&mut tx.project, now)?;
+            Ok((queued.clone(), queued))
+        })
+    }
+
     /// Makes an item or a brief wait on another, or on nothing; gives what
     /// it did, as `c3 after c9`. Allocates nothing, so it works offline
     /// like `done`.
@@ -362,6 +391,7 @@ impl Board {
         let commits = match check {
             CommitCheck::Trailer => self.brief_commits(id)?,
             CommitCheck::Skip => Commits::Skipped,
+            CommitCheck::NotBuilt => Commits::NotBuilt,
         };
         let now = now()?;
         self.command("file", &|tx| {
@@ -532,6 +562,8 @@ pub enum CommitCheck {
     Trailer,
     /// `--no-commits`: the brief changed nothing in the repository.
     Skip,
+    /// `--not-built`: no commits looked for, and nothing it closes deleted.
+    NotBuilt,
 }
 
 /// The time a write stamps, taken once, before the write: every round of it
@@ -584,10 +616,13 @@ pub enum Next {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub project: ProjectName,
-    /// The briefs outside `briefs/done/`, in the order of [`BriefRow::rank`],
-    /// the queued ones in queue order ([`QueuePlace`]), then by number.
+    /// The briefs in `briefs/` and the unpushed ones, in the order of
+    /// [`BriefRow::rank`], the queued ones in queue order ([`QueuePlace`]),
+    /// then by number.
     pub open: Vec<BriefRow>,
-    /// The briefs in `briefs/done/`, by number.
+    /// The briefs in `briefs/parked/`, by number.
+    pub parked: Vec<BriefRow>,
+    /// The briefs in `briefs/done/` that are not unpushed, by number.
     pub filed: Vec<BriefRow>,
     pub chores: Vec<ListRow>,
     pub backlog: Vec<ListRow>,
@@ -666,10 +701,13 @@ impl BriefRow {
         }
     }
 
-    /// Whether the brief is among the open ones: outside `briefs/done/`,
-    /// or filed and unpushed.
-    fn open(&self, in_done: bool) -> bool {
-        !in_done || self.unpushed
+    /// Which list the brief is in: the open ones (in `briefs/`, or filed
+    /// and unpushed), the parked ones, the filed ones.
+    fn list(&self, place: Place) -> Place {
+        match place {
+            Place::Done if self.unpushed => Place::Open,
+            place => place,
+        }
     }
 
     /// Where the row stands among the briefs: what is in flight first
@@ -688,6 +726,7 @@ impl BriefRow {
             Some(Status::Draft) => 5,
             None => 6,
             Some(Status::Filed) => 7,
+            Some(Status::Parked) => 8,
         }
     }
 
@@ -745,39 +784,48 @@ pub fn waits_suffix(waits: Option<ItemId>) -> String {
 /// The label of a filed brief with unpushed commits.
 pub const UNPUSHED: &str = "unpushed";
 
-/// Labels the briefs by `unpushed` and splits them into the open ones and
-/// the filed ones, in the order the board shows them: by [`BriefRow::rank`],
-/// the queued ones in queue order ([`QueuePlace`]), then by number. One
-/// order for `ls` and the TUI, which hold a brief as a row or as an item:
-/// `row` gives an item's row and whether its file is in
-/// `briefs/done/`. Filed ones go by number: a brief in `briefs/done/` is
-/// filed whatever its header says ([`BriefFile::status`]), so all rank
-/// alike.
+/// Labels the briefs by `unpushed` and splits them into the open ones, the
+/// parked ones and the filed ones, in the order the board shows them: by
+/// [`BriefRow::rank`], the queued ones in queue order ([`QueuePlace`]),
+/// then by number. One order for `ls` and the TUI, which hold a brief as a
+/// row or as an item: `row` gives an item's row and where its file is.
+/// Parked and filed ones go by number: the place decides their status
+/// ([`BriefFile::status`]), so all rank alike.
 pub(crate) fn arrange<T>(
     briefs: impl IntoIterator<Item = T>,
     unpushed: &BTreeSet<BriefId>,
-    mut row: impl FnMut(&mut T) -> (&mut BriefRow, bool),
-) -> (Vec<T>, Vec<T>) {
-    let mut open = Vec::new();
-    let mut filed = Vec::new();
+    mut row: impl FnMut(&mut T) -> (&mut BriefRow, Place),
+) -> Arranged<T> {
+    let (mut open, mut parked, mut filed) = (Vec::new(), Vec::new(), Vec::new());
     for mut brief in briefs {
-        let (row, in_done) = row(&mut brief);
+        let (row, place) = row(&mut brief);
         row.unpushed = row.status == Some(Status::Filed) && unpushed.contains(&row.number);
         // Queued briefs in queue order, so `--first` shows; the others by
         // number, as before.
         let queue = (row.status == Some(Status::Queued) && !row.unpushed).then_some(row.queue);
         let key = (row.rank(), queue, row.number);
-        if row.open(in_done) {
-            open.push((key, brief));
-        } else {
-            filed.push((key, brief));
+        match row.list(place) {
+            Place::Open => open.push((key, brief)),
+            Place::Parked => parked.push((key, brief)),
+            Place::Done => filed.push((key, brief)),
         }
     }
     let sorted = |mut briefs: Vec<(BriefOrder, T)>| -> Vec<T> {
         briefs.sort_by_key(|(key, _)| *key);
         briefs.into_iter().map(|(_, brief)| brief).collect()
     };
-    (sorted(open), sorted(filed))
+    Arranged {
+        open: sorted(open),
+        parked: sorted(parked),
+        filed: sorted(filed),
+    }
+}
+
+/// The briefs as [`arrange`] splits them.
+pub(crate) struct Arranged<T> {
+    pub(crate) open: Vec<T>,
+    pub(crate) parked: Vec<T>,
+    pub(crate) filed: Vec<T>,
 }
 
 impl Snapshot {
@@ -785,13 +833,15 @@ impl Snapshot {
         let rows = project
             .briefs()
             .iter()
-            .map(|file| (BriefRow::of(project, file), file.filed));
-        let (open, filed) = arrange(rows, unpushed, |(row, in_done)| (row, *in_done));
-        let rows = |briefs: Vec<(BriefRow, bool)>| briefs.into_iter().map(|(row, _)| row).collect();
+            .map(|file| (BriefRow::of(project, file), file.place));
+        let arranged = arrange(rows, unpushed, |(row, place)| (row, *place));
+        let rows =
+            |briefs: Vec<(BriefRow, Place)>| briefs.into_iter().map(|(row, _)| row).collect();
         Snapshot {
             project: project.name().clone(),
-            open: rows(open),
-            filed: rows(filed),
+            open: rows(arranged.open),
+            parked: rows(arranged.parked),
+            filed: rows(arranged.filed),
             chores: list_rows(project, ListKind::Chores),
             backlog: list_rows(project, ListKind::Backlog),
         }
@@ -799,14 +849,16 @@ impl Snapshot {
 
     /// The briefs `ls` lists: the open ones, or those it shows with one
     /// word. `filed` is the briefs in `briefs/done/` that are not
-    /// `unpushed`.
+    /// `unpushed`, `parked` those in `briefs/parked/`: neither is among the
+    /// open ones, so a parked brief is out of the planner's queue checks.
     pub fn briefs(&self, shown: Option<Shown>) -> impl Iterator<Item = &BriefRow> {
         let rows = match shown {
             Some(Shown::Status(Status::Filed)) => &self.filed,
+            Some(Shown::Status(Status::Parked)) => &self.parked,
             Some(_) | None => &self.open,
         };
         rows.iter().filter(move |row| match shown {
-            None | Some(Shown::Status(Status::Filed)) => true,
+            None | Some(Shown::Status(Status::Filed | Status::Parked)) => true,
             Some(Shown::Unpushed) => row.unpushed,
             Some(Shown::Status(status)) => !row.unpushed && row.status == Some(status),
         })
@@ -857,9 +909,9 @@ mod tests {
 
     fn brief(path: &str, text: &str) -> BriefFile {
         match BoardPath::parse(&format!("shop/{path}")) {
-            Some(BoardPath::Brief { name, filed, .. }) => BriefFile {
+            Some(BoardPath::Brief { name, place, .. }) => BriefFile {
                 name,
-                filed,
+                place,
                 brief: Brief::parse(text.as_bytes()),
             },
             _ => panic!("{path} is no brief path"),

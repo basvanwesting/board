@@ -16,7 +16,7 @@ use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
 use crate::item::{self, Body, Item};
 use crate::list::{FindError, Line};
-use crate::project::{BoardPath, BriefFile, BriefName, Project, Slug};
+use crate::project::{BoardPath, BriefFile, BriefName, Place, Project, Slug};
 
 /// The sections a brief needs text in before it is queued: what the worker
 /// works from. Their template is the planner skill's, not the tool's (the
@@ -43,7 +43,7 @@ pub(crate) fn new_brief(
 ) -> BoardPath {
     let file = BriefFile {
         name: BriefName::new(number, slug),
-        filed: false,
+        place: Place::Open,
         brief: Brief::new(number, base.as_str(), now),
     };
     let path = file.path(project.name());
@@ -121,54 +121,41 @@ pub(crate) fn queue(
                 "it is queued; `board after {number} <id>` changes what it waits on"
             )));
         }
+        Ok(Status::Parked) => {
+            if closes.is_some() || after.is_some() {
+                return Err(refused(
+                    "it is parked: its --closes and --after were set at `park`, and `board \
+                     after` changes what it waits on"
+                        .to_owned(),
+                ));
+            }
+            // What `park` asked of it, asked again: a parked brief is edited
+            // or placed by hand, and is built with nobody watching.
+            written(project, number, None, None).map_err(refused)?;
+            let counter = first.then(|| next_first(project));
+            let file = project
+                .brief_mut(number)
+                .map_err(|why| refused(no_brief(number, why)))?;
+            if let Some(counter) = counter {
+                file.brief.set_first(counter);
+            }
+            file.transition(Transition::Queue, now)
+                .map_err(|error| refused(not_moved(&error, Status::Parked)))?;
+            return Ok(if first {
+                format!("queued {number}, first")
+            } else {
+                format!("queued {number}")
+            });
+        }
         Ok(status) if first => {
             return Err(refused(format!(
-                "it is {status}; --first is for a draft or a queued brief"
+                "it is {status}; --first is for a draft, a parked or a queued brief"
             )));
         }
-        Ok(status) => return Err(refused(format!("it is {status}, not draft"))),
+        Ok(status) => return Err(refused(format!("it is {status}, not draft or parked"))),
         Err(bad) => return Err(refused(bad_status(&bad))),
     }
-    let empty: Vec<&str> = REQUIRED_SECTIONS
-        .into_iter()
-        .filter(|name| !file.brief.section(name).is_some_and(|s| s.has_text()))
-        .collect();
-    if !empty.is_empty() {
-        return Err(refused(format!(
-            "no text under ## {}; every one of {} needs a line",
-            empty.join(", ## "),
-            REQUIRED_SECTIONS.join(", ")
-        )));
-    }
-    // An id given twice is one item.
-    let closes = closes.map(|ids| {
-        let mut unique: Vec<BacklogId> = Vec::with_capacity(ids.len());
-        for id in ids {
-            if !unique.contains(id) {
-                unique.push(*id);
-            }
-        }
-        unique
-    });
-    for id in closes.iter().flatten() {
-        project
-            .list(ListKind::Backlog)
-            .find(id.get())
-            .map_err(|why| {
-                refused(format!(
-                    "closes {id}: {}",
-                    not_one(ListKind::Backlog, id.get(), why)
-                ))
-            })?;
-    }
-    // What it waits on after this write: the `--after` given, else the
-    // file's, checked against the `closes` it gets now too.
-    let id = ItemId::Brief(number);
-    if let Some(target) = after.or_else(|| after::target_of(project, id))
-        && let Some(why) = after::refusal(project, id, target, closes.as_deref())
-    {
-        return Err(refused(why));
-    }
+    let closes = written(project, number, closes, after).map_err(refused)?;
     let counter = first.then(|| next_first(project));
     let file = project
         .brief_mut(number)
@@ -189,6 +176,124 @@ pub(crate) fn queue(
     } else {
         format!("queued {number}")
     })
+}
+
+/// A draft as `queue` and `park` take it: text in every required section,
+/// the backlog items it closes there (each once), and a wait a write may
+/// make (the `--after` given, else the file's, checked against the
+/// `closes` it gets now too). Gives the `closes` to write, or why not.
+fn written(
+    project: &Project,
+    number: BriefId,
+    closes: Option<&[BacklogId]>,
+    after: Option<ItemId>,
+) -> Result<Option<Vec<BacklogId>>, String> {
+    let file = project
+        .find_brief(number)
+        .map_err(|why| no_brief(number, why))?;
+    let empty: Vec<&str> = REQUIRED_SECTIONS
+        .into_iter()
+        .filter(|name| !file.brief.section(name).is_some_and(|s| s.has_text()))
+        .collect();
+    if !empty.is_empty() {
+        return Err(format!(
+            "no text under ## {}; every one of {} needs a line",
+            empty.join(", ## "),
+            REQUIRED_SECTIONS.join(", ")
+        ));
+    }
+    // An id given twice is one item.
+    let closes = closes.map(|ids| {
+        let mut unique: Vec<BacklogId> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.contains(id) {
+                unique.push(*id);
+            }
+        }
+        unique
+    });
+    for id in closes.iter().flatten() {
+        project
+            .list(ListKind::Backlog)
+            .find(id.get())
+            .map_err(|why| format!("closes {id}: {}", not_one(ListKind::Backlog, id.get(), why)))?;
+    }
+    let id = ItemId::Brief(number);
+    if let Some(target) = after.or_else(|| after::target_of(project, id))
+        && let Some(why) = after::refusal(project, id, target, closes.as_deref())
+    {
+        return Err(why);
+    }
+    Ok(closes)
+}
+
+/// Parks a draft whose required sections hold text: `briefs/parked/`,
+/// `status: parked`, with the backlog items it closes and what it waits
+/// on, until the owner's word queues it. Gives what `park` prints.
+///
+/// The refusals of `queue`, as it is the same brief, written whole: a
+/// parked brief is built with nobody watching when released.
+pub(crate) fn park(
+    project: &mut Project,
+    number: BriefId,
+    closes: Option<&[BacklogId]>,
+    after: Option<ItemId>,
+    now: Stamp,
+) -> Result<String, Error> {
+    let refused = |why: String| Error::Refused(format!("park {number}: {why}"));
+    let file = project
+        .find_brief(number)
+        .map_err(|why| refused(no_brief(number, why)))?;
+    match file.status() {
+        Ok(Status::Draft) => {}
+        Ok(status) => return Err(refused(format!("it is {status}, not draft"))),
+        Err(bad) => return Err(refused(bad_status(&bad))),
+    }
+    let closes = written(project, number, closes, after).map_err(refused)?;
+    let file = project
+        .brief_mut(number)
+        .map_err(|why| refused(no_brief(number, why)))?;
+    if let Some(closes) = &closes {
+        file.brief.set_closes(closes);
+    }
+    if after.is_some() {
+        file.brief.set_after(after);
+    }
+    file.transition(Transition::Park, now)
+        .map_err(|error| refused(not_moved(&error, Status::Draft)))?;
+    Ok(format!("parked {number}"))
+}
+
+/// Queues every parked brief of the project, in one commit, all with one
+/// `queued:` time, so `next` takes them by number; refused, none released,
+/// when one has an empty required section or a wait a write would refuse. Gives what `queue
+/// --parked` prints: `queued 31, 32`, or `nothing parked` with no change.
+pub(crate) fn queue_parked(project: &mut Project, now: Stamp) -> Result<String, Error> {
+    let numbers: Vec<BriefId> = project
+        .briefs()
+        .iter()
+        .filter(|file| file.status() == Ok(Status::Parked))
+        .map(|file| file.name.number())
+        .collect();
+    if numbers.is_empty() {
+        return Ok("nothing parked".to_owned());
+    }
+    // All or none, as `done` and `drop` are: one that `park` would refuse
+    // now (edited or placed by hand) is named, and none is released.
+    for number in &numbers {
+        written(project, *number, None, None)
+            .map_err(|why| Error::Refused(format!("queue --parked: {number}: {why}")))?;
+    }
+    for number in &numbers {
+        let refused = |why: String| Error::Refused(format!("queue --parked: {number}: {why}"));
+        project
+            .brief_mut(*number)
+            .map_err(|why| refused(no_brief(*number, why)))?
+            .transition(Transition::Queue, now)
+            .map_err(|error| refused(not_moved(&error, Status::Parked)))?;
+    }
+    let numbers: Vec<String> = numbers.iter().map(BriefId::to_string).collect();
+    Ok(format!("queued {}", numbers.join(", ")))
 }
 
 /// The `first:` a brief put first now gets: one above the highest among
@@ -277,7 +382,8 @@ pub(crate) fn next(project: &mut Project, now: Stamp) -> Result<Claim, Error> {
 
 /// Makes `id` wait on `target`, or on nothing (`None`); gives what `after`
 /// prints, as `c3 after c9`. Any chore or backlog item; a brief only while
-/// it is draft or queued, as a started brief no longer waits for anything.
+/// it is draft, parked or queued, as a started brief no longer waits for
+/// anything.
 /// Refused for the item itself and a loop ([`after::refusal`]); a target
 /// that is satisfied already is accepted and holds nothing up.
 pub(crate) fn set_after(
@@ -292,11 +398,11 @@ pub(crate) fn set_after(
                 .find_brief(number)
                 .map_err(|why| refused(no_brief(number, why)))?;
             match file.status() {
-                Ok(Status::Draft | Status::Queued) => {}
+                Ok(Status::Draft | Status::Parked | Status::Queued) => {}
                 Ok(status) => {
                     return Err(refused(format!(
-                        "it is {status}; only a draft or a queued brief waits, as a started \
-                         one no longer waits for anything"
+                        "it is {status}; only a draft, a parked or a queued brief waits, as a \
+                         started one no longer waits for anything"
                     )));
                 }
                 Err(bad) => return Err(refused(bad_status(&bad))),
@@ -379,7 +485,7 @@ pub(crate) fn amend(
     let resume = match file.status() {
         Ok(Status::Queued | Status::Started) => false,
         Ok(Status::Blocked) => true,
-        Ok(status @ (Status::Draft | Status::Reported | Status::Filed)) => {
+        Ok(status @ (Status::Draft | Status::Parked | Status::Reported | Status::Filed)) => {
             return Err(refused(format!(
                 "it is {status}, not queued, started or blocked"
             )));
@@ -420,6 +526,9 @@ pub(crate) fn report(
 pub enum Commits {
     /// `--no-commits`: the brief changed nothing in the repository.
     Skipped,
+    /// `--not-built`: the brief built nothing, as a premise failed; what
+    /// it closes is not resolved and stays.
+    NotBuilt,
     /// The commits reachable from `HEAD` of `repository` that carry the
     /// brief's trailer.
     Counted { count: usize, repository: PathBuf },
@@ -437,12 +546,15 @@ pub struct Filed {
     pub commits: Option<NonZeroUsize>,
     /// The backlog items whose files were deleted.
     pub closed: Vec<BacklogId>,
+    /// Filed with `--not-built`.
+    pub not_built: bool,
 }
 
 impl fmt::Display for Filed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "filed {} (", self.number)?;
         match self.commits {
+            None if self.not_built => f.write_str("not built")?,
             None => f.write_str("no commits")?,
             Some(n) if n.get() == 1 => f.write_str("1 commit")?,
             Some(n) => write!(f, "{n} commits")?,
@@ -480,8 +592,9 @@ pub(crate) fn file(
         Ok(status) => return Err(refused(format!("it is {status}, not reported"))),
         Err(bad) => return Err(refused(bad_status(&bad))),
     }
+    let not_built = *commits == Commits::NotBuilt;
     let commits = match commits {
-        Commits::Skipped => None,
+        Commits::Skipped | Commits::NotBuilt => None,
         Commits::Counted { count, repository } => {
             Some(NonZeroUsize::new(*count).ok_or_else(|| {
                 refused(format!(
@@ -506,8 +619,13 @@ pub(crate) fn file(
             word.escape_debug()
         ))
     })?;
+    // A brief not built resolved nothing: what it names stays, for the
+    // planner to add the premise that failed to (planner, 2026-11-26).
+    // `--no-commits` still closes them: a brief that changed nothing in
+    // the repository, an investigation, is done.
     let closed: Vec<BacklogId> = closes
         .into_iter()
+        .filter(|_| !not_built)
         .filter(|id| project.list(ListKind::Backlog).get(id.get()).is_some())
         .collect();
     for id in &closed {
@@ -523,6 +641,7 @@ pub(crate) fn file(
         number,
         commits,
         closed,
+        not_built,
     })
 }
 
@@ -1184,9 +1303,9 @@ mod tests {
         let mut project = project(&[], &items);
         for (path, text) in files {
             match BoardPath::parse(&format!("shop/{path}")) {
-                Some(BoardPath::Brief { name, filed, .. }) => project.briefs.push(BriefFile {
+                Some(BoardPath::Brief { name, place, .. }) => project.briefs.push(BriefFile {
                     name,
-                    filed,
+                    place,
                     brief: Brief::parse(text.as_bytes()),
                 }),
                 _ => panic!("{path} is no brief path"),
@@ -1304,12 +1423,18 @@ mod tests {
         let mut queue_one = |number: u32, closes: Option<&[BacklogId]>| {
             refused(queue(&mut shop, BriefId::new(number), closing(closes), now))
         };
-        assert_eq!(queue_one(1, None), "queue 1: it is queued, not draft");
+        assert_eq!(
+            queue_one(1, None),
+            "queue 1: it is queued, not draft or parked"
+        );
         assert_eq!(
             queue_one(2, None),
             "queue 2: 2 is on 2 files; fix the duplicate first"
         );
-        assert_eq!(queue_one(3, None), "queue 3: it is filed, not draft");
+        assert_eq!(
+            queue_one(3, None),
+            "queue 3: it is filed, not draft or parked"
+        );
         assert_eq!(queue_one(4, None), "queue 4: it has no `status:` line");
         assert_eq!(queue_one(5, None), "queue 5: its status `wip` is unknown");
         assert_eq!(queue_one(7, None), "queue 7: no such brief");

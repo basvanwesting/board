@@ -1304,7 +1304,7 @@ fn hand_edits_are_committed_and_a_misnamed_file_is_not() {
     assert_eq!(
         ran.stderr,
         "board: lint: proj/backlog/notes.md: not named as the board names its files \
-         (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is \
+         (briefs/[parked/|done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), so it is \
          not synced\n\
          board: lint: proj/briefs/128-x.md.local: unmerged local version of brief 128; \
          merge it by hand, then delete this file\n"

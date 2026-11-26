@@ -25,8 +25,8 @@ pub struct Finding {
 pub enum Problem {
     /// A brief number that another file of the project carries too.
     DuplicateBrief { number: BriefId, other: String },
-    /// A brief outside `briefs/done/` without a status a command can move on
-    /// from.
+    /// A brief outside `briefs/parked/` and `briefs/done/` without a status
+    /// a command can move on from.
     Status(BadStatus),
     /// The header's `id:` is not the number in the file name. The file name
     /// is the one the tool goes by.
@@ -104,7 +104,7 @@ impl fmt::Display for Problem {
             ),
             Problem::Wait(why) => write!(f, "after: {why}"),
             Problem::Misnamed => f.write_str(
-                "not named as the board names its files (briefs/[done/]<number>-<slug>.md, \
+                "not named as the board names its files (briefs/[parked/|done/]<number>-<slug>.md, \
                  chores/c<id>.md, backlog/b<id>.md), so it is not synced",
             ),
             Problem::LocalCopy(ItemId::Brief(number)) => write!(
@@ -119,8 +119,8 @@ impl fmt::Display for Problem {
     }
 }
 
-const OPEN_STATUSES: &str =
-    "a brief outside briefs/done/ is draft, queued, started, blocked or reported";
+const OPEN_STATUSES: &str = "a brief outside briefs/parked/ and briefs/done/ is draft, queued, \
+                             started, blocked or reported";
 
 /// Every finding of the project, in a fixed order: the chores and the
 /// backlog items by id, the briefs by number, the misnamed files, then the
@@ -273,9 +273,9 @@ mod tests {
 
     fn brief(path: &str, text: &str) -> BriefFile {
         match BoardPath::parse(&format!("shop/{path}")) {
-            Some(BoardPath::Brief { name, filed, .. }) => BriefFile {
+            Some(BoardPath::Brief { name, place, .. }) => BriefFile {
                 name,
-                filed,
+                place,
                 brief: Brief::parse(text.as_bytes()),
             },
             _ => panic!("{path} is no brief path"),
@@ -308,13 +308,13 @@ mod tests {
             lines(&project),
             [
                 "shop/briefs/2-b.md: no `status:` line; \
-                 a brief outside briefs/done/ is draft, queued, started, blocked or reported",
+                 a brief outside briefs/parked/ and briefs/done/ is draft, queued, started, blocked or reported",
                 "shop/briefs/3-c.md: unknown status `strated`; \
-                 a brief outside briefs/done/ is draft, queued, started, blocked or reported",
+                 a brief outside briefs/parked/ and briefs/done/ is draft, queued, started, blocked or reported",
                 "shop/briefs/4-d.md: unknown status `filed`; \
-                 a brief outside briefs/done/ is draft, queued, started, blocked or reported",
+                 a brief outside briefs/parked/ and briefs/done/ is draft, queued, started, blocked or reported",
                 "shop/briefs/5-e.md: unknown status ``; \
-                 a brief outside briefs/done/ is draft, queued, started, blocked or reported",
+                 a brief outside briefs/parked/ and briefs/done/ is draft, queued, started, blocked or reported",
             ]
         );
     }
@@ -381,7 +381,7 @@ mod tests {
             lines(&project),
             [
                 "shop/briefs/notes.md: not named as the board names its files \
-                 (briefs/[done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), \
+                 (briefs/[parked/|done/]<number>-<slug>.md, chores/c<id>.md, backlog/b<id>.md), \
                  so it is not synced"
             ]
         );
