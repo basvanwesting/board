@@ -42,10 +42,10 @@
 //!   more claimed briefs as `next` printed paths; the line `block`, `amend`
 //!   or `report` wrote is in its brief, and one they refused is in none; a
 //!   brief `file` printed is in `done/` there, without the items it says it
-//!   closed; after a move that no other write met, the item stands directly
-//!   before or after its target, in its group, in the listing where the
-//!   move was written, and a refused move named an id not there; a move
-//!   never needs the remote (no exit 3);
+//!   closed; an item named by a `group` write that no other write met
+//!   carries that group where the write was the last change, and a refused
+//!   `group` named an id not there; a `group` never needs the remote (no
+//!   exit 3);
 //! - convergence, at `Quiesce` and at the end: after `sync` on A, B and A,
 //!   both clones are on the remote's commit with nothing changed but the
 //!   copies and the misnamed files, which stay as they were; every token
@@ -117,13 +117,11 @@ enum Op {
     Done(Index),
     /// A backlog item of the clone or the remote, picked when the step runs.
     Drop(Index),
-    /// An item of the clone or the remote put before or after another of
-    /// its kind, both picked when the step runs.
-    Move {
-        backlog: bool,
-        item: Index,
-        target: Index,
-        after: bool,
+    /// Items of the clone or the remote, chores and backlog items mixed,
+    /// picked when the step runs, put into one of [`GROUPS`] by `group`.
+    Group {
+        items: Vec<(bool, Index)>,
+        name: u8,
     },
     /// An item's title or check changed by `retitle`, its token kept: its
     /// text, a chore's check, or both (a backlog item's text only).
@@ -185,9 +183,9 @@ enum Edit {
     BodyLine(Index),
     /// A line of an item's body deleted.
     DeleteBodyLine(Index),
-    /// An item's `order:` set to another number, or its `mark:`, a key the
+    /// An item's `group:` set to another name, or its `mark:`, a key the
     /// tool does not know, set to a fresh token.
-    Key { item: Index, order: bool },
+    Key { item: Index, group: bool },
     /// An item's file deleted.
     Delete(Index),
     /// A well-named item file with a body line, its id past every id
@@ -252,8 +250,8 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(backlog, item, replace, lines)| Op::Body { backlog, item, replace, lines }),
         2 => any::<Index>().prop_map(Op::Done),
         2 => any::<Index>().prop_map(Op::Drop),
-        3 => (any::<bool>(), any::<Index>(), any::<Index>(), any::<bool>())
-            .prop_map(|(backlog, item, target, after)| Op::Move { backlog, item, target, after }),
+        3 => (prop::collection::vec((any::<bool>(), any::<Index>()), 1..=3), 0..3u8)
+            .prop_map(|(items, name)| Op::Group { items, name }),
         1 => (any::<bool>(), any::<Index>(), any::<bool>(), any::<bool>())
             .prop_map(|(backlog, item, text, check)| Op::Retitle { backlog, item, text, check }),
         2 => Just(Op::NewBrief),
@@ -280,7 +278,7 @@ fn edit() -> impl Strategy<Value = Edit> {
     prop_oneof![
         2 => any::<Index>().prop_map(Edit::BodyLine),
         1 => any::<Index>().prop_map(Edit::DeleteBodyLine),
-        2 => (any::<Index>(), any::<bool>()).prop_map(|(item, order)| Edit::Key { item, order }),
+        2 => (any::<Index>(), any::<bool>()).prop_map(|(item, group)| Edit::Key { item, group }),
         2 => any::<Index>().prop_map(Edit::Delete),
         2 => any::<bool>().prop_map(|backlog| Edit::AddFile { backlog }),
         1 => any::<bool>().prop_map(|backlog| Edit::AddMisnamed { backlog }),
@@ -300,24 +298,16 @@ fn fault() -> impl Strategy<Value = Option<Fault>> {
     ]
 }
 
-/// A move and a write of the same item, one the step's command and the
+/// A `group` and a write of the same item, one the step's command and the
 /// other the other clone's run in its push's window: picked by one index
 /// from lists the two clones mostly share, so mostly the same item. Left
 /// to `fault()`, the two seldom meet on one item.
-fn met_move() -> impl Strategy<Value = (Op, Op)> {
-    (
-        any::<bool>(),
-        any::<Index>(),
-        any::<Index>(),
-        any::<bool>(),
-        0..3u8,
-    )
-        .prop_map(|(backlog, item, target, after, write)| {
-            let moving = Op::Move {
-                backlog,
-                item,
-                target,
-                after,
+fn met_group() -> impl Strategy<Value = (Op, Op)> {
+    (any::<bool>(), any::<Index>(), 0..3u8, any::<bool>(), 0..3u8).prop_map(
+        |(backlog, item, name, after, write)| {
+            let grouping = Op::Group {
+                items: vec![(backlog, item)],
+                name,
             };
             let writing = match write {
                 0 => Op::Body {
@@ -332,25 +322,24 @@ fn met_move() -> impl Strategy<Value = (Op, Op)> {
                     text: true,
                     check: after,
                 },
-                _ => Op::Move {
-                    backlog,
-                    item,
-                    target,
-                    after: !after,
+                _ => Op::Group {
+                    items: vec![(backlog, item)],
+                    name: (name + 1) % 3,
                 },
             };
             if after {
-                (moving, writing)
+                (grouping, writing)
             } else {
-                (writing, moving)
+                (writing, grouping)
             }
-        })
+        },
+    )
 }
 
 fn step() -> impl Strategy<Value = Step> {
     prop_oneof![
         10 => (who(), op(), fault()).prop_map(|(who, op, fault)| Step::Cmd { who, op, fault }),
-        1 => (who(), met_move()).prop_map(|(who, (op, window))| Step::Cmd {
+        1 => (who(), met_group()).prop_map(|(who, (op, window))| Step::Cmd {
             who,
             op,
             fault: Some(Fault::WindowOp(window)),
@@ -378,12 +367,12 @@ fn scene() -> impl Strategy<Value = Vec<Step>> {
         0..3u8,
         0..4u8,
         any::<bool>(),
-        any::<Index>(),
+        0..3u8,
     )
-        .prop_map(|(who, backlog, item, edit, write, flag, target)| {
+        .prop_map(|(who, backlog, item, edit, write, flag, name)| {
             let edit = match edit {
                 0 => Edit::BodyLine(item),
-                1 => Edit::Key { item, order: flag },
+                1 => Edit::Key { item, group: flag },
                 _ => Edit::Delete(item),
             };
             let write = match write {
@@ -399,11 +388,9 @@ fn scene() -> impl Strategy<Value = Vec<Step>> {
                     text: true,
                     check: flag,
                 },
-                2 => Op::Move {
-                    backlog,
-                    item,
-                    target,
-                    after: flag,
+                2 => Op::Group {
+                    items: vec![(backlog, item)],
+                    name,
                 },
                 _ if backlog => Op::Drop(item),
                 _ => Op::Done(item),
@@ -430,6 +417,10 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
     )
     .prop_map(|scenes| scenes.into_iter().flatten().collect())
 }
+
+/// The names `group` puts items under: two the chores are added to, so an
+/// item is at times there already, and one no add uses.
+const GROUPS: [&str; 3] = ["Home", "Work", "Later"];
 
 /// The item directories, with the prefix of their ids.
 const KINDS: [(&str, char); 2] = [("proj/chores", 'c'), ("proj/backlog", 'b')];
@@ -567,8 +558,6 @@ struct ItemSeen {
     token: String,
     title: String,
     group: Option<String>,
-    /// `None` for no `order:`, or one that is no number.
-    order: Option<i64>,
     check: Option<String>,
     /// The value of `mark:`, the key only hand edits write.
     mark: Option<String>,
@@ -623,35 +612,12 @@ fn item_seen(id: Id, bytes: Vec<u8>) -> ItemSeen {
             .to_owned(),
         title,
         group: key("group"),
-        order: key("order").and_then(|order| order.parse().ok()),
         check: key("check"),
         mark: key("mark"),
         body,
         odd,
         bytes,
     }
-}
-
-/// The ids of a kind's items in the board's order, each with its group:
-/// chores by group name (byte order), then `order`, ties by id; written out
-/// here rather than taken from the tool.
-fn listing(items: &BTreeMap<Id, ItemSeen>, prefix: char) -> Vec<(String, Id)> {
-    let mut listed: Vec<(String, i64, u32)> = items
-        .values()
-        .filter(|item| item.id.0 == prefix)
-        .map(|item| {
-            let group = match prefix {
-                'c' => item.group.clone().unwrap_or_default(),
-                _ => String::new(),
-            };
-            (group, item.order.unwrap_or(i64::MAX), item.id.1)
-        })
-        .collect();
-    listed.sort();
-    listed
-        .into_iter()
-        .map(|(group, _, number)| (group, (prefix, number)))
-        .collect()
 }
 
 /// A body's lines as stdin gives them to `--body` and `amend`.
@@ -729,8 +695,8 @@ enum Subject {
     /// the write as the oracle recorded it, when it knew the item.
     Body(Id, Vec<String>, bool, Option<usize>),
     Close(Id),
-    /// The item, whether it goes after the target, and the target.
-    Move(Id, bool, Id),
+    /// The items, each once, in the order given, and the group's name.
+    Group(Vec<Id>, String),
     /// The item, and what it holds once retitled: the start of its title,
     /// and a chore's check when one was given.
     Retitle(Id, String, Option<String>),
@@ -758,7 +724,7 @@ impl Subject {
             Subject::Add(..)
             | Subject::Body(..)
             | Subject::Close(_)
-            | Subject::Move(..)
+            | Subject::Group(..)
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
@@ -767,11 +733,11 @@ impl Subject {
         }
     }
 
-    /// The item whose file the command changes, and no other's but for a
-    /// renumbering.
-    fn item(&self) -> Option<Id> {
+    /// The items whose files the command changes.
+    fn items(&self) -> Vec<Id> {
         match self {
-            Subject::Body(id, ..) | Subject::Move(id, ..) | Subject::Retitle(id, ..) => Some(*id),
+            Subject::Body(id, ..) | Subject::Retitle(id, ..) => vec![*id],
+            Subject::Group(ids, _) => ids.clone(),
             Subject::Add(..)
             | Subject::Close(_)
             | Subject::NewBrief(_)
@@ -780,7 +746,7 @@ impl Subject {
             | Subject::Block(..)
             | Subject::Amend(..)
             | Subject::Report(..)
-            | Subject::File(..) => None,
+            | Subject::File(..) => Vec::new(),
         }
     }
 
@@ -791,7 +757,7 @@ impl Subject {
             Subject::File(_, closes) => closes.clone(),
             Subject::Add(..)
             | Subject::Body(..)
-            | Subject::Move(..)
+            | Subject::Group(..)
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
@@ -811,7 +777,7 @@ impl Subject {
             Subject::Block(..)
             | Subject::Add(..)
             | Subject::Close(_)
-            | Subject::Move(..)
+            | Subject::Group(..)
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
@@ -911,13 +877,16 @@ struct Depth {
     briefs_reported: u32,
     briefs_filed: u32,
     closed_by_file: u32,
-    items_moved: u32,
-    moves_not_pushed: u32,
-    /// A move and a write of the same item by the other clone, neither
+    /// Items a `group` run was judged to have put into its group.
+    items_grouped: u32,
+    groups_not_pushed: u32,
+    /// A `group` and a write of the same item by the other clone, neither
     /// knowing of the other: in one push's window, or met at a merge.
-    move_met: u32,
-    /// A move judged that put the item between two of its group.
-    moved_between: u32,
+    group_met: u32,
+    /// A `group` judged that put a chore and a backlog item into one group.
+    grouped_both_kinds: u32,
+    /// A `group` whose items were all in the group: nothing to commit.
+    grouped_nothing: u32,
     items_retitled: u32,
     /// `add … --body`, `amend`, `amend --replace` with lines and without,
     /// that succeeded.
@@ -967,10 +936,11 @@ impl Depth {
         self.briefs_reported += other.briefs_reported;
         self.briefs_filed += other.briefs_filed;
         self.closed_by_file += other.closed_by_file;
-        self.items_moved += other.items_moved;
-        self.moves_not_pushed += other.moves_not_pushed;
-        self.move_met += other.move_met;
-        self.moved_between += other.moved_between;
+        self.items_grouped += other.items_grouped;
+        self.groups_not_pushed += other.groups_not_pushed;
+        self.group_met += other.group_met;
+        self.grouped_both_kinds += other.grouped_both_kinds;
+        self.grouped_nothing += other.grouped_nothing;
         self.items_retitled += other.items_retitled;
         self.bodies_added += other.bodies_added;
         self.bodies_appended += other.bodies_appended;
@@ -1139,11 +1109,11 @@ struct Oracle<'w> {
     /// Per clone, the items it deleted and has not pushed, with the
     /// remote's file as it was then.
     deletes_pending: [BTreeMap<Id, Vec<u8>>; 2],
-    /// Per clone, the items it moved and has not pushed.
-    moves_pending: [BTreeSet<Id>; 2],
-    /// Per clone, the items the other clone moved and pushed since this
+    /// Per clone, the items it regrouped and has not pushed.
+    groups_pending: [BTreeSet<Id>; 2],
+    /// Per clone, the items the other clone regrouped and pushed since this
     /// one last pulled.
-    moves_unseen: [BTreeSet<Id>; 2],
+    groups_unseen: [BTreeSet<Id>; 2],
     /// Per clone, the item tokens it closed in this step.
     closed_in_step: [BTreeSet<String>; 2],
     /// Misnamed files made by hand: the clone, the path, the bytes.
@@ -1179,8 +1149,8 @@ impl<'w> Oracle<'w> {
             pending: Default::default(),
             pending_at_step: Default::default(),
             deletes_pending: Default::default(),
-            moves_pending: Default::default(),
-            moves_unseen: Default::default(),
+            groups_pending: Default::default(),
+            groups_unseen: Default::default(),
             closed_in_step: Default::default(),
             misnamed: Vec::new(),
             depth: Depth::default(),
@@ -1426,34 +1396,19 @@ impl<'w> Oracle<'w> {
                 let id = pick(self, 'b', index);
                 (owned(&["drop", &show(id)]), Subject::Close(id))
             }
-            Op::Move {
-                backlog,
-                item,
-                target,
-                after,
-            } => {
-                let prefix = if *backlog { 'b' } else { 'c' };
-                let item = pick(self, prefix, item);
-                // Another item, never the same one: that is a usage error,
-                // which the example tests have. Nothing else to pick: an id
-                // no item has, for a refusal.
-                let others: BTreeSet<u32> = self
-                    .ids_in(who.slot(), prefix)
-                    .into_iter()
-                    .chain(self.ids_in(2, prefix))
-                    .filter(|n| *n != item.1)
-                    .collect();
-                let others: Vec<u32> = others.into_iter().collect();
-                let target = if others.is_empty() {
-                    (prefix, 999_998)
-                } else {
-                    (prefix, *target.get(&others))
-                };
-                let side = if *after { "--after" } else { "--before" };
-                (
-                    owned(&["move", &show(item), side, &show(target)]),
-                    Subject::Move(item, *after, target),
-                )
+            Op::Group { items, name } => {
+                let mut ids: Vec<Id> = Vec::new();
+                for (backlog, index) in items {
+                    let id = pick(self, if *backlog { 'b' } else { 'c' }, index);
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                let name = GROUPS[usize::from(*name)].to_owned();
+                let mut args = owned(&["group"]);
+                args.extend(ids.iter().map(|id| show(*id)));
+                args.extend(["--to".to_owned(), name.clone()]);
+                (args, Subject::Group(ids, name))
             }
             Op::Retitle {
                 backlog,
@@ -1651,7 +1606,7 @@ impl<'w> Oracle<'w> {
                 let bytes = without_body_line(&item.bytes, token);
                 Some((Change::Write(item_path(item.id), bytes), effect))
             }
-            Edit::Key { item, order } => {
+            Edit::Key { item, group } => {
                 if items.is_empty() {
                     return None;
                 }
@@ -1659,11 +1614,10 @@ impl<'w> Oracle<'w> {
                 let token = self.token();
                 let mut effect = Effect::new(Hand::Key);
                 effect.changed = Some(item.id);
-                let bytes = if *order {
-                    // A number of the token's: mostly far from the tool's
-                    // thousands, so the item goes first, now and then next
-                    // to another one set so.
-                    with_key(&item.bytes, "order", token.trim_start_matches('t'))
+                let bytes = if *group {
+                    // A group no command names: the item leaves the ones
+                    // `group` puts it in.
+                    with_key(&item.bytes, "group", "Hand")
                 } else {
                     effect.writes.push((
                         item.token.clone(),
@@ -1698,10 +1652,9 @@ impl<'w> Oracle<'w> {
                 let n = seen.chain(typed).max().unwrap_or(0) + 100;
                 self.typed.insert(prefix, n);
                 let (token, line) = (self.token(), self.token());
-                let group = if *backlog { "" } else { "group: Home\n" };
                 let check = if *backlog { "" } else { "check: x\n" };
                 let bytes = format!(
-                    "id: {prefix}{n}\n{group}order: 500\n{check}{CREATED}\n\n# {token}\n\n- {line}\n"
+                    "id: {prefix}{n}\ngroup: Home\n{check}{CREATED}\n\n# {token}\n\n- {line}\n"
                 );
                 let mut effect = Effect::new(Hand::Add);
                 effect.added = Some(token.clone());
@@ -1897,10 +1850,10 @@ impl<'w> Oracle<'w> {
     /// A run of `who` got the remote's commits, and pushed all of its own
     /// if `pushed`.
     fn pulled(&mut self, who: Who, pushed: bool) {
-        self.moves_unseen[who.slot()].clear();
+        self.groups_unseen[who.slot()].clear();
         if pushed {
             self.pending[who.slot()].clear();
-            self.moves_pending[who.slot()].clear();
+            self.groups_pending[who.slot()].clear();
         }
     }
 
@@ -1953,8 +1906,7 @@ impl<'w> Oracle<'w> {
     /// For an op on an item when the clone and the remote have fewer than
     /// `wanted` of its kind, as mostly they do: the adds that bring them
     /// there, each judged as a command of its own. A second chore goes into
-    /// the other group, so that a move crosses one, and a third into that
-    /// group too, so that a move lands between two.
+    /// the other group, so that a `group` finds items in either.
     fn prepare_list(
         &mut self,
         who: Who,
@@ -2002,9 +1954,14 @@ impl<'w> Oracle<'w> {
             | Op::NewBrief
             | Op::Queue { .. }
             | Op::Next => return Ok(()),
-            // Three for a move: with two, every move puts the item first or
-            // last, and the order halfway between two is never judged.
-            Op::Move { backlog, .. } => return self.prepare_list(who, *backlog, 3),
+            Op::Group { items, .. } => {
+                for backlog in [false, true] {
+                    if items.iter().any(|(b, _)| *b == backlog) {
+                        self.prepare_list(who, backlog, 2)?;
+                    }
+                }
+                return Ok(());
+            }
             Op::Retitle { backlog, .. } | Op::Body { backlog, .. } => {
                 return self.prepare_list(who, *backlog, 2);
             }
@@ -2074,16 +2031,8 @@ impl<'w> Oracle<'w> {
                 window = Some(window_subject);
             }
             Some(Fault::WindowEdit(edit)) => {
-                // What the command writes: its item, or for a move any of
-                // its kind, which a renumbering writes.
-                let writes: Vec<Id> = match &subject {
-                    Subject::Move(item, ..) => [who.slot(), 2]
-                        .into_iter()
-                        .flat_map(|place| self.ids_in(place, item.0))
-                        .map(|n| (item.0, n))
-                        .collect(),
-                    other => other.item().into_iter().collect(),
-                };
+                // What the command writes: its items.
+                let writes: Vec<Id> = subject.items();
                 if let Some((change, effect)) = self.edit(who, edit, Some(&writes)) {
                     // git's fast-forward wrote such a file back once.
                     if let Some((id, _)) = &effect.deleted
@@ -2195,17 +2144,17 @@ impl<'w> Oracle<'w> {
             if window_run.code == Some(0) && run.code == Some(0) && run.stderr.contains("retry") {
                 self.depth.raced_in_the_window += 1;
             }
-            // One clone's move and the other's write of the same item, in
+            // One clone's `group` and the other's write of the same item, in
             // one push's window: the later runs again on the earlier.
-            let moved = matches!(&subject, Subject::Move(..))
-                || matches!(window_subject, Subject::Move(..));
-            if moved
+            let grouped = matches!(&subject, Subject::Group(..))
+                || matches!(window_subject, Subject::Group(..));
+            let window_items = window_subject.items();
+            if grouped
                 && window_run.code == Some(0)
                 && run.code == Some(0)
-                && subject.item().is_some()
-                && subject.item() == window_subject.item()
+                && subject.items().iter().any(|id| window_items.contains(id))
             {
-                self.depth.move_met += 1;
+                self.depth.group_met += 1;
             }
         }
         self.judge(who, &subject, &run, rejecting, fault, false)?;
@@ -2305,8 +2254,9 @@ impl<'w> Oracle<'w> {
                 );
                 self.depth.local_copies += 1;
                 let slot = who.slot();
-                if self.moves_pending[slot].contains(&id) || self.moves_unseen[slot].contains(&id) {
-                    self.depth.move_met += 1;
+                if self.groups_pending[slot].contains(&id) || self.groups_unseen[slot].contains(&id)
+                {
+                    self.depth.group_met += 1;
                 }
                 conflicts.push(id);
             } else if let Some(finding) = line.strip_prefix("board: lint: ") {
@@ -2361,7 +2311,7 @@ impl<'w> Oracle<'w> {
                         subject,
                         Subject::Close(_)
                             | Subject::Body(..)
-                            | Subject::Move(..)
+                            | Subject::Group(..)
                             | Subject::Retitle(..)
                             | Subject::Queue(_)
                             | Subject::File(..)
@@ -2395,16 +2345,14 @@ impl<'w> Oracle<'w> {
             Vec::new()
         };
         // Offline nothing is pushed, though a write that changed nothing (a
-        // move to where the item stands) has no commit to note as not pushed.
+        // `group` of items there already) has no commit to note as not
+        // pushed.
         let pushed = run.code == Some(0) && !offline && !run.stderr.contains("board: not pushed: ");
         if run.code == Some(0) && !offline {
             self.pulled(who, pushed);
         }
-        if run.code == Some(0)
-            && !pushed
-            && let Some(id) = subject.item()
-        {
-            self.pending[slot].insert(id);
+        if run.code == Some(0) && !pushed {
+            self.pending[slot].extend(subject.items());
         }
         // Another write of the step may delete the item after this run's
         // merge kept it: the other clone's in the window, or a file saved
@@ -2513,8 +2461,8 @@ impl<'w> Oracle<'w> {
                     Some(_) | None => self.maybe_closed.extend(token),
                 }
             }
-            Subject::Move(item, after, target) => {
-                self.judge_move(who, run, pushed, (*item, *after, *target), (fault, window))?;
+            Subject::Group(ids, name) => {
+                self.judge_group(who, run, pushed, (ids, name), (fault, window))?;
             }
             Subject::Retitle(id, start, check) => {
                 self.judge_retitle(
@@ -2646,7 +2594,7 @@ impl<'w> Oracle<'w> {
     }
 
     /// A `retitle` run: what it printed, and the item's new title and check
-    /// where the retitle was the last change, as for a move; refused only
+    /// where the retitle was the last change, as for a `group`; refused only
     /// for an id that is not there.
     fn judge_retitle(
         &mut self,
@@ -2705,88 +2653,89 @@ impl<'w> Oracle<'w> {
         })
     }
 
-    /// A `move` run: what it printed, and the item next to its target, in
-    /// the target's group, in the listing of the place it wrote to; refused
-    /// only for an id that is not there.
-    fn judge_move(
+    /// A `group` run: what it printed, and each item it named in the group
+    /// where the write was the last change; refused only for an id that is
+    /// not there.
+    fn judge_group(
         &mut self,
         who: Who,
         run: &Run,
         pushed: bool,
-        (item, after, target): (Id, bool, Id),
+        (ids, name): (&[Id], &str),
         (fault, window): (Option<&Fault>, bool),
     ) -> Result<(), TestCaseError> {
-        let side = if after { "after" } else { "before" };
         match run.code {
             Some(0) => {
-                prop_assert_eq!(
-                    &run.stdout,
-                    &format!("moved {} {side} {}\n", show(item), show(target))
-                );
-                self.depth.items_moved += 1;
-                if pushed {
-                    self.moves_unseen[who.other().slot()].insert(item);
+                // The ids it changed, in the order given: the ones that
+                // were not in the group, which the oracle cannot know when a
+                // merge came between.
+                let nothing = format!("nothing to group: all are under {name} already\n");
+                if run.stdout == nothing {
+                    self.depth.grouped_nothing += 1;
                 } else {
-                    self.depth.moves_not_pushed += 1;
-                    self.moves_pending[who.slot()].insert(item);
+                    let printed = run
+                        .stdout
+                        .strip_prefix("grouped ")
+                        .and_then(|rest| rest.strip_suffix(&format!(" under {name}\n")));
+                    let mut given = ids.iter().map(|id| show(*id));
+                    prop_assert!(
+                        printed.is_some_and(|printed| printed
+                            .split(' ')
+                            .all(|word| given.any(|id| id == word))),
+                        "{:?} for {:?} under {}",
+                        run,
+                        ids,
+                        name
+                    );
                 }
-                // Where the move was the last change: the remote when
+                let slot = who.slot();
+                for id in ids {
+                    if pushed {
+                        self.groups_unseen[who.other().slot()].insert(*id);
+                    } else {
+                        self.groups_pending[slot].insert(*id);
+                    }
+                }
+                if !pushed {
+                    self.depth.groups_not_pushed += 1;
+                }
+                // Where the write was the last change: the remote when
                 // pushed, else the clone. Not for a run in a window, which
                 // the step's own command comes after, nor where a file saved
-                // during a push that failed was merged in after the move.
+                // during a push that failed was merged in after it.
                 let saved_after = !pushed && matches!(fault, Some(Fault::WindowEdit(_)));
                 if !window && !saved_after {
-                    let place = if pushed { 2 } else { who.slot() };
-                    let listed = listing(&self.read(place).items, item.0);
-                    let at = |id: Id| listed.iter().position(|(_, listed)| *listed == id);
-                    let next_to = match (at(item), at(target)) {
-                        (Some(i), Some(t)) => {
-                            listed[i].0 == listed[t].0
-                                && if after { i == t + 1 } else { i + 1 == t }
-                        }
-                        _ => false,
-                    };
-                    let between = at(item).is_some_and(|i| {
-                        i > 0
-                            && i + 1 < listed.len()
-                            && listed[i - 1].0 == listed[i].0
-                            && listed[i + 1].0 == listed[i].0
-                    });
-                    if next_to && between {
-                        self.depth.moved_between += 1;
+                    let place = if pushed { 2 } else { slot };
+                    let snapshot = self.read(place);
+                    for id in ids {
+                        let item = snapshot.items.get(id);
+                        prop_assert!(
+                            item.is_some_and(|item| item.group.as_deref() == Some(name)),
+                            "{:?} in place {} is {:?} after {:?}",
+                            id,
+                            place,
+                            item,
+                            run
+                        );
+                        self.depth.items_grouped += 1;
                     }
-                    prop_assert!(
-                        next_to,
-                        "{:?} is not {} {:?} in place {}: {:?} after {:?}",
-                        item,
-                        side,
-                        target,
-                        place,
-                        listed,
-                        run
-                    );
+                    if ids.iter().any(|id| id.0 == 'c') && ids.iter().any(|id| id.0 == 'b') {
+                        self.depth.grouped_both_kinds += 1;
+                    }
                 }
             }
             Some(1) => {
                 let last = run.stderr.lines().last().unwrap_or_default();
-                prop_assert!(
-                    last.starts_with(&format!("board: move {}: ", show(item)))
+                let named = ids.iter().find(|id| {
+                    last.starts_with(&format!("board: group {}: ", show(**id)))
                         && (last.ends_with("no such chore")
-                            || last.ends_with("no such backlog item")),
-                    "{:?}",
-                    run
-                );
-                let here = self.ids_in(who.slot(), item.0);
-                prop_assert!(
-                    !here.contains(&item.1) || !here.contains(&target.1),
-                    "move refused with {:?} and {:?} in {:?}: {:?}",
-                    item,
-                    target,
-                    who,
-                    run
-                );
+                            || last.ends_with("no such backlog item"))
+                });
+                prop_assert!(named.is_some(), "{:?} for {:?}", run, ids);
+                let id = *named.expect("checked");
+                prop_assert!(!self.ids_in(who.slot(), id.0).contains(&id.1), "{:?}", run);
             }
-            // Killed: moved or not; a move closes nothing.
+            // Killed: regrouped or not; a `group` closes nothing.
             Some(_) | None => {}
         }
         Ok(())
@@ -3500,9 +3449,10 @@ fn the_traces_get_deep() {
     assert!(depth.briefs_reported > 0, "{depth:?}");
     assert!(depth.briefs_filed > 0, "{depth:?}");
     assert!(depth.closed_by_file > 0, "{depth:?}");
-    assert!(depth.items_moved > 0, "{depth:?}");
-    assert!(depth.move_met > 0, "{depth:?}");
-    assert!(depth.moved_between > 0, "{depth:?}");
+    assert!(depth.items_grouped > 0, "{depth:?}");
+    assert!(depth.group_met > 0, "{depth:?}");
+    assert!(depth.grouped_both_kinds > 0, "{depth:?}");
+    assert!(depth.grouped_nothing > 0, "{depth:?}");
     assert!(depth.items_retitled > 0, "{depth:?}");
     assert!(depth.bodies_added > 0, "{depth:?}");
     assert!(depth.bodies_appended > 0, "{depth:?}");
@@ -3686,68 +3636,52 @@ fn next_after_a_queue_whose_brief_was_saved_during_the_push() {
     assert!(depth.briefs_queued > 0, "{depth:?}");
 }
 
-/// `move` on a clone that is offline, both kinds, a chore into the other
-/// group; meanwhile the other clone adds an item and moves the same chore.
-/// At the sync the backlog move, which only A made, stands; the chore both
-/// clones moved keeps the remote's place, B's, and A's is its copy.
+/// `group` on a clone that is offline, both kinds, in two runs; meanwhile
+/// the other clone adds an item and regroups the same chore. At the sync
+/// the backlog item, which only A regrouped, is in A's group; the chore
+/// both clones regrouped keeps the remote's group, B's, and A's is its copy.
 #[test]
-fn a_move_made_offline_meets_the_remote_s() {
-    let moving = |backlog, after| Op::Move {
-        backlog,
-        item: first(),
-        target: first(),
-        after,
+fn a_group_made_offline_meets_the_remote_s() {
+    let grouping = |backlog, name| Op::Group {
+        items: vec![(backlog, first())],
+        name,
     };
     let (depth, world) = run_example_in(&[
-        // Three of each, as a move's preparation brings: none is needed
+        // Two of each, as a `group`'s preparation brings: none is needed
         // offline, where an add is refused.
         cmd(Who::A, Op::AddBacklog),
         cmd(Who::A, Op::AddBacklog),
-        cmd(Who::A, Op::AddBacklog),
         cmd(Who::A, Op::AddChore { group: true }),
-        cmd(Who::A, Op::AddChore { group: false }),
         cmd(Who::A, Op::AddChore { group: false }),
         Step::Sync { who: Who::B },
         Step::Net {
             who: Who::A,
             online: false,
         },
-        // b1 after b2, between it and b3; c1 after c2, out of Home into
-        // Work, between c2 and c3.
-        cmd(Who::A, moving(true, true)),
-        cmd(Who::A, moving(false, true)),
+        // b1 and c1 into Later.
+        cmd(Who::A, grouping(true, 2)),
+        cmd(Who::A, grouping(false, 2)),
         cmd(Who::B, Op::AddBacklog),
-        // c1 before c2: into Work as well, above it.
-        cmd(Who::B, moving(false, false)),
+        // c1 into Work.
+        cmd(Who::B, grouping(false, 1)),
         Step::Net {
             who: Who::A,
             online: true,
         },
     ]);
-    assert!(depth.moves_not_pushed >= 2, "{depth:?}");
-    assert!(depth.items_moved >= 3, "{depth:?}");
-    assert!(depth.move_met > 0, "{depth:?}");
-    assert!(depth.moved_between > 0, "{depth:?}");
+    assert!(depth.groups_not_pushed >= 2, "{depth:?}");
+    assert!(depth.items_grouped >= 3, "{depth:?}");
+    assert!(depth.group_met > 0, "{depth:?}");
     assert!(depth.local_copies > 0, "{depth:?}");
-    let remote: BTreeMap<Id, ItemSeen> = world
-        .remote_blobs("proj")
-        .into_iter()
-        .filter_map(|(path, bytes)| {
-            KINDS.iter().find_map(|(dir, prefix)| {
-                let name = path.strip_prefix(&format!("{dir}/"))?.strip_suffix(".md")?;
-                let id = id_of(*prefix, name)?;
-                Some((id, item_seen(id, bytes.clone())))
-            })
-        })
-        .collect();
-    let ids = |prefix| -> Vec<Id> {
-        listing(&remote, prefix)
-            .into_iter()
-            .map(|(_, id)| id)
-            .collect()
-    };
-    assert_eq!(ids('b'), [('b', 2), ('b', 1), ('b', 3), ('b', 4)]);
-    assert_eq!(ids('c'), [('c', 1), ('c', 2), ('c', 3)]);
+    let group = |file: &str, id: Id| item_seen(id, world.remote_file(file).unwrap()).group;
+    assert_eq!(
+        group("proj/backlog/b1.md", ('b', 1)).as_deref(),
+        Some("Later")
+    );
+    assert_eq!(
+        group("proj/chores/c1.md", ('c', 1)).as_deref(),
+        Some("Work")
+    );
     assert!(world.a().file("proj/chores/c1.md.local").is_some());
 }
 
@@ -3868,7 +3802,7 @@ fn a_delete_wins_over_an_edit_either_way_round() {
             who: Who::A,
             edit: Edit::Key {
                 item: first(),
-                order: false,
+                group: false,
             },
         },
         // B has b1 still, the remote b2 only: the second of the two.
@@ -3877,82 +3811,4 @@ fn a_delete_wins_over_an_edit_either_way_round() {
     ]);
     assert!(depth.delete_won >= 2, "{depth:?}");
     assert_eq!(depth.local_copies, 0, "{depth:?}");
-}
-
-/// A move into a gap with no integer left renumbers its kind in the move's
-/// commit: the orders set by hand to 4, 5, 6 become 1000, 2000, 3000. The
-/// random trace seldom gets there (about ten moves into one gap). B's hand
-/// edit of a renumbered neighbour then meets the renumbering like any other
-/// write of that file: the remote's stands, B's is its copy.
-#[test]
-fn a_move_into_a_full_gap_renumbers_the_kind() {
-    let world = World::new();
-    let mut oracle = Oracle::new(&world);
-    let order = |at| Edit::Key {
-        item: index_at(at, 3),
-        order: true,
-    };
-    let steps = [
-        cmd(Who::A, Op::AddBacklog),
-        cmd(Who::A, Op::AddBacklog),
-        cmd(Who::A, Op::AddBacklog),
-        Step::Sync { who: Who::B },
-        // Tokens t4, t5, t6: orders 4, 5, 6 for b1, b2, b3.
-        Step::HandEdit {
-            who: Who::A,
-            edit: order(0),
-        },
-        Step::HandEdit {
-            who: Who::A,
-            edit: order(1),
-        },
-        Step::HandEdit {
-            who: Who::A,
-            edit: order(2),
-        },
-        Step::HandEdit {
-            who: Who::B,
-            edit: Edit::BodyLine(index_at(1, 3)),
-        },
-        // b3 before b2: between 4 and 5, where no integer is.
-        cmd(
-            Who::A,
-            Op::Move {
-                backlog: true,
-                item: index_at(2, 3),
-                target: index_at(1, 2),
-                after: false,
-            },
-        ),
-    ];
-    for step in &steps {
-        if let Err(error) = oracle.step(step) {
-            panic!("{error}");
-        }
-    }
-    let order_of = |n: u32| {
-        let path = format!("proj/backlog/b{n}.md");
-        item_seen(('b', n), world.remote_file(&path).unwrap()).order
-    };
-    assert_eq!(
-        [order_of(1), order_of(3), order_of(2)],
-        [Some(1000), Some(2000), Some(3000)]
-    );
-    // One commit: the move's, with every file it renumbered.
-    assert_eq!(
-        world.remote_changed("main"),
-        [
-            "proj/backlog/b1.md",
-            "proj/backlog/b2.md",
-            "proj/backlog/b3.md"
-        ]
-    );
-    let run = [Step::Sync { who: Who::B }, Step::Quiesce]
-        .iter()
-        .try_for_each(|step| oracle.step(step));
-    if let Err(error) = run {
-        panic!("{error}");
-    }
-    assert!(oracle.depth.local_copies > 0, "{:?}", oracle.depth);
-    assert!(world.b().file("proj/backlog/b2.md.local").is_some());
 }

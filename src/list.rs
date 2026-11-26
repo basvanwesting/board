@@ -1,8 +1,8 @@
 //! The line grammar of the old list files (`chores.md`, `backlog.md`),
 //! kept for reading what they held: the ids ever used, counted from their
 //! history (`sync.rs`), and `migrate`'s conversion of a board to item files,
-//! which reads each line as the old writer wrote it. And the inputs the
-//! item commands share: a line of text, a move.
+//! which reads each line as the old writer wrote it. And the input the
+//! item commands share: a line of text.
 //!
 //! ```text
 //! line    = heading | item | text
@@ -15,7 +15,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::id::{ItemId, ListId, ListKind};
+use crate::id::{ItemId, ListKind};
 use crate::raw;
 
 /// What one line of a list file is. `content` is the line without its
@@ -194,115 +194,15 @@ pub enum FindError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdsExhausted;
 
-/// Which side of the other item `move` puts an item on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Before,
-    After,
-}
-
-impl fmt::Display for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Side::Before => "before",
-            Side::After => "after",
-        })
-    }
-}
-
-/// What `move` is asked: an item, and the other item of its list it goes
-/// next to. Two items of one list, so no file can be asked to hold an item
-/// of the other and no item is put next to itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Move {
-    item: ListId,
-    side: Side,
-    target: ListId,
-}
-
-impl Move {
-    pub fn new(item: ListId, side: Side, target: ListId) -> Result<Move, BadMove> {
-        if item.kind() != target.kind() {
-            Err(BadMove::OtherList { item, target })
-        } else if item == target {
-            Err(BadMove::Itself(item))
-        } else {
-            Ok(Move { item, side, target })
-        }
-    }
-
-    pub fn kind(&self) -> ListKind {
-        self.item.kind()
-    }
-
-    pub fn item(&self) -> ListId {
-        self.item
-    }
-
-    pub fn side(&self) -> Side {
-        self.side
-    }
-
-    pub fn target(&self) -> ListId {
-        self.target
-    }
-}
-
-/// As `move` prints it: `c12 before c3`.
-impl fmt::Display for Move {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}", self.item, self.side, self.target)
-    }
-}
-
-/// Why two ids make no [`Move`], whatever the files hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BadMove {
-    OtherList { item: ListId, target: ListId },
-    Itself(ListId),
-}
-
-impl fmt::Display for BadMove {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let what = |id: &ListId| match id.kind() {
-            ListKind::Chores => "a chore",
-            ListKind::Backlog => "a backlog item",
-        };
-        match self {
-            BadMove::OtherList { item, target } => write!(
-                f,
-                "{item} is {} and {target} {}; an item moves within its own list",
-                what(item),
-                what(target)
-            ),
-            BadMove::Itself(item) => write!(f, "{item} cannot go next to itself"),
-        }
-    }
-}
-
-impl std::error::Error for BadMove {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{BacklogId, ChoreId};
 
     const CHORES: ListKind = ListKind::Chores;
     const BACKLOG: ListKind = ListKind::Backlog;
 
     fn line(text: &str) -> Line {
         Line::new(text).unwrap()
-    }
-
-    fn list_id(kind: ListKind, number: u32) -> ListId {
-        match kind {
-            ListKind::Chores => ListId::Chore(ChoreId::new(number).unwrap()),
-            ListKind::Backlog => ListId::Backlog(BacklogId::new(number).unwrap()),
-        }
-    }
-
-    fn moving(kind: ListKind, item: u32, side: Side, target: u32) -> Move {
-        Move::new(list_id(kind, item), side, list_id(kind, target)).unwrap()
     }
 
     #[test]
@@ -415,30 +315,6 @@ mod tests {
         assert_eq!(Line::new(" \n "), Err(InvalidLine::Empty));
         assert_eq!(Line::new("a\nb"), Err(InvalidLine::LineBreak));
         assert_eq!(Line::new("a\rb"), Err(InvalidLine::LineBreak));
-    }
-
-    #[test]
-    fn two_ids_make_a_move_when_they_are_two_items_of_one_list() {
-        let (c1, c2, b1) = (list_id(CHORES, 1), list_id(CHORES, 2), list_id(BACKLOG, 1));
-        assert!(Move::new(c1, Side::Before, c2).is_ok());
-        let other = Move::new(c1, Side::After, b1).unwrap_err();
-        assert_eq!(
-            other,
-            BadMove::OtherList {
-                item: c1,
-                target: b1
-            }
-        );
-        assert_eq!(
-            other.to_string(),
-            "c1 is a chore and b1 a backlog item; an item moves within its own list"
-        );
-        let itself = Move::new(b1, Side::Before, b1).unwrap_err();
-        assert_eq!(itself.to_string(), "b1 cannot go next to itself");
-        assert_eq!(
-            moving(BACKLOG, 3, Side::After, 1).to_string(),
-            "b3 after b1"
-        );
     }
 
     #[test]

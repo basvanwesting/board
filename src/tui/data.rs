@@ -198,11 +198,8 @@ mod tests {
     fn a_kind_s_rows_are_ls_s_with_what_show_prints() {
         let mut project = Project::empty(ProjectName::parse("shop").unwrap());
         for (number, text) in [
-            (
-                1,
-                "id: c1\ngroup: home\norder: 1000\n\n# one\n\nmore of c1\n",
-            ),
-            (2, "id: c2\ngroup: away\norder: 1000\ncheck: z\n\n# two\n"),
+            (1, "id: c1\ngroup: home\n\n# one\n\nmore of c1\n"),
+            (2, "id: c2\ngroup: away\ncheck: z\n\n# two\n"),
         ] {
             project
                 .list_mut(ListKind::Chores)

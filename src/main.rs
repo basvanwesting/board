@@ -4,11 +4,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use board::{
-    BacklogId, Board, Body, BriefId, BriefRow, CheckChange, ChoreId, CommitCheck, EmptyText, Env,
-    Error, Exit, ItemId, Line, ListId, ListKind, ListRow, Move, NewChore, Shown, Side, Slug,
-    Snapshot, Text,
+    BacklogId, Board, Body, BriefId, BriefRow, CheckChange, ChoreId, CommitCheck, DEFAULT_GROUP,
+    EmptyText, Env, Error, Exit, ItemId, Line, ListId, ListKind, ListRow, NewBacklog, NewChore,
+    Shown, Slug, Snapshot, Text,
 };
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
 /// A file-based board for a planner/worker pair of coding agents and their
 /// user. Without a command: the board, as a TUI on a terminal.
@@ -107,7 +107,7 @@ enum Command {
         ids: Vec<BacklogId>,
     },
     /// Change a chore's or backlog item's title, a chore's check, or both.
-    /// Its id, place, reference, body and other keys stay
+    /// Its id, group, reference, body and other keys stay
     // The group alone would print `<TEXT|--check <CHECK>> <ID>`, as if
     // the text came first.
     #[command(
@@ -123,17 +123,19 @@ enum Command {
         #[arg(long)]
         check: Option<String>,
     },
-    /// Put a chore or a backlog item before or after another item of its
-    /// list; a chore goes into the group of that item
-    Move {
+    /// Put chores and backlog items into a group, in one commit: a new
+    /// name makes a new group, and one no item names is gone
+    Group {
         /// Like c12 or b41
-        id: ListId,
-        #[command(flatten)]
-        place: Place,
+        #[arg(required = true)]
+        ids: Vec<ListId>,
+        /// The group's name
+        #[arg(long, value_name = "NAME")]
+        to: Line,
     },
     /// Bring the board-data clone and the remote to the same commit
     Sync,
-    /// Convert the project's chores.md and backlog.md, the storage before item files, to a file per item, in one write; until then every other command is refused on the project
+    /// Convert the project's chores.md and backlog.md, the storage before item files, to a file per item, and bring the item files up to date (a `group:` line on each, no `order:`), in one write; while a list file is there every other command is refused on the project
     Migrate,
 }
 
@@ -153,7 +155,7 @@ enum AddItem {
     Chore {
         text: Line,
         /// The group it is listed under; a new name makes a new group
-        #[arg(long)]
+        #[arg(long, default_value = DEFAULT_GROUP)]
         group: Line,
         /// How to see that it is done, when the title does not show it
         #[arg(long)]
@@ -165,9 +167,12 @@ enum AddItem {
         #[arg(long)]
         body: bool,
     },
-    /// An item for later, below the others
+    /// An item for later, in a group
     Backlog {
         text: Line,
+        /// The group it is listed under; a new name makes a new group
+        #[arg(long, default_value = DEFAULT_GROUP)]
+        group: Line,
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
@@ -175,31 +180,6 @@ enum AddItem {
         #[arg(long)]
         body: bool,
     },
-}
-
-/// Where `move` puts the item: exactly one of the two.
-#[derive(Args)]
-#[group(required = true, multiple = false)]
-struct Place {
-    /// Directly above this item
-    #[arg(long, value_name = "ID")]
-    before: Option<ListId>,
-    /// Directly below this item
-    #[arg(long, value_name = "ID")]
-    after: Option<ListId>,
-}
-
-impl Place {
-    /// Two ids that make no move are wrong whatever the files hold, so they
-    /// are a usage error like `done b41`, before the board is read.
-    fn of(self, item: ListId) -> Result<Move, Error> {
-        let (side, target) = match (self.before, self.after) {
-            (Some(target), None) => (Side::Before, target),
-            (None, Some(target)) => (Side::After, target),
-            _ => unreachable!("clap takes exactly one of --before and --after"),
-        };
-        Move::new(item, side, target).map_err(|why| Error::Usage(format!("move {item}: {why}")))
-    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -323,11 +303,22 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
             body: stdin_body(body, "add chore")?,
         }),
         Some(Command::Add {
-            item: AddItem::Backlog { text, from, body },
-        }) => Run::AddBacklog(text, from, stdin_body(body, "add backlog")?),
+            item:
+                AddItem::Backlog {
+                    text,
+                    group,
+                    from,
+                    body,
+                },
+        }) => Run::AddBacklog(NewBacklog {
+            text,
+            group,
+            from,
+            body: stdin_body(body, "add backlog")?,
+        }),
         Some(Command::Done { ids }) => Run::Done(ids),
         Some(Command::Drop { ids }) => Run::Drop(ids),
-        Some(Command::Move { id, place }) => Run::Move(place.of(id)?),
+        Some(Command::Group { ids, to }) => Run::Group(ids, to),
         Some(Command::Retitle { id, text, check }) => retitle(id, text, check)?,
         Some(Command::Sync) => Run::Sync,
         Some(Command::Migrate) => Run::Migrate,
@@ -365,12 +356,10 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         }
         Run::File(id, check) => line(board.file(id, check)?.to_string()),
         Run::AddChore(new) => line(board.add_chore(&new)?.to_string()),
-        Run::AddBacklog(text, from, body) => {
-            line(board.add_backlog(&text, from, &body)?.to_string())
-        }
+        Run::AddBacklog(new) => line(board.add_backlog(&new)?.to_string()),
         Run::Done(ids) => line(board.done(&ids)?),
         Run::Drop(ids) => line(board.drop_items(&ids)?),
-        Run::Move(wanted) => line(board.move_item(&wanted)?),
+        Run::Group(ids, to) => line(board.group(&ids, &to)?),
         Run::Retitle(id, text, check) => line(board.retitle(id, text.as_ref(), check.as_ref())?),
         Run::Sync => {
             board.sync()?;
@@ -407,10 +396,10 @@ enum Run {
     Report(BriefId, Text),
     File(BriefId, CommitCheck),
     AddChore(NewChore),
-    AddBacklog(Line, Option<ItemId>, Body),
+    AddBacklog(NewBacklog),
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
-    Move(Move),
+    Group(Vec<ListId>, Line),
     Retitle(ListId, Option<Line>, Option<CheckChange>),
     Sync,
     Migrate,

@@ -198,8 +198,8 @@ impl FromStr for ItemId {
 }
 
 /// A chore's or a backlog item's id, where a command takes either but no
-/// brief (`move`: briefs have no order of their own, the board ranks them by
-/// status).
+/// brief (`group`, `retitle`: a brief has neither a group nor a title line
+/// the tool rewrites).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ListId {
     Chore(ChoreId),

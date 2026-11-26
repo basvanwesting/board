@@ -1131,7 +1131,7 @@ mod tests {
             fs::create_dir_all(data.join("shop/backlog")).unwrap();
             fs::write(
                 data.join("shop/backlog/b1.md"),
-                format!("id: b1\norder: 1000\ncreated: x\n\n# {line}\n"),
+                format!("id: b1\ngroup: Default\ncreated: x\n\n# {line}\n"),
             )
             .unwrap();
             let waits = RefCell::new(Vec::new());

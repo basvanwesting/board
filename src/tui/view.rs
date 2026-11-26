@@ -12,7 +12,7 @@ use super::state::{Panel, Row, Source, State, Tab};
 use crate::board::Shown;
 use crate::brief::Status;
 
-const HELP: [(&str, &str); 21] = [
+const HELP: [(&str, &str); 20] = [
     ("j k", "down, up"),
     ("wheel", "down, up, as j k"),
     ("gg G", "first, last"),
@@ -25,10 +25,6 @@ const HELP: [(&str, &str); 21] = [
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
     ("d", "done: delete the chore, asked first (y/n)"),
     ("x", "drop: delete the backlog item, asked first (y/n)"),
-    (
-        "J K",
-        "move the item down, up; sent at the next key but Esc",
-    ),
     ("e", "edit the brief, or the list at the item, in $EDITOR"),
     ("r", "sync: commit hand edits, fetch, push"),
     ("y Y yy", "yank the id, the line, the whole item"),
@@ -76,7 +72,7 @@ fn block(focused: bool) -> Block<'static> {
 // a light and a dark theme alike (SPEC.md, TUI).
 
 /// An item's id, in its panel and in the preview's title. Green is focus,
-/// yellow the filter and a pending move, red an error.
+/// yellow the filter, red an error.
 pub(super) fn id_style() -> Style {
     Style::new().fg(Color::Cyan)
 }
@@ -200,37 +196,23 @@ fn draw_panel(frame: &mut Frame, state: &State, panel: Panel, area: Rect) {
             .take(inner_height(area))
             .map(|(at, row)| {
                 let marker = if cursor == Some(at) { "▶" } else { " " };
-                // Where a move puts it, before the file has it: yellow as a
-                // whole, so its id and status are not coloured.
-                let pending = state.pending(source, row);
                 let mut spans = vec![Span::raw(marker)];
-                if pending {
-                    spans.push(Span::raw(row.text.clone()));
-                } else {
-                    spans.extend(row_spans(row, source));
-                }
+                spans.extend(row_spans(row, source));
                 if let Some(since) = row.since {
                     let age = age(now.unix().saturating_sub(since.unix()));
                     let used = Line::from(spans.clone()).width() + age.chars().count();
                     spans.push(Span::raw(" ".repeat(width.saturating_sub(used).max(2))));
-                    spans.push(if pending {
-                        Span::raw(age)
-                    } else {
-                        Span::styled(age, Style::new().add_modifier(Modifier::DIM))
-                    });
+                    spans.push(Span::styled(age, Style::new().add_modifier(Modifier::DIM)));
                 }
                 // On the cursor's row the id and status keep their colour
                 // inside the reverse video, as LazyGit's selected line does.
-                let mut style = if row.key.is_none() {
+                let style = if row.key.is_none() {
                     Style::new().add_modifier(Modifier::BOLD)
                 } else if cursor == Some(at) && focused {
                     Style::new().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::new()
                 };
-                if pending {
-                    style = style.fg(Color::Yellow).add_modifier(Modifier::ITALIC);
-                }
                 Line::from(spans).style(style)
             })
             .collect()
@@ -349,15 +331,13 @@ fn draw_status(frame: &mut Frame, state: &State, area: Rect) {
         "Enter keep  Esc clear "
     } else if state.help() {
         "Esc close  q quit "
-    } else if state.moving().is_some() {
-        "J/K move  any key but Esc sends it "
     } else if state.in_preview() {
         "j/k scroll  h back  ? help "
     } else {
         match state.focus() {
             Panel::Briefs => "e edit  y yank  / filter  ? help ",
-            Panel::Chores => "d done  J/K move  e edit  ? help ",
-            Panel::Backlog => "x drop  J/K move  e edit  ? help ",
+            Panel::Chores => "d done  e edit  y yank  ? help ",
+            Panel::Backlog => "x drop  e edit  y yank  ? help ",
         }
     };
     let left = Line::from(left);
@@ -462,7 +442,10 @@ mod tests {
             ),
             backlog: ListLine::numbered(
                 ListKind::Backlog,
-                vec![ListRow::Item(b"b41 Cache the prices  (from 126)".to_vec())],
+                vec![
+                    ListRow::Group(b"Default".to_vec()),
+                    ListRow::Item(b"b41 Cache the prices  (from 126)".to_vec()),
+                ],
             ),
         }
     }
@@ -645,40 +628,77 @@ mod tests {
         assert!(!line.contains('…'), "{line}");
     }
 
+    /// `J` and `K` are gone with the order of chores and backlog items:
+    /// pressed before a key that used to end their run (`j`, `r`), they
+    /// send nothing, and the screen, its colours too, is what the key alone
+    /// gives. The key after, not the press alone: a run's move went out
+    /// with the next key.
     #[test]
-    fn a_moved_row_shows_where_it_goes_and_that_it_is_pending() {
-        let mut two = data();
-        two.backlog = ListLine::numbered(
-            ListKind::Backlog,
-            vec![
-                ListRow::Item(b"b41 Cache the prices".to_vec()),
-                ListRow::Item(b"b42 Drop the old api".to_vec()),
-            ],
-        );
-        let (state, _) = state(100, 14).step(Event::Loaded(Box::new(two)));
-        let moved = press(state, "3J");
-        let size = moved.areas().status;
-        let mut terminal = Terminal::new(TestBackend::new(size.width, size.y + 1)).unwrap();
-        terminal.draw(|frame| draw(frame, &moved)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let row = |id: &str| {
-            (0..size.y)
-                .find(|y| {
-                    (0..size.width)
-                        .map(|x| buffer[(x, *y)].symbol())
-                        .collect::<String>()
-                        .contains(id)
-                })
-                .unwrap()
+    fn j_and_k_upper_case_do_nothing() {
+        for panel in ["2", "3"] {
+            for (upper, key) in [('J', 'j'), ('K', 'j'), ('J', 'r'), ('K', 'r')] {
+                let start = press(mouse_state(100, 16), panel);
+                let step = |state: State, key: char| state.step(Event::Key(Key::Char(key)));
+                let (pressed, none) = step(start.clone(), upper);
+                assert_eq!(none, Vec::<Command>::new());
+                let (after, commands) = step(pressed, key);
+                let (want, want_commands) = step(start, key);
+                assert_eq!(commands, want_commands, "{upper}{key}");
+                assert!(
+                    commands
+                        .iter()
+                        .all(|command| *command == Command::Run(Action::Sync)),
+                    "{commands:?}"
+                );
+                assert_eq!(cells(&after), cells(&want), "{upper}{key} in {panel}");
+            }
+        }
+    }
+
+    /// Both lists by group, then by id as a number, on the screen as in
+    /// `ls`: `c9` before `c10` although their old order keys say the other
+    /// way round.
+    #[test]
+    fn the_panels_list_by_group_then_by_id() {
+        let mut project = crate::project::Project::empty(ProjectName::parse("shop").unwrap());
+        for (kind, p) in [(ListKind::Chores, 'c'), (ListKind::Backlog, 'b')] {
+            for (number, text) in [
+                (
+                    10,
+                    format!("id: {p}10\ngroup: Home\norder: 1000\n\n# ten\n"),
+                ),
+                (9, format!("id: {p}9\ngroup: Home\norder: 2000\n\n# nine\n")),
+                (2, format!("id: {p}2\ngroup: Away\n\n# two\n")),
+            ] {
+                project
+                    .list_mut(kind)
+                    .insert(number, crate::item::Item::parse(text.as_bytes()));
+            }
+        }
+        let data = Data::of(&project);
+        let (state, _) = State::new(data, 60, 30, Stamp::from_unix(NOW).unwrap());
+        let lines = screen(&state);
+        let panel = |title: &str| -> Vec<String> {
+            let top = lines.iter().position(|line| line.contains(title)).unwrap();
+            lines[top + 1..]
+                .iter()
+                .take_while(|line| !line.starts_with('╰'))
+                .map(|line| line.split('│').nth(1).unwrap().trim_end().to_owned())
+                .collect()
         };
-        // In the panel: the cursor's row, and the other one's.
-        let (moved_row, other_row) = (row("│▶b41"), row("│ b42"));
-        assert_eq!(moved_row, other_row + 1);
-        assert_eq!(buffer[(2, moved_row)].fg, Color::Yellow);
-        // The other row's id is cyan: the pending row is yellow as a whole.
-        assert_eq!(buffer[(3, moved_row)].fg, Color::Yellow);
-        assert_eq!(buffer[(2, other_row)].fg, Color::Cyan);
-        assert!(screen(&moved)[13].ends_with("J/K move  any key but Esc sends it"));
+        for (title, p) in [("Chores", 'c'), ("Backlog", 'b')] {
+            assert_eq!(
+                panel(title),
+                [
+                    " ## Away".to_owned(),
+                    format!("▶{p}2 two"),
+                    " ## Home".to_owned(),
+                    format!(" {p}9 nine"),
+                    format!(" {p}10 ten"),
+                ],
+                "{title}"
+            );
+        }
     }
 
     /// The state drawn, to read the cells' styles.
@@ -929,9 +949,9 @@ mod tests {
         for (number, text) in [
             (
                 41,
-                "id: b41\norder: 1\n\n# Cache the prices\n\nwhy: slow\n\n- a list\n  - nested\n",
+                "id: b41\ngroup: Default\n\n# Cache the prices\n\nwhy: slow\n\n- a list\n  - nested\n",
             ),
-            (42, "id: b42\norder: 2\n\n# plain\n"),
+            (42, "id: b42\ngroup: Default\n\n# plain\n"),
         ] {
             project
                 .list_mut(ListKind::Backlog)
@@ -988,8 +1008,8 @@ mod tests {
         );
         data.backlog = ListLine::numbered(
             ListKind::Backlog,
-            (1..=12)
-                .map(|n| ListRow::Item(format!("b{n} item {n}").into_bytes()))
+            std::iter::once(ListRow::Group(b"Default".to_vec()))
+                .chain((1..=12).map(|n| ListRow::Item(format!("b{n} item {n}").into_bytes())))
                 .collect(),
         );
         data
@@ -1068,12 +1088,12 @@ mod tests {
     fn a_click_on_a_row_selects_its_item_and_no_other() {
         let state = press(mouse_state(100, 16), "3");
         assert_eq!(on(&state), on_row(Panel::Backlog, "b1 item 1"));
-        // Row 10 is the fourth item row: b4.
-        let state = clicked(state, 5, 10);
+        // Row 11 is the fourth item row, under the heading on row 7: b4.
+        let state = clicked(state, 5, 11);
         assert_eq!(on(&state), on_row(Panel::Backlog, "b4 item 4"));
         // Scrolled to the end: b6 to b12 on rows 7-13.
         let state = press(state, "G");
-        assert_eq!(state.offset(state.source()), 5);
+        assert_eq!(state.offset(state.source()), 6);
         let state = clicked(state, 5, 7);
         assert_eq!(on(&state), on_row(Panel::Backlog, "b6 item 6"));
         let state = clicked(state, 5, 13);
@@ -1154,18 +1174,19 @@ mod tests {
             on_row(Panel::Chores, "c13 Renew the cert. Check: it expires later")
         );
         // Chores focused: Briefs 0-3, Chores 4-17, Backlog 18-22; its rows
-        // on 5-9, c14 on row 9; backlog's b1 to b3 on rows 19-21.
+        // on 5-9, c14 on row 9; backlog's heading, b1 and b2 on rows 19-21.
         let state = clicked(state, 5, 9);
         assert_eq!(
             on(&state),
             on_row(Panel::Chores, "c14 Water the plants. Check: wet soil")
         );
         let state = clicked(state, 5, 21);
-        assert_eq!(on(&state), on_row(Panel::Backlog, "b3 item 3"));
-        // Backlog focused: Briefs 0-3, Chores 4-8, Backlog 9-22; b1 on 10.
-        let state = clicked(state, 35, 12);
-        assert_eq!(on(&state), on_row(Panel::Backlog, "b3 item 3"));
-        let state = clicked(state, 1, 10);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b2 item 2"));
+        // Backlog focused: Briefs 0-3, Chores 4-8, Backlog 9-22; the
+        // heading on 10, b1 on 11.
+        let state = clicked(state, 35, 13);
+        assert_eq!(on(&state), on_row(Panel::Backlog, "b2 item 2"));
+        let state = clicked(state, 1, 11);
         assert_eq!(on(&state), on_row(Panel::Backlog, "b1 item 1"));
         // Column 36 is the preview's border.
         let state = clicked(state, 36, 12);
@@ -1223,24 +1244,12 @@ mod tests {
     }
 
     #[test]
-    fn a_click_clears_a_pending_g_and_ends_a_run() {
+    fn a_click_clears_a_pending_g() {
         // `g`, a click, `g`: no `gg`.
         let state = press(mouse_state(100, 16), "3Gg");
         let state = clicked(state, 5, 15);
         let state = press(state, "g");
         assert_eq!(on(&state), on_row(Panel::Backlog, "b12 item 12"));
-        // A run of `J` ended by a click, as by an unrelated key: its move
-        // first, then the click.
-        let state = press(mouse_state(100, 16), "3J");
-        let (state, commands) = click(state, 5, 9);
-        assert!(state.moving().is_none());
-        assert_eq!(commands.len(), 1, "{commands:?}");
-        assert!(
-            matches!(&commands[0], Command::Run(Action::Move(wanted)) if (wanted.item().get(), wanted.side(), wanted.target().get()) == (1, crate::list::Side::Before, 3)),
-            "{commands:?}"
-        );
-        // Row 9 is the third row: b2, b1, b3 as the run left them.
-        assert_eq!(on(&state), on_row(Panel::Backlog, "b3 item 3"));
     }
 
     #[test]

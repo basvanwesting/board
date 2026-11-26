@@ -62,9 +62,30 @@ fn the_old_writers_lists_become_item_files_that_show_as_before() {
     assert_eq!(world.remote_file("proj/backlog.md"), None);
     assert_eq!(a.status(), "");
 
-    // `ls`: the same text (the groups already stand in byte order here).
+    // `ls`: the same lines, by id within a group now (the old tool listed
+    // by the order its `move`s left), and the backlog under `Default`.
     let ls = a.board(&["ls", "chores"]).ok() + &a.board(&["ls", "backlog"]).ok();
-    assert_eq!(ls, OLD_LS);
+    assert_eq!(
+        ls,
+        "## Home\n\
+         c1 Water the plants. Check: the soil is damp\n\
+         c5 Sweep the porch. Check: no leaves\n\
+         c6 Call the plumber\n\
+         ## Work\n\
+         c2 Rotate the key. Check: login works: run it. Done.  (126)\n\
+         c3 Ship it! Check: deployed  (c7)\n\
+         c4 Is it up? Check: status page: green\n\
+         ## Default\n\
+         b1 Search by tag  (from 126)\n\
+         b2 Export as CSV.  (from b41)\n\
+         b3 Dark mode?\n\
+         b4 A plain idea  (from c3)\n"
+    );
+    let mut new: Vec<&str> = ls.lines().filter(|l| *l != "## Default").collect();
+    let mut old: Vec<&str> = OLD_LS.lines().collect();
+    new.sort_unstable();
+    old.sort_unstable();
+    assert_eq!(new, old);
 
     // `show`: the same, but for the body: the old one printed it as stored,
     // indented, the new one after a blank line, as the file has it.
@@ -87,34 +108,34 @@ fn the_old_writers_lists_become_item_files_that_show_as_before() {
     }
 
     // The files, as the new tool writes them: a title without the join's
-    // full stop, the check and the reference as keys, order by the file.
+    // full stop, the check and the reference as keys, no order key.
     assert_eq!(
         stamped(world.remote_file("proj/chores/c2.md")),
-        "id: c2\ngroup: Work\norder: 1000\ncheck: login works: run it. Done.\nfrom: 126\n\
+        "id: c2\ngroup: Work\ncheck: login works: run it. Done.\nfrom: 126\n\
          created: <now>\n\n# Rotate the key\n\n\
          Steps:\n  - open the valve\n    - slowly\nthen close it\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/chores/c1.md")),
-        "id: c1\ngroup: Home\norder: 2000\ncheck: the soil is damp\ncreated: <now>\n\n\
+        "id: c1\ngroup: Home\ncheck: the soil is damp\ncreated: <now>\n\n\
          # Water the plants\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/chores/c3.md")),
-        "id: c3\ngroup: Work\norder: 2000\ncheck: deployed\nfrom: c7\ncreated: <now>\n\n\
+        "id: c3\ngroup: Work\ncheck: deployed\nfrom: c7\ncreated: <now>\n\n\
          # Ship it!\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/chores/c6.md")),
-        "id: c6\ngroup: Home\norder: 3000\ncreated: <now>\n\n# Call the plumber\n"
+        "id: c6\ngroup: Home\ncreated: <now>\n\n# Call the plumber\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b4.md")),
-        "id: b4\norder: 1000\nfrom: c3\ncreated: <now>\n\n# A plain idea\n"
+        "id: b4\ngroup: Default\nfrom: c3\ncreated: <now>\n\n# A plain idea\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b2.md")),
-        "id: b2\norder: 3000\nfrom: b41\ncreated: <now>\n\n# Export as CSV.\n\n\
+        "id: b2\ngroup: Default\nfrom: b41\ncreated: <now>\n\n# Export as CSV.\n\n\
          Why: hard to find.\n  indented once\n"
     );
     assert_eq!(a.board(&["lint"]).ok(), "ok\n");
@@ -133,7 +154,7 @@ fn a_project_without_lists_has_nothing_to_migrate() {
 /// Each line the conversion cannot place: named, and nothing written.
 #[test]
 fn a_line_it_cannot_place_is_named_and_nothing_is_converted() {
-    let item = "id: c1\ngroup: Home\norder: 1000\ncreated: x\n\n# Here already\n";
+    let item = "id: c1\ngroup: Home\ncreated: x\n\n# Here already\n";
     for (file, list, existing, why) in [
         (
             "chores.md",
@@ -228,7 +249,7 @@ fn a_project_with_a_list_file_takes_only_migrate() {
         &["add", "chore", "x", "--group", "Home"],
         &["done", "c1"],
         &["drop", "b1"],
-        &["move", "b1", "--before", "b4"],
+        &["group", "b1", "--to", "Later"],
         &["retitle", "b1", "y"],
         &["new", "brief", "a-brief"],
         &["next"],
@@ -281,7 +302,7 @@ fn a_list_that_comes_in_with_the_merge_is_refused_too() {
     );
     assert_eq!(
         a.board(&["ls", "backlog"]).ok(),
-        "b1 one\nb7 from an old machine\n"
+        "## Default\nb1 one\nb7 from an old machine\n"
     );
 }
 
@@ -353,7 +374,7 @@ fn a_list_changed_offline_before_the_migration_is_kept() {
 }
 
 /// `migrate` in a project that has item files already: the list's items
-/// go after the group's, and the existing files stay as they are.
+/// join them, and the existing files that need nothing stay as they are.
 #[test]
 fn migrate_folds_a_list_into_the_item_files_there() {
     let world = World::new();
@@ -378,8 +399,130 @@ fn migrate_folds_a_list_into_the_item_files_there() {
     );
     assert_eq!(
         a.board(&["ls", "backlog"]).ok(),
-        "b1 one\nb4 four\nb3 three\n"
+        "## Default\nb1 one\nb3 three\nb4 four\n"
     );
+}
+
+/// Item files of an older version of this tool: `migrate` gives each item
+/// without a `group:` line `group: Default`, right after `id:`, and takes
+/// out every header `order:` line, in one commit; nothing else of a file
+/// changes, its body neither, and a file that needs nothing is not in the
+/// commit. Run again, it has nothing to do.
+#[test]
+fn migrate_brings_item_files_up_to_date() {
+    let world = World::new();
+    let a = world.a();
+    let files = [
+        // A chore and a backlog item without a group.
+        (
+            "proj/chores/c1.md",
+            "id: c1\norder: 1000\nfrom: 126\ncreated: x\n\n# Water\n",
+        ),
+        (
+            "proj/backlog/b1.md",
+            "id: b1\nfrom: c1\norder: 2000\ncreated: x\n\n# Dark mode\n",
+        ),
+        // A group, a key the tool does not know, a body with key-like lines.
+        (
+            "proj/backlog/b2.md",
+            "id: b2\ngroup: Later\norder: 3000\nowner: me\ncreated: x\n\n# Search\n\n\
+             order: 3\ngroup: x\n",
+        ),
+        // An empty group: rewritten in its place.
+        (
+            "proj/chores/c3.md",
+            "id: c3\nfrom: 126\ngroup:\ncreated: x\n\n# Empty\n",
+        ),
+        // Nothing to do.
+        (
+            "proj/chores/c2.md",
+            "id: c2\ngroup: Home\ncreated: x\n\n# Sweep\n",
+        ),
+    ];
+    for (file, text) in files {
+        a.write(file, text);
+    }
+    a.commit_and_push("by an older version");
+    let commits = world.remote_log().len();
+    assert_eq!(a.board(&["migrate"]).ok(), "updated 4 item files\n");
+    assert_eq!(world.remote_log().len(), commits + 1);
+    assert_eq!(world.remote_log()[0], "proj: updated 4 item files");
+    let mut changed = world.remote_changed("main");
+    changed.sort();
+    assert_eq!(
+        changed,
+        [
+            "proj/backlog/b1.md",
+            "proj/backlog/b2.md",
+            "proj/chores/c1.md",
+            "proj/chores/c3.md"
+        ]
+    );
+    let after = |file: &str| text(world.remote_file(file));
+    // An empty `group:` is rewritten where it stands.
+    assert_eq!(
+        after("proj/chores/c3.md"),
+        "id: c3\nfrom: 126\ngroup: Default\ncreated: x\n\n# Empty\n"
+    );
+    assert_eq!(
+        after("proj/chores/c1.md"),
+        "id: c1\ngroup: Default\nfrom: 126\ncreated: x\n\n# Water\n"
+    );
+    assert_eq!(
+        after("proj/backlog/b1.md"),
+        "id: b1\ngroup: Default\nfrom: c1\ncreated: x\n\n# Dark mode\n"
+    );
+    assert_eq!(
+        after("proj/backlog/b2.md"),
+        "id: b2\ngroup: Later\nowner: me\ncreated: x\n\n# Search\n\norder: 3\ngroup: x\n"
+    );
+    assert_eq!(after("proj/chores/c2.md"), files[4].1);
+    assert_eq!(a.board(&["lint"]).ok(), "ok\n");
+    let before = world.remote_main();
+    assert_eq!(a.board(&["migrate"]).ok(), "nothing to migrate\n");
+    assert_eq!(world.remote_main(), before);
+    assert_eq!(a.main(), before);
+}
+
+/// Lists and item files that need it: one commit does both.
+#[test]
+fn migrate_converts_the_lists_and_updates_the_item_files_in_one_commit() {
+    let world = World::new();
+    let a = world.a();
+    a.write(
+        "proj/backlog/b1.md",
+        "id: b1\norder: 1000\ncreated: x\n\n# one\n",
+    );
+    a.write("proj/chores.md", "## Home\n- c2 Two. Check: x\n");
+    a.write("proj/backlog.md", "- b3 three\n");
+    a.commit_and_push("both kinds");
+    let commits = world.remote_log().len();
+    assert_eq!(
+        a.board(&["migrate"]).ok(),
+        "migrated 1 chore, 1 backlog item; updated 1 item file\n"
+    );
+    assert_eq!(world.remote_log().len(), commits + 1);
+    let mut changed = world.remote_changed("main");
+    changed.sort();
+    assert_eq!(
+        changed,
+        [
+            "proj/backlog.md",
+            "proj/backlog/b1.md",
+            "proj/backlog/b3.md",
+            "proj/chores.md",
+            "proj/chores/c2.md"
+        ]
+    );
+    assert_eq!(
+        text(world.remote_file("proj/backlog/b1.md")),
+        "id: b1\ngroup: Default\ncreated: x\n\n# one\n"
+    );
+    assert_eq!(
+        stamped(world.remote_file("proj/backlog/b3.md")),
+        "id: b3\ngroup: Default\ncreated: <now>\n\n# three\n"
+    );
+    assert_eq!(a.board(&["migrate"]).ok(), "nothing to migrate\n");
 }
 
 /// The refusal is the project's: a write in another project of the clone

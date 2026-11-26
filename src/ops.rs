@@ -13,8 +13,8 @@ use crate::brief::{
 use crate::error::Error;
 use crate::git::Oid;
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
-use crate::item::{self, Body, Item, MoveError};
-use crate::list::{FindError, Line, Move};
+use crate::item::{self, Body, Item};
+use crate::list::{FindError, Line};
 use crate::project::{BoardPath, BriefFile, BriefName, Project, Slug};
 
 /// The sections a brief needs text in before it is queued: what the worker
@@ -391,6 +391,16 @@ pub struct NewChore {
     pub body: Body,
 }
 
+/// A backlog item as `add backlog` is given it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewBacklog {
+    pub text: Line,
+    pub group: Line,
+    pub from: Option<ItemId>,
+    /// Empty for none.
+    pub body: Body,
+}
+
 /// What `retitle --check` asks of a chore's check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckChange {
@@ -399,14 +409,12 @@ pub enum CheckChange {
     Remove,
 }
 
-/// Adds chore `id` last in its group.
+/// Adds chore `id` in its group.
 pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore, now: Stamp) {
     let items = project.list_mut(ListKind::Chores);
-    let order = items.next_order(Some(new.group.as_str().as_bytes()));
     let item = Item::new(item::New {
         id: ItemId::Chore(id),
-        group: Some(&new.group),
-        order,
+        group: &new.group,
         check: new.check.as_ref(),
         from: new.from,
         created: now,
@@ -417,36 +425,27 @@ pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore, now:
     project.touched(ListId::Chore(id));
 }
 
-/// Adds backlog item `id` last in the backlog.
-pub(crate) fn add_backlog(
-    project: &mut Project,
-    id: BacklogId,
-    text: &Line,
-    from: Option<ItemId>,
-    body: &Body,
-    now: Stamp,
-) {
+/// Adds backlog item `id` in its group.
+pub(crate) fn add_backlog(project: &mut Project, id: BacklogId, new: &NewBacklog, now: Stamp) {
     let items = project.list_mut(ListKind::Backlog);
-    let order = items.next_order(None);
     let item = Item::new(item::New {
         id: ItemId::Backlog(id),
-        group: None,
-        order,
+        group: &new.group,
         check: None,
-        from,
+        from: new.from,
         created: now,
-        title: text,
-        body,
+        title: &new.text,
+        body: &new.body,
     });
     items.insert(id.get(), item);
     project.touched(ListId::Backlog(id));
 }
 
 /// Changes a chore's or backlog item's title, or a chore's check (set or
-/// removed), keeping its id, place, reference, body and every other key;
+/// removed), keeping its id, group, reference, body and every other key;
 /// gives what `retitle` prints, as `retitled c12`. Without it the planner,
 /// which changes single items only through `board`, could change a title
-/// only by drop and add: a new id, and the item at the bottom.
+/// only by drop and add: a new id, and the item's history cut.
 pub(crate) fn retitle(
     project: &mut Project,
     id: ListId,
@@ -509,31 +508,43 @@ pub(crate) fn drop_items(project: &mut Project, ids: &[BacklogId]) -> Result<Str
     remove(project, &ids, ("drop", "dropped"))
 }
 
-/// Moves an item next to another of its kind; gives what `move` prints, as
-/// `moved c12 before c3`. Writes the moved item's file, or the files of its
-/// group when that is renumbered ([`Items::move_item`]).
+/// Puts chores and backlog items, mixed, into group `to`; gives what
+/// `group` prints, as `grouped c1 b4 under Home`. All or none: an id that
+/// names no item refuses the whole command. An item in `to` already is no
+/// change and is left out of the print; when that is every item, nothing
+/// is written and the write makes no commit.
 ///
-/// An item already where it is asked to be changes no file, so the write
-/// makes no commit and the output is the same: what was asked is so.
-pub(crate) fn move_item(project: &mut Project, wanted: &Move) -> Result<String, Error> {
-    let kind = wanted.kind();
-    let refused = |why: String| Error::Refused(format!("move {}: {why}", wanted.item()));
-    let changed = project
-        .list_mut(kind)
-        .move_item(wanted)
-        .map_err(|error| match error {
-            MoveError::Item(why) => refused(not_one(kind, wanted.item().get(), why)),
-            MoveError::Target(why) => refused(format!(
-                "{} {}: {}",
-                wanted.side(),
-                wanted.target(),
-                not_one(kind, wanted.target().get(), why)
-            )),
-        })?;
-    for number in changed {
-        project.touched(ListId::of(kind, number).expect("an item's id is past 0"));
+/// Many ids in one write, so renaming or merging a group is one commit,
+/// not a burst of writes (SPEC.md, Data). The name goes behind `--to`
+/// rather than in a last position: a call that forgot it would read the
+/// last id as the name.
+pub(crate) fn group(project: &mut Project, ids: &[ListId], to: &Line) -> Result<String, Error> {
+    let mut unique: Vec<ListId> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !unique.contains(id) {
+            unique.push(*id);
+        }
     }
-    Ok(format!("moved {wanted}"))
+    for id in &unique {
+        project.list(id.kind()).find(id.get()).map_err(|why| {
+            Error::Refused(format!("group {id}: {}", not_one(id.kind(), id.get(), why)))
+        })?;
+    }
+    let moved: Vec<ListId> = unique
+        .into_iter()
+        .filter(|id| {
+            let item = project.list(id.kind()).get(id.get()).expect("found above");
+            item.group() != Some(to.as_str().as_bytes())
+        })
+        .collect();
+    if moved.is_empty() {
+        return Ok(format!("nothing to group: all are under {to} already"));
+    }
+    for id in &moved {
+        project.item_mut(*id).expect("found above").set_group(to);
+    }
+    let ids: Vec<String> = moved.iter().map(ListId::to_string).collect();
+    Ok(format!("grouped {} under {to}", ids.join(" ")))
 }
 
 /// `(command, past)`: the command names a refusal, the past tense what was
@@ -583,7 +594,6 @@ pub(crate) fn not_one(kind: ListKind, number: u32, why: FindError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::list::Side::{After, Before};
     use crate::project::{BoardPath, ProjectName};
 
     const CREATED: &str = "2026-11-25T10:00:00Z";
@@ -601,12 +611,12 @@ mod tests {
         project
     }
 
-    fn chore_file(id: u32, group: &str, order: i64, title: &str) -> String {
-        format!("id: c{id}\ngroup: {group}\norder: {order}\ncreated: {CREATED}\n\n# {title}\n")
+    fn chore_file(id: u32, group: &str, title: &str) -> String {
+        format!("id: c{id}\ngroup: {group}\ncreated: {CREATED}\n\n# {title}\n")
     }
 
-    fn backlog_file(id: u32, order: i64, title: &str) -> String {
-        format!("id: b{id}\norder: {order}\ncreated: {CREATED}\n\n# {title}\n")
+    fn backlog_file(id: u32, title: &str) -> String {
+        format!("id: b{id}\ngroup: Default\ncreated: {CREATED}\n\n# {title}\n")
     }
 
     /// The file of item `id` (`c1`) as the project has it now; `None` once
@@ -646,8 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn add_writes_an_item_s_file_last_in_its_group() {
-        let home = chore_file(1, "Home", 3000, "Old");
+    fn add_writes_an_item_s_file_in_its_group_without_an_order() {
+        let home = chore_file(1, "Home", "Old");
         let mut shop = project(&[(1, &home)], &[]);
         let new = |text: &str, group: &str, check: Option<&str>, body: &[u8]| NewChore {
             text: line(text),
@@ -675,26 +685,25 @@ mod tests {
         );
         assert_eq!(
             file_text(&shop, "c4").unwrap(),
-            "id: c4\ngroup: Home\norder: 4000\ncheck: login works\n\
+            "id: c4\ngroup: Home\ncheck: login works\n\
              created: 2026-11-25T14:08:18Z\n\n# Rotate the key\n"
         );
         assert_eq!(
             file_text(&shop, "c5").unwrap(),
-            "id: c5\ngroup: Away\norder: 1000\ncreated: 2026-11-25T14:08:18Z\n\n\
+            "id: c5\ngroup: Away\ncreated: 2026-11-25T14:08:18Z\n\n\
              # Water the plants\n\nfirst\n\n## step\n```sql\nselect 1;\n```\n"
         );
         let from = Some(ItemId::Brief(BriefId::new(126)));
-        add_backlog(
-            &mut shop,
-            backlog(7),
-            &line("Dark mode"),
+        let new = NewBacklog {
+            text: line("Dark mode"),
+            group: line("Later"),
             from,
-            &Body::new(b""),
-            now(),
-        );
+            body: Body::new(b""),
+        };
+        add_backlog(&mut shop, backlog(7), &new, now());
         assert_eq!(
             file_text(&shop, "b7").unwrap(),
-            "id: b7\norder: 1000\nfrom: 126\ncreated: 2026-11-25T14:08:18Z\n\n# Dark mode\n"
+            "id: b7\ngroup: Later\nfrom: 126\ncreated: 2026-11-25T14:08:18Z\n\n# Dark mode\n"
         );
         assert_eq!(
             changed(&shop),
@@ -709,8 +718,8 @@ mod tests {
 
     #[test]
     fn amend_appends_after_one_blank_line_and_replace_takes_the_body_s_place() {
-        let bare = backlog_file(1, 1000, "Later");
-        let with_body = format!("{}\nfirst\n\n\n", backlog_file(2, 2000, "Body"));
+        let bare = backlog_file(1, "Later");
+        let with_body = format!("{}\nfirst\n\n\n", backlog_file(2, "Body"));
         let mut shop = project(&[], &[(1, &bare), (2, &with_body)]);
         let body = |text: &str| Body::new(text.as_bytes());
         assert_eq!(
@@ -726,7 +735,7 @@ mod tests {
         amend_item(&mut shop, "b2".parse().unwrap(), &body("more"), false).unwrap();
         assert_eq!(
             file_text(&shop, "b2").unwrap(),
-            format!("{}\nfirst\n\nmore\n", backlog_file(2, 2000, "Body"))
+            format!("{}\nfirst\n\nmore\n", backlog_file(2, "Body"))
         );
         amend_item(
             &mut shop,
@@ -737,14 +746,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             file_text(&shop, "b2").unwrap(),
-            format!("{}\nnew\n\nwhole\n", backlog_file(2, 2000, "Body"))
+            format!("{}\nnew\n\nwhole\n", backlog_file(2, "Body"))
         );
         // Empty stdin with `--replace`: the file ends at its title.
         amend_item(&mut shop, "b2".parse().unwrap(), &body(""), true).unwrap();
-        assert_eq!(
-            file_text(&shop, "b2").unwrap(),
-            backlog_file(2, 2000, "Body")
-        );
+        assert_eq!(file_text(&shop, "b2").unwrap(), backlog_file(2, "Body"));
         assert_eq!(
             refusal(amend_item(
                 &mut shop,
@@ -755,7 +761,7 @@ mod tests {
             "amend c9: no such chore"
         );
         // A key the tool does not know stays as it is.
-        let text = "id: b3\norder: 3\nowner: me\ncreated: x\n\n# T\n";
+        let text = "id: b3\ngroup: Default\nowner: me\ncreated: x\n\n# T\n";
         let mut shop = project(&[], &[(3, text)]);
         amend_item(&mut shop, "b3".parse().unwrap(), &body("more"), false).unwrap();
         assert_eq!(file_text(&shop, "b3").unwrap(), format!("{text}\nmore\n"));
@@ -763,9 +769,9 @@ mod tests {
 
     #[test]
     fn retitle_changes_the_title_or_the_check_and_keeps_every_other_byte() {
-        let text = "id: c1\ngroup: Home\norder: 1000\nowner: me\ncheck: old\n\
+        let text = "id: c1\ngroup: Home\nowner: me\ncheck: old\n\
                     created: 2026-11-25T10:00:00Z\n\n# Old title\n\nthe body\n";
-        let plain = chore_file(2, "Home", 2000, "No check");
+        let plain = chore_file(2, "Home", "No check");
         let mut shop = project(&[(1, text), (2, &plain)], &[]);
         assert_eq!(
             retitle(
@@ -810,12 +816,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             file_text(&shop, "c2").unwrap(),
-            chore_file(2, "Home", 2000, "Still none")
+            chore_file(2, "Home", "Still none")
         );
         retitle(&mut shop, "c2".parse().unwrap(), None, Some(&set)).unwrap();
         assert_eq!(
             file_text(&shop, "c2").unwrap(),
-            chore_file(2, "Home", 2000, "Still none")
+            chore_file(2, "Home", "Still none")
                 .replace("\n\n# Still none", "\ncheck: select 1\n\n# Still none")
         );
         assert_eq!(
@@ -831,12 +837,10 @@ mod tests {
 
     #[test]
     fn done_and_drop_delete_the_files_and_name_each_id_once() {
-        let files: Vec<String> = (1..=3)
-            .map(|n| chore_file(n, "Home", 1000 * i64::from(n), "x"))
-            .collect();
+        let files: Vec<String> = (1..=3).map(|n| chore_file(n, "Home", "x")).collect();
         let mut shop = project(
             &[(1, &files[0]), (2, &files[1]), (3, &files[2])],
-            &[(1, &backlog_file(1, 1, "b"))],
+            &[(1, &backlog_file(1, "b"))],
         );
         assert_eq!(
             refusal(done(&mut shop, &[chore(1), chore(9)])),
@@ -861,123 +865,94 @@ mod tests {
         assert_eq!(file_text(&shop, "b1"), None);
     }
 
-    fn moving(item: &str, side: crate::list::Side, target: &str) -> Move {
-        Move::new(item.parse().unwrap(), side, target.parse().unwrap()).unwrap()
-    }
-
-    /// Home: c1 1000, c2 2000, c3 3000; Work: c4 1000.
-    fn groups() -> Project {
-        let c: Vec<String> = [
-            (1, "Home", 1000),
-            (2, "Home", 2000),
-            (3, "Home", 3000),
-            (4, "Work", 1000),
-        ]
-        .map(|(n, group, order)| chore_file(n, group, order, "x"))
-        .into();
-        project(&[(1, &c[0]), (2, &c[1]), (3, &c[2]), (4, &c[3])], &[])
+    /// Home: c1, c2; Work: b1; b2 has no group line.
+    fn grouped() -> Project {
+        let (c1, c2) = (chore_file(1, "Home", "x"), chore_file(2, "Home", "y"));
+        let b1 = format!("id: b1\ngroup: Work\nowner: me\ncreated: {CREATED}\n\n# z\n\nbody\n");
+        let b2 = format!("id: b2\nfrom: 126\ncreated: {CREATED}\n\n# none\n");
+        project(&[(1, &c1), (2, &c2)], &[(1, &b1), (2, &b2)])
     }
 
     #[test]
-    fn a_move_writes_the_moved_item_only() {
-        for (wanted, file_after) in [
-            // Halfway between its new neighbours.
-            (moving("c3", Before, "c2"), chore_file(3, "Home", 1500, "x")),
-            // Last: past the last by a step.
-            (moving("c1", After, "c3"), chore_file(1, "Home", 4000, "x")),
-            // First, into another group: before the first by a step.
-            (moving("c4", Before, "c1"), chore_file(4, "Home", 0, "x")),
-            // Last in another group.
-            (moving("c1", After, "c4"), chore_file(1, "Work", 2000, "x")),
-        ] {
-            let mut shop = groups();
-            assert_eq!(
-                move_item(&mut shop, &wanted).unwrap(),
-                format!("moved {wanted}")
-            );
-            let id = wanted.item().to_string();
-            assert_eq!(changed(&shop), [format!("shop/chores/{id}.md")], "{wanted}");
-            assert_eq!(file_text(&shop, &id).unwrap(), file_after, "{wanted}");
-        }
-    }
-
-    #[test]
-    fn a_move_into_no_gap_renumbers_that_list() {
-        let b: Vec<String> = (1..=3)
-            .map(|n| backlog_file(n, i64::from(n), "x"))
-            .collect();
-        let mut shop = project(&[], &[(1, &b[0]), (2, &b[1]), (3, &b[2])]);
-        move_item(&mut shop, &moving("b3", Before, "b2")).unwrap();
-        assert_eq!(
-            changed(&shop),
-            [
-                "shop/backlog/b1.md",
-                "shop/backlog/b2.md",
-                "shop/backlog/b3.md"
-            ]
-        );
-        assert_eq!(
-            [1, 3, 2].map(|n| file_text(&shop, &format!("b{n}")).unwrap()),
-            [
-                backlog_file(1, 1000, "x"),
-                backlog_file(3, 2000, "x"),
-                backlog_file(2, 3000, "x"),
-            ]
-        );
-        // A chores' group is renumbered alone.
-        let c: Vec<String> = [(1, "Home", 1), (2, "Home", 2), (3, "Work", 5)]
-            .map(|(n, group, order)| chore_file(n, group, order, "x"))
+    fn group_writes_the_group_line_of_each_item_and_nothing_else() {
+        let mut shop = grouped();
+        let before = ["c1", "c2", "b1", "b2"].map(|id| file_text(&shop, id).unwrap());
+        let ids: Vec<ListId> = ["c2", "b1", "b2", "c2"]
+            .map(|id| id.parse().unwrap())
             .into();
-        let mut shop = project(&[(1, &c[0]), (2, &c[1]), (3, &c[2])], &[]);
-        move_item(&mut shop, &moving("c3", Before, "c2")).unwrap();
+        assert_eq!(
+            group(&mut shop, &ids, &line("Later")).unwrap(),
+            "grouped c2 b1 b2 under Later"
+        );
         assert_eq!(
             changed(&shop),
             [
-                "shop/chores/c1.md",
                 "shop/chores/c2.md",
-                "shop/chores/c3.md"
+                "shop/backlog/b1.md",
+                "shop/backlog/b2.md"
             ]
         );
-        assert_eq!(
-            file_text(&shop, "c3").unwrap(),
-            chore_file(3, "Home", 2000, "x")
-        );
+        assert_eq!(file_text(&shop, "c1").unwrap(), before[0]);
         assert_eq!(
             file_text(&shop, "c2").unwrap(),
-            chore_file(2, "Home", 3000, "x")
+            before[1].replace("group: Home", "group: Later")
         );
-    }
-
-    #[test]
-    fn a_move_to_where_the_item_is_changes_no_file_and_keeps_unknown_keys() {
-        let mut shop = groups();
-        assert_eq!(
-            move_item(&mut shop, &moving("c2", After, "c1")).unwrap(),
-            "moved c2 after c1"
-        );
-        move_item(&mut shop, &moving("c1", Before, "c2")).unwrap();
-        assert_eq!(changed(&shop), Vec::<String>::new());
-        let text = "id: b1\norder: 5\nowner: me\ncreated: x\n\n# a\n";
-        let mut shop = project(&[], &[(1, text), (2, &backlog_file(2, 9, "b"))]);
-        move_item(&mut shop, &moving("b1", After, "b2")).unwrap();
         assert_eq!(
             file_text(&shop, "b1").unwrap(),
-            text.replace("order: 5", "order: 1009")
+            before[2].replace("group: Work", "group: Later")
+        );
+        // Without a group line: it lands right after `id:`.
+        assert_eq!(
+            file_text(&shop, "b2").unwrap(),
+            before[3].replace("id: b2\n", "id: b2\ngroup: Later\n")
         );
     }
 
     #[test]
-    fn move_refuses_an_id_that_names_no_item() {
-        let mut shop = groups();
+    fn group_leaves_out_what_is_there_already_and_refuses_an_unknown_id() {
+        let mut shop = grouped();
+        let ids: Vec<ListId> = ["c1", "c2", "b1"].map(|id| id.parse().unwrap()).into();
         assert_eq!(
-            refusal(move_item(&mut shop, &moving("c9", Before, "c1"))),
-            "move c9: no such chore"
+            group(&mut shop, &ids, &line("Home")).unwrap(),
+            "grouped b1 under Home"
         );
+        assert_eq!(changed(&shop), ["shop/backlog/b1.md"]);
+        let mut shop = grouped();
+        let ids: Vec<ListId> = ["c1", "c2"].map(|id| id.parse().unwrap()).into();
         assert_eq!(
-            refusal(move_item(&mut shop, &moving("c1", After, "c9"))),
-            "move c1: after c9: no such chore"
+            group(&mut shop, &ids, &line("Home")).unwrap(),
+            "nothing to group: all are under Home already"
         );
         assert_eq!(changed(&shop), Vec::<String>::new());
+        let ids: Vec<ListId> = ["c1", "b9"].map(|id| id.parse().unwrap()).into();
+        assert_eq!(
+            refusal(group(&mut shop, &ids, &line("Away"))),
+            "group b9: no such backlog item"
+        );
+        assert_eq!(changed(&shop), Vec::<String>::new());
+    }
+
+    /// An item without a `group:` line is no reason to refuse it: it is
+    /// listed, so every item command works on it.
+    #[test]
+    fn an_item_without_a_group_takes_every_item_command() {
+        let mut shop = grouped();
+        let b2: ListId = "b2".parse().unwrap();
+        retitle(&mut shop, b2, Some(&line("Named")), None).unwrap();
+        amend_item(&mut shop, b2, &Body::new(b"more"), false).unwrap();
+        let c3 = "id: c3\ncreated: x\n\n# no group\n";
+        let mut chores = project(&[(3, c3)], &[]);
+        let c3_id: ListId = "c3".parse().unwrap();
+        retitle(&mut chores, c3_id, Some(&line("Named")), None).unwrap();
+        amend_item(&mut chores, c3_id, &Body::new(b"more"), false).unwrap();
+        assert_eq!(done(&mut chores, &[chore(3)]).unwrap(), "done c3");
+        assert_eq!(drop_items(&mut shop, &[backlog(2)]).unwrap(), "dropped b2");
+        let mut chores = project(&[(3, c3)], &[]);
+        group(&mut chores, &[c3_id], &line("G")).unwrap();
+        assert_eq!(
+            file_text(&chores, "c3").unwrap(),
+            "id: c3\ngroup: G\ncreated: x\n\n# no group\n"
+        );
     }
 
     // ---- briefs ----
@@ -993,7 +968,7 @@ mod tests {
     fn with_briefs(files: &[(&str, &str)], backlog: &[u32]) -> Project {
         let items: Vec<(u32, String)> = backlog
             .iter()
-            .map(|n| (*n, backlog_file(*n, i64::from(*n), "x")))
+            .map(|n| (*n, backlog_file(*n, "x")))
             .collect();
         let items: Vec<(u32, &str)> = items.iter().map(|(n, t)| (*n, t.as_str())).collect();
         let mut project = project(&[], &items);
@@ -1366,7 +1341,7 @@ mod tests {
         // A closed item's file is deleted, as on `drop`.
         assert_eq!(file_text(&shop, "b41"), None);
         assert_eq!(file_text(&shop, "b52"), None);
-        assert_eq!(file_text(&shop, "b60").unwrap(), backlog_file(60, 60, "x"));
+        assert_eq!(file_text(&shop, "b60").unwrap(), backlog_file(60, "x"));
         assert_eq!(
             paths(&shop),
             [

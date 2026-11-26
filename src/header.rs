@@ -95,6 +95,25 @@ impl Header {
         }
     }
 
+    /// Rewrites the key's line in place, or adds the key right after the
+    /// line of `after` (first in the header without one).
+    pub(crate) fn set_after(&mut self, key: &str, value: &str, after: &str) {
+        if self.position(key).is_some() {
+            self.set(key, value);
+            return;
+        }
+        let terminator = raw::terminator_of(self.first_line());
+        if let Some(last) = self.lines.last_mut()
+            && !last.ends_with(b"\n")
+        {
+            last.extend_from_slice(terminator);
+        }
+        let at = self.position(after).map_or(0, |at| at + 1);
+        let line = format!("{key}: {value}").into_bytes();
+        self.lines
+            .insert(at, [line.as_slice(), terminator].concat());
+    }
+
     /// Deletes every line with this key.
     pub(crate) fn remove(&mut self, key: &str) {
         self.lines
@@ -126,12 +145,18 @@ mod tests {
     fn set_rewrites_its_line_or_adds_one_and_remove_deletes() {
         let (mut header, _) = Header::split(b"id: c1\r\nother: x\n");
         header.set("id", "c2");
-        header.set("order", "1000");
-        assert_eq!(header.to_bytes(), b"id: c2\r\nother: x\norder: 1000\r\n");
+        header.set("group", "Home");
+        assert_eq!(header.to_bytes(), b"id: c2\r\nother: x\ngroup: Home\r\n");
         header.remove("other");
-        assert_eq!(header.to_bytes(), b"id: c2\r\norder: 1000\r\n");
+        assert_eq!(header.to_bytes(), b"id: c2\r\ngroup: Home\r\n");
         let (mut open, _) = Header::split(b"id: c1");
-        open.set("order", "3");
-        assert_eq!(open.to_bytes(), b"id: c1\norder: 3\n");
+        open.set("group", "3");
+        assert_eq!(open.to_bytes(), b"id: c1\ngroup: 3\n");
+        let (mut after, _) = Header::split(b"x: 1\nid: c1\nother: y\n");
+        after.set_after("group", "G", "id");
+        assert_eq!(after.to_bytes(), b"x: 1\nid: c1\ngroup: G\nother: y\n");
+        let (mut first, _) = Header::split(b"other: y\n");
+        first.set_after("group", "G", "id");
+        assert_eq!(first.to_bytes(), b"group: G\nother: y\n");
     }
 }

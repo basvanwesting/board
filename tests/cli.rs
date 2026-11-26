@@ -14,25 +14,25 @@ use common::{Machine, World, run};
 const ITEMS: [(&str, &str); 5] = [
     (
         "chores/c1.md",
-        "id: c1\ngroup: Home\norder: 1000\ncheck: the soil is wet\ncreated: x\n\n\
+        "id: c1\ngroup: Home\ncheck: the soil is wet\ncreated: x\n\n\
          # Water the plants\n\ntwice a week\n",
     ),
     (
         "chores/c3.md",
-        "id: c3\ngroup: Home\norder: 2000\ncheck: login works\nfrom: 126\ncreated: x\n\n\
+        "id: c3\ngroup: Home\ncheck: login works\nfrom: 126\ncreated: x\n\n\
          # Rotate the key\n",
     ),
     (
         "chores/c4.md",
-        "id: c4\ngroup: Office\norder: 1000\ncreated: x\n\n# Clean the desk\n",
+        "id: c4\ngroup: Office\ncreated: x\n\n# Clean the desk\n",
     ),
     (
         "backlog/b2.md",
-        "id: b2\norder: 1000\nfrom: 126\ncreated: x\n\n# Faster search\n",
+        "id: b2\ngroup: Search\nfrom: 126\ncreated: x\n\n# Faster search\n",
     ),
     (
         "backlog/b1.md",
-        "id: b1\norder: 2000\ncreated: x\n\n# Dark mode\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# Dark mode\n",
     ),
 ];
 
@@ -76,8 +76,10 @@ c4 Clean the desk
 ";
 
 const BACKLOG_LINES: &str = "\
-b2 Faster search  (from 126)
+## Default
 b1 Dark mode
+## Search
+b2 Faster search  (from 126)
 ";
 
 // ---- board, ls ----
@@ -114,6 +116,40 @@ fn ls_of_one_kind_is_its_block_without_the_head() {
     assert_eq!(a.board(&["ls", "briefs"]).ok(), BRIEFS);
     assert_eq!(a.board(&["ls", "chores"]).ok(), CHORE_LINES);
     assert_eq!(a.board(&["ls", "backlog"]).ok(), BACKLOG_LINES);
+}
+
+/// Both lists by group name, then by id as a number: `c9` before `c10`,
+/// whatever an old order key says (here the other way round), and an item
+/// without a group under the empty name.
+#[test]
+fn ls_lists_by_group_then_by_id() {
+    let world = World::new();
+    let a = world.a();
+    for (dir, p) in [("chores", 'c'), ("backlog", 'b')] {
+        a.write(
+            &format!("proj/{dir}/{p}10.md"),
+            format!("id: {p}10\ngroup: Home\norder: 1000\ncreated: x\n\n# ten\n"),
+        );
+        a.write(
+            &format!("proj/{dir}/{p}9.md"),
+            format!("id: {p}9\ngroup: Home\norder: 2000\ncreated: x\n\n# nine\n"),
+        );
+        a.write(
+            &format!("proj/{dir}/{p}2.md"),
+            format!("id: {p}2\ngroup: Away\ncreated: x\n\n# two\n"),
+        );
+        a.write(
+            &format!("proj/{dir}/{p}3.md"),
+            format!("id: {p}3\ncreated: x\n\n# none\n"),
+        );
+    }
+    for (kind, p) in [("chores", 'c'), ("backlog", 'b')] {
+        assert_eq!(
+            a.board(&["ls", kind]).ok(),
+            format!("## \n{p}3 none\n## Away\n{p}2 two\n## Home\n{p}9 nine\n{p}10 ten\n"),
+            "{kind}"
+        );
+    }
 }
 
 #[test]
@@ -181,11 +217,11 @@ fn a_title_is_printed_as_its_file_has_it() {
     // Latin-1, CRLF: not UTF-8, and not the tool's to repair.
     a.write(
         "proj/backlog/b1.md",
-        b"id: b1\r\norder: 1\r\ncreated: x\r\n\r\n# caf\xe9\r\n",
+        b"id: b1\r\ngroup: Default\r\ncreated: x\r\n\r\n# caf\xe9\r\n",
     );
     let ran = a.board(&["ls", "backlog"]);
     assert_eq!((ran.code, ran.stderr.as_str()), (0, ""));
-    assert_eq!(ran.stdout, b"b1 caf\xe9\n");
+    assert_eq!(ran.stdout, b"## Default\nb1 caf\xe9\n");
     let ran = a.board(&["show", "b1"]);
     assert_eq!((ran.code, ran.stderr.as_str()), (0, ""));
     assert_eq!(ran.stdout, b"b1 caf\xe9\n");
@@ -229,7 +265,7 @@ fn show_prints_an_item_with_its_body_as_the_file_has_it() {
     let body = "why: the night shift\n\n## Steps\n```sql\nselect count(*)\n  from orders;\n```\n\t- a list\n";
     a.write(
         "proj/backlog/b1.md",
-        format!("id: b1\norder: 1\ncreated: x\n\n# Dark mode\n\n{body}"),
+        format!("id: b1\ngroup: Default\ncreated: x\n\n# Dark mode\n\n{body}"),
     );
     assert_eq!(
         a.board(&["show", "b1"]).ok(),
@@ -237,7 +273,7 @@ fn show_prints_an_item_with_its_body_as_the_file_has_it() {
     );
     a.write(
         "proj/backlog/b2.md",
-        "id: b2\norder: 2\ncreated: x\n\n# Other\n\nno final line break",
+        "id: b2\ngroup: Default\ncreated: x\n\n# Other\n\nno final line break",
     );
     assert_eq!(
         a.board(&["show", "b2"]).ok(),
@@ -307,16 +343,13 @@ fn lint_prints_a_line_per_finding_and_exits_1() {
     let a = world.a();
     a.write(
         "proj/chores/c1.md",
-        "id: c1\norder: 1000\ncreated: x\n\n# Water the plants\n",
+        "id: c1\ncreated: x\n\n# Water the plants\n",
     );
     a.write(
         "proj/chores/c2.md",
-        "id: c3\ngroup: Home\norder: 1000\ncreated: x\n\n# Rotate the key\n",
+        "id: c3\ngroup: Home\ncreated: x\n\n# Rotate the key\n",
     );
-    a.write(
-        "proj/backlog/b1.md",
-        "id: b1\norder: soon\ncreated: x\n\nno title\n",
-    );
+    a.write("proj/backlog/b1.md", "id: b1\ncreated: x\n\nno title\n");
     a.write("proj/chores/notes.md", "not a chore\n");
     a.write("proj/briefs/127-search.md", "id: 127\nstatus: strated\n");
     a.write("proj/briefs/128-export.md", "id: 129\nstatus: draft\n");
@@ -332,9 +365,9 @@ fn lint_prints_a_line_per_finding_and_exits_1() {
     assert_eq!(
         a.board(&["lint"]).out(1),
         "\
-proj/chores/c1.md: no `group:` line
+proj/chores/c1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`
 proj/chores/c2.md: header id `c3` differs from the file name's c2
-proj/backlog/b1.md: order `soon` is no integer, so the item is listed last
+proj/backlog/b1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`
 proj/backlog/b1.md: no `# ` title line after the header
 proj/briefs/127-search.md: unknown status `strated`; a brief outside briefs/done/ is draft, queued, started, blocked or reported
 proj/briefs/128-export.md: header id `129` differs from the file name's 128
@@ -351,14 +384,11 @@ proj/chores/notes.md: not named as the board names its files (briefs/[done/]<num
 fn lint_is_about_this_project_only() {
     let world = World::new();
     let a = world.a();
-    a.write(
-        "shop/chores/c1.md",
-        "id: c1\norder: 1\ncreated: x\n\n# No group\n",
-    );
+    a.write("shop/chores/c1.md", "id: c1\ncreated: x\n\n# No group\n");
     assert_eq!(a.board(&["lint"]).ok(), "ok\n");
     assert_eq!(
         a.board(&["--board", "shop", "lint"]).out(1),
-        "shop/chores/c1.md: no `group:` line\n"
+        "shop/chores/c1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`\n"
     );
 }
 
@@ -370,11 +400,11 @@ fn the_project_is_the_repository_s_path_below_work() {
     let a = world.a();
     a.write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of proj\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of proj\n",
     );
     a.write(
         "tools-shop/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of tools-shop\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of tools-shop\n",
     );
 
     // From anywhere inside the repository.
@@ -406,7 +436,7 @@ fn the_project_is_the_repository_s_path_below_work() {
     );
     a.write(
         "tools-till/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of tools-till\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of tools-till\n",
     );
     assert_eq!(
         a.board_in(&kept_elsewhere, &["show", "b1"]).ok(),
@@ -438,15 +468,15 @@ fn a_linked_worktree_is_on_the_board_of_its_repository() {
     let a = world.a();
     a.write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of proj\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of proj\n",
     );
     a.write(
         "proj-.claude-worktrees-x/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of the worktree's path\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of the worktree's path\n",
     );
     a.write(
         "proj-wt/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of the worktree's path\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of the worktree's path\n",
     );
 
     for place in [
@@ -531,10 +561,7 @@ fn a_linked_worktree_of_a_repository_that_gives_no_project_is_a_usage_error() {
 fn the_board_data_clone_gives_no_project() {
     let world = World::new();
     let a = world.a();
-    a.write(
-        "shop/chores/c1.md",
-        "id: c1\norder: 1\ncreated: x\n\n# No group\n",
-    );
+    a.write("shop/chores/c1.md", "id: c1\ncreated: x\n\n# No group\n");
     let data = a.data();
     let refused = |shown: String| {
         format!(
@@ -555,7 +582,7 @@ fn the_board_data_clone_gives_no_project() {
         // Named, the board is read from there like from anywhere.
         assert_eq!(
             a.board_in(&directory, &["--board", "shop", "lint"]).out(1),
-            "shop/chores/c1.md: no `group:` line\n"
+            "shop/chores/c1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`\n"
         );
     }
 
@@ -584,7 +611,7 @@ fn the_board_data_clone_gives_no_project() {
             .join("board-data")
             .join("backlog")
             .join("b1.md"),
-        "id: b1\norder: 1\ncreated: x\n\n# of board-data\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of board-data\n",
     )
     .unwrap();
     let link = a.home().join("link-to-kept");
@@ -620,7 +647,7 @@ fn a_symlink_on_the_way_to_work_does_not_move_the_project() {
     let a = world.a();
     a.write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of proj\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of proj\n",
     );
     let link = a.home().with_file_name("link-to-a");
     std::os::unix::fs::symlink(a.home(), &link).unwrap();
@@ -667,15 +694,15 @@ fn a_given_board_replaces_the_derived_one() {
     let a = world.a();
     a.write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of proj\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of proj\n",
     );
     a.write(
         "shop/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of shop\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of shop\n",
     );
     a.write(
         "other/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of other\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of other\n",
     );
     let show = |command: &mut std::process::Command| run(command.args(["show", "b1"])).ok();
 
@@ -700,7 +727,7 @@ fn a_given_board_works_where_no_project_can_be_derived() {
     let a = world.a();
     a.write(
         "shop/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of shop\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of shop\n",
     );
     assert_eq!(
         a.board_in(&a.home(), &["--board", "shop", "show", "b1"])
@@ -776,7 +803,7 @@ fn git_s_own_variables_do_not_move_the_project() {
     let a = world.a();
     a.write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# of proj\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# of proj\n",
     );
     let inside = a.proj().join("src");
     fs::create_dir_all(&inside).unwrap();
@@ -803,7 +830,7 @@ fn board_root_names_the_clone() {
     let b = world.b();
     b.write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# in the other clone\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# in the other clone\n",
     );
     assert_eq!(a.board(&["ls", "backlog"]).ok(), "");
     assert_eq!(
@@ -812,7 +839,7 @@ fn board_root_names_the_clone() {
             .env("BOARD_ROOT", b.data())
             .args(["ls", "backlog"]))
         .ok(),
-        "b1 in the other clone\n"
+        "## Default\nb1 in the other clone\n"
     );
     // Empty is unset.
     assert_eq!(
@@ -845,11 +872,11 @@ fn a_read_shows_the_files_of_its_own_clone() {
     let world = World::new();
     world.a().write(
         "proj/backlog/b1.md",
-        "id: b1\norder: 1\ncreated: x\n\n# saved a moment ago\n",
+        "id: b1\ngroup: Default\ncreated: x\n\n# saved a moment ago\n",
     );
     assert_eq!(
         world.a().board(&["ls", "backlog"]).ok(),
-        "b1 saved a moment ago\n"
+        "## Default\nb1 saved a moment ago\n"
     );
     assert_eq!(world.b().board(&["ls", "backlog"]).ok(), "");
 }

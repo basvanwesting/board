@@ -25,9 +25,9 @@ pub use brief::{
 };
 pub use error::{Error, Exit};
 pub use id::{BacklogId, BriefId, ChoreId, InvalidId, ItemId, ListId, ListKind};
-pub use item::{BadOrder, Body, Item, Items, Listed, MoveError, Row};
+pub use item::{Body, DEFAULT_GROUP, Item, Items, Listed, Row};
 pub use lint::{Finding, Problem, lint};
-pub use list::{BadMove, Entry, FindError, IdsExhausted, Line, Move, Side};
-pub use ops::{CheckChange, Commits, Filed, NewChore};
+pub use list::{Entry, FindError, IdsExhausted, Line};
+pub use ops::{CheckChange, Commits, Filed, NewBacklog, NewChore};
 pub use project::{BoardPath, BriefFile, BriefName, Env, InvalidSlug, Project, ProjectName, Slug};
 pub use sync::{Counts, Fetched, Note};

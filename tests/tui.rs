@@ -134,19 +134,19 @@ fn main() {
     tui(&a, "3xn3x\x1b3x\x03");
     assert_eq!(world.remote_main(), before);
 
-    // J/K: a run of presses on screen, one move when it ends (here: the
-    // input ends); c1 goes below c4, past c3 and c4 and back and on.
+    // J/K: no keys of the TUI's since items have no order; nothing runs.
+    let before = world.remote_main();
     tui(&a, "2JJKJ");
-    assert_eq!(world.remote_log()[..2], ["proj: move c1", "proj: done c2"]);
+    assert_eq!(world.remote_main(), before);
     assert_eq!(
         a.board(&["ls", "chores"]).ok(),
-        "## home\nc3 third. Check: x\nc4 fourth. Check: x\nc1 first. Check: x\n"
+        "## home\nc1 first. Check: x\nc3 third. Check: x\nc4 fourth. Check: x\n"
     );
 
     // e: the editor on c1's own file; on return a sync commits what it
     // added. The mouse is captured while the TUI runs and given back
     // around the editor.
-    let raw = tui(&a, "2Ge");
+    let raw = tui(&a, "2gge");
     let (on, off) = (mouse(true), mouse(false));
     assert_eq!(raw, [&on[..], &off, &on, &off].concat());
     let args = fs::read_to_string(&editor_args).expect("the editor ran");
@@ -158,7 +158,7 @@ fn main() {
     assert!(c1.ends_with("# first\n\ntyped in the editor\n"), "{c1}");
     assert_eq!(
         world.remote_log()[..2],
-        ["board: hand edits", "proj: move c1"]
+        ["board: hand edits", "proj: done c2"]
     );
 
     // y, Y: the id and the line, through OSC 52 and the clipboard helper.

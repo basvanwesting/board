@@ -2,7 +2,6 @@
 //!
 //! ```text
 //! state.rs    what is shown: a pure function (State, Event) -> (State, Vec<Command>)
-//! moves.rs    where the rows stand while moves are made or out
 //! layout.rs   where it goes, shared by the state and the view
 //! view.rs     the state, drawn
 //! data.rs     what a load reads from the files
@@ -18,7 +17,6 @@
 
 mod data;
 mod layout;
-mod moves;
 mod outside;
 mod state;
 mod view;
@@ -539,7 +537,6 @@ fn worker(board: Board, messages: Sender<Message>) -> impl FnMut(Job) -> Event +
             let result = match &action {
                 Action::Done(id) => board.done(&[*id]),
                 Action::Drop(id) => board.drop_items(&[*id]),
-                Action::Move(wanted) => board.move_item(wanted),
                 Action::Sync => board.sync().map(|()| "synced".to_owned()),
             };
             Event::Ran(action, result.map_err(|error| error.to_string()))

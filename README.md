@@ -18,9 +18,9 @@ Three lists, one board per project:
 
 - **Briefs** (`126`): one markdown file per piece of work: the planner's design, then the worker's questions and report. Numbered per project. Written by the planner, moved along by both; it ends filed.
 - **Chores** (`c12`): an action of the user's that a brief leaves behind (a deploy, an edit on production, something to judge by eye). A file of its own with a title, a group, and when the title does not show how to see it is done, a check: a chore expires unannounced, and the check is how to see it did. It ends deleted, by the user or the planner.
-- **Backlog** (`b41`): an unrefined item for later, a file of its own with a title. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
+- **Backlog** (`b41`): an unrefined item for later, a file of its own with a title and a group. Added on the user's word or from a worker's out-of-scope findings; it ends deleted, closed by the brief that resolves it or dropped.
 
-An item is listed as one line, its ID first (`b41 Dark mode  (from 126)`), so it copies and greps cleanly; its file is named by the ID (`backlog/b41.md`). Header lines hold what the board needs (`id`, a chore's `group`, `order`, a chore's `check`, `from`, `created`), then the `# ` title and, when there is one, the body: Markdown, kept as written, so a query or a list reads and copies whole. A body is written from stdin with `board add backlog "<text>" --body`, added to with `board amend <id>` and rewritten with `board amend <id> --replace`, or edited by hand; `board show <id>` and the TUI's preview show it. The order within a group, or the backlog, is the `order` key: `board move <id> --before <id>` and the TUI's `J`/`K` change it. Git history is the archive of everything deleted.
+An item is listed as one line, its ID first (`b41 Dark mode  (from 126)`), so it copies and greps cleanly; its file is named by the ID (`backlog/b41.md`). Header lines hold what the board needs (`id`, `group`, a chore's `check`, `from`, `created`), then the `# ` title and, when there is one, the body: Markdown, kept as written, so a query or a list reads and copies whole. A body is written from stdin with `board add backlog "<text>" --body`, added to with `board amend <id>` and rewritten with `board amend <id> --replace`, or edited by hand; `board show <id>` and the TUI's preview show it. Items have no order: both lists show by group, then by ID, which is the order they were made in. An item added without a group (`board add backlog "<text>"`) goes to `Default`, and `board group c1 b4 --to "<name>"` moves items, chores and backlog items alike, into a group in one commit; the groups are the planner's to keep few and balanced. Git history is the archive of everything deleted.
 
 ## The life of a brief
 
@@ -49,7 +49,7 @@ cargo install --path .
 
 The boards live in a second git repository, `board-data`: private, with a remote every machine reaches over https, cloned once per machine at `$BOARD_ROOT` (default `~/Work/board-data`). The clone must be a full one, not shallow (`git clone --depth`): IDs are counted from its history. It must be on branch `main`, with its remote named `origin` and at least one commit; the tool creates everything inside it.
 
-Upgrading from a version that kept chores and backlog in `chores.md` and `backlog.md`: on the machine in use, rebuild and run `board migrate` once in each project's checkout (or `board migrate --board <name>`); keep every other machine closed until it is rebuilt. Until a project is migrated, every other command refuses it and says so, and so it does again if a machine still on the old version writes a list there: `board migrate` folds it in.
+Upgrading from a version that kept chores and backlog in `chores.md` and `backlog.md`, or from one that gave backlog items no group: on the machine in use, rebuild and run `board migrate` once in each project's checkout (or `board migrate --board <name>`); keep every other machine closed until it is rebuilt. It converts the lists and gives every item without a group `group: Default`. Until a project is migrated, every other command refuses it and says so, and so it does again if a machine still on the old version writes a list there: `board migrate` folds it in.
 
 A command finds its project's board from the directory it runs in: the path of the git checkout below `~/Work`, with `/` turned into `-` (`~/Work/shop` is `shop`, `~/Work/tools/shop` is `tools-shop`). Elsewhere, name the board yourself: `board ls --board shop`, or `BOARD=shop` in the environment. A project has no setup of its own: its first write creates its directory on the board.
 
@@ -64,7 +64,7 @@ board-data/
 
 ## Usage
 
-The planner runs `board new brief <slug>`, `board queue <id>`, `board amend <id>`, `board file <id>`, `board add chore "<text>" --group <group> --check "<check>" --from <id>` (the check only when the title does not say how to see it is done), `board add backlog "<text>" --from <id>`, `board retitle <id> "<text>"` (an item's title, keeping its ID and place) and `board done <id>`, and reads with `board ls`, `board ls briefs --status reported` and `board show <id>`. The worker runs `board next`, `board block <id> "<question>"` and `board report <id>`. `board --help` is the reference, and each command has its own (`board queue --help`).
+The planner runs `board new brief <slug>`, `board queue <id>`, `board amend <id>`, `board file <id>`, `board add chore "<text>" --group <group> --check "<check>" --from <id>` (the check only when the title does not say how to see it is done), `board add backlog "<text>" --group <group> --from <id>`, `board retitle <id> "<text>"` (an item's title, keeping its ID and group), `board group <id> --to "<name>"` and `board done <id>`, and reads with `board ls`, `board ls briefs --status reported` and `board show <id>`. The worker runs `board next`, `board block <id> "<question>"` and `board report <id>`. `board --help` is the reference, and each command has its own (`board queue --help`).
 
 A session in `~/Work/shop`, from a backlog item to a filed brief:
 
@@ -93,11 +93,11 @@ $ board done c1
 done c1
 ```
 
-The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones and the unpushed, and Filed), Chores by group, Backlog in order, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
+The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones and the unpushed, and Filed), Chores and Backlog by group, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
 
 - `j`/`k` move, `1` `2` `3` or Tab focus a panel, `0` or Enter scrolls the preview, `/` filters the panel.
 - A click focuses a pane and selects the row clicked; the wheel moves as `j`/`k`. The TUI captures the mouse for that, so selecting text with the mouse takes the terminal's bypass (Shift-drag in most); `y`, `Y` and `yy` copy.
-- `d` marks a chore done, `x` drops a backlog item (each asks once), `J`/`K` reorder, `e` opens the item in `$EDITOR`.
+- `d` marks a chore done, `x` drops a backlog item (each asks once), `e` opens the item in `$EDITOR`.
 - `r` syncs, `?` shows every key, `q` quits. Esc only ever backs out.
 
 The TUI edits no text itself: every action is the CLI command of the same name, so an agent can do whatever the user does.

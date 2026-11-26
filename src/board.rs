@@ -11,9 +11,9 @@ use crate::git::{Failure, Git, Oid};
 use crate::id::{BacklogId, BriefId, ChoreId, ItemId, ListId, ListKind};
 use crate::item::{Body, Items, Row};
 use crate::lint::{Finding, lint};
-use crate::list::{FindError, Line, Move};
+use crate::list::{FindError, Line};
 use crate::migrate;
-use crate::ops::{self, CheckChange, Commits, Filed, NewChore};
+use crate::ops::{self, CheckChange, Commits, Filed, NewBacklog, NewChore};
 use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
 use crate::sync::{self, Fetched, Note};
 
@@ -90,8 +90,8 @@ impl Board {
     }
 
     /// Converts the project's list files of the older storage to item
-    /// files, in one write; the one command a project with a list file
-    /// takes.
+    /// files and brings the item files up to date, in one write; the one
+    /// command a project with a list file takes.
     pub fn migrate(&self) -> Result<String, Error> {
         let now = now()?;
         let value = sync::write(
@@ -100,9 +100,6 @@ impl Board {
             "migrate",
             &*self.notes,
             Some(&|tx| {
-                if tx.project.old_lists.is_empty() {
-                    return Ok(("nothing to migrate".to_owned(), String::new()));
-                }
                 let migrated = migrate::migrate(&mut tx.project, now).map_err(|unplaced| {
                     let lines: Vec<String> =
                         unplaced.iter().map(|line| format!("\n  {line}")).collect();
@@ -111,6 +108,10 @@ impl Board {
                         lines.concat()
                     ))
                 })?;
+                if migrated.is_nothing() {
+                    // Nothing changed, so nothing is committed under a subject.
+                    return Ok(("nothing to migrate".to_owned(), String::new()));
+                }
                 Ok((migrated.to_string(), migrated.to_string()))
             }),
         )?;
@@ -180,18 +181,13 @@ impl Board {
         })
     }
 
-    /// Adds a backlog item below the others, with its body (empty for
+    /// Adds a backlog item under its group, with its body (empty for
     /// none); gives its new id.
-    pub fn add_backlog(
-        &self,
-        text: &Line,
-        from: Option<ItemId>,
-        body: &Body,
-    ) -> Result<BacklogId, Error> {
+    pub fn add_backlog(&self, new: &NewBacklog) -> Result<BacklogId, Error> {
         let now = now()?;
         self.command("add backlog", &|tx| {
             let id = tx.alloc_backlog()?;
-            ops::add_backlog(&mut tx.project, id, text, from, body, now);
+            ops::add_backlog(&mut tx.project, id, new, now);
             Ok((id, format!("add {id}")))
         })
     }
@@ -242,13 +238,13 @@ impl Board {
         })
     }
 
-    /// Moves an item next to another of its list; gives what it did, as
-    /// `moved c12 before c3`. Allocates nothing, so it works offline like
-    /// `done`.
-    pub fn move_item(&self, wanted: &Move) -> Result<String, Error> {
-        self.command("move", &|tx| {
-            let moved = ops::move_item(&mut tx.project, wanted)?;
-            Ok((moved, format!("move {}", wanted.item())))
+    /// Puts chores and backlog items into a group, in one commit; gives
+    /// what it did, as `grouped c12 b4 under Home`. Allocates nothing, so
+    /// it works offline like `done`.
+    pub fn group(&self, ids: &[ListId], to: &Line) -> Result<String, Error> {
+        self.command("group", &|tx| {
+            let grouped = ops::group(&mut tx.project, ids, to)?;
+            Ok((grouped.clone(), grouped))
         })
     }
 
@@ -541,8 +537,8 @@ fn shown(items: &Items, number: u32) -> Result<Vec<u8>, String> {
         .ok_or_else(|| ops::not_one(items.kind(), number, FindError::Missing))
 }
 
-/// What the board shows of a project: the briefs, the chores by group, the
-/// backlog in its order.
+/// What the board shows of a project: the briefs, the chores and the
+/// backlog by group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub project: ProjectName,
@@ -670,8 +666,7 @@ impl BriefRow {
 /// A row of a kind's listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListRow {
-    /// A chores' group, as its name: `ls` prints `## <name>` above its
-    /// chores.
+    /// A group, as its name: `ls` prints `## <name>` above its items.
     Group(Vec<u8>),
     /// An item, as its line ([`crate::item::Item::line`]): the id is the
     /// first word.
@@ -904,16 +899,13 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_lists_its_groups_by_name_and_its_items_by_order() {
+    fn a_kind_lists_its_groups_by_name_and_its_items_by_id() {
         let mut chores = Items::new(ListKind::Chores);
         for (number, text) in [
-            (1, "id: c1\ngroup: Work\norder: 1000\n\n# one\n"),
-            (
-                2,
-                "id: c2\ngroup: Home\norder: 2000\ncheck: x\nfrom: 126\n\n# two.\n",
-            ),
-            (3, "id: c3\ngroup: Home\norder: 1000\n\n# three\n\nbody\n"),
-            (4, "id: c4\ngroup: Home\norder: 1000\n\n# four, tied\n"),
+            (1, "id: c1\ngroup: Work\n\n# one\n"),
+            (2, "id: c2\ngroup: Home\ncheck: x\nfrom: 126\n\n# two.\n"),
+            (3, "id: c3\ngroup: Home\n\n# three\n\nbody\n"),
+            (4, "id: c4\ngroup: Home\n\n# four\n"),
         ] {
             chores.insert(number, crate::item::Item::parse(text.as_bytes()));
         }
@@ -921,9 +913,9 @@ mod tests {
             list_rows(&chores),
             [
                 ListRow::Group(b"Home".to_vec()),
-                ListRow::Item(b"c3 three".to_vec()),
-                ListRow::Item(b"c4 four, tied".to_vec()),
                 ListRow::Item(b"c2 two. Check: x  (126)".to_vec()),
+                ListRow::Item(b"c3 three".to_vec()),
+                ListRow::Item(b"c4 four".to_vec()),
                 ListRow::Group(b"Work".to_vec()),
                 ListRow::Item(b"c1 one".to_vec()),
             ]
@@ -931,11 +923,14 @@ mod tests {
         let mut backlog = Items::new(ListKind::Backlog);
         backlog.insert(
             41,
-            crate::item::Item::parse(b"id: b41\norder: 1\nfrom: 126\n\n# Later\n"),
+            crate::item::Item::parse(b"id: b41\ngroup: Default\nfrom: 126\n\n# Later\n"),
         );
         assert_eq!(
             list_rows(&backlog),
-            [ListRow::Item(b"b41 Later  (from 126)".to_vec())]
+            [
+                ListRow::Group(b"Default".to_vec()),
+                ListRow::Item(b"b41 Later  (from 126)".to_vec())
+            ]
         );
     }
 

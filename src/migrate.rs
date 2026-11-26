@@ -1,5 +1,6 @@
 //! `board migrate`: a project's `chores.md` and `backlog.md`, the storage
-//! before item files, converted to one file per item in one write.
+//! before item files, converted to one file per item, and the item files
+//! brought up to date (a `group:` on each, no `order:`), in one write.
 //!
 //! A line is taken apart by the readers of the old list code
 //! ([`crate::list`]), so it reads exactly as the old tool read it. The
@@ -8,33 +9,55 @@
 //! was made for have none). Rejected: giving a colliding id a new number:
 //! an id is how the owner and the briefs refer to an item.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::brief::Stamp;
 use crate::id::{ItemId, ListId, ListKind};
-use crate::item::{self, Body, Item, STEP};
+use crate::item::{self, Body, DEFAULT_GROUP, Item};
 use crate::list::{Entry, Line, is_continuation, parse_line, split_check, split_reference};
 use crate::project::{OldList, Project};
 use crate::raw;
 
-/// How many items a migration made, per kind.
+/// How many items a migration made from list files, per kind, and how
+/// many item files it brought up to date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Migrated {
+    /// Whether there were list files to convert.
+    pub lists: bool,
     pub chores: usize,
     pub backlog: usize,
+    pub updated: usize,
+}
+
+impl Migrated {
+    /// Nothing was there to do: the write makes no commit.
+    pub fn is_nothing(&self) -> bool {
+        !self.lists && self.updated == 0
+    }
 }
 
 impl fmt::Display for Migrated {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let plural =
             |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let updated = format!(
+            "updated {}",
+            plural(self.updated, "item file", "item files")
+        );
+        if !self.lists {
+            return f.write_str(&updated);
+        }
         write!(
             f,
             "migrated {}, {}",
             plural(self.chores, "chore", "chores"),
             plural(self.backlog, "backlog item", "backlog items")
-        )
+        )?;
+        if self.updated > 0 {
+            write!(f, "; {updated}")?;
+        }
+        Ok(())
     }
 }
 
@@ -65,10 +88,10 @@ struct Old {
 }
 
 /// Converts every list file of the project into item files and marks the
-/// lists deleted; nothing changes when a line is unplaced. In a project
-/// that has item files already, the list's items go after them in their
-/// group: a list that came back from a machine on the old binary is folded
-/// in.
+/// lists deleted, and brings the item files there were up to date
+/// ([`update`]); nothing changes when a line is unplaced. In a project that
+/// has item files already, the list's items join them: a list that came
+/// back from a machine on the old binary is folded in.
 pub(crate) fn migrate(project: &mut Project, now: Stamp) -> Result<Migrated, Vec<Unplaced>> {
     let mut read = Vec::new();
     let mut unplaced = Vec::new();
@@ -93,23 +116,19 @@ pub(crate) fn migrate(project: &mut Project, now: Stamp) -> Result<Migrated, Vec
         unplaced.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
         return Err(unplaced);
     }
-    let mut migrated = Migrated::default();
+    let mut migrated = Migrated {
+        lists: !project.old_lists.is_empty(),
+        updated: update(project),
+        ..Migrated::default()
+    };
+    let default = Line::new(DEFAULT_GROUP).expect("a line");
     for (kind, _, items) in read {
-        // The order of the file, a chore's within its group, after what the
-        // group has (the planner's promise: "it numbers the items as they
-        // now stand in the file").
-        let mut next: BTreeMap<Option<Vec<u8>>, i64> = BTreeMap::new();
         for old in items {
-            let group = old.group.as_ref().map(|g| g.as_str().as_bytes().to_vec());
-            let order = *next
-                .entry(group.clone())
-                .or_insert_with(|| project.list(kind).next_order(group.as_deref()));
-            next.insert(group, order.saturating_add(STEP));
             let id = ListId::of(kind, old.id).expect("a parsed id is past 0");
             let item = Item::new(item::New {
                 id: ItemId::from(id),
-                group: old.group.as_ref(),
-                order,
+                // A chore the heading it stood under; the backlog had none.
+                group: old.group.as_ref().unwrap_or(&default),
                 check: old.check.as_ref(),
                 from: old.from,
                 created: now,
@@ -128,6 +147,41 @@ pub(crate) fn migrate(project: &mut Project, now: Stamp) -> Result<Migrated, Vec
         list.converted = true;
     }
     Ok(migrated)
+}
+
+/// Brings the item files up to date; gives how many it changed. An item
+/// without a `group:` gets `group: Default`, right after `id:` (an empty
+/// one is filled where it stands), and every header `order:` line goes
+/// (owner, 2026-11-26: items have no order). The
+/// rest of each file stays byte for byte, the body too, whatever lines it
+/// has; a file that needs neither is not written.
+///
+/// Stripped although nothing reads the key any more: migrate writes these
+/// files anyway, and a dead key in every file would have to be explained to
+/// each planner who edits one by hand.
+fn update(project: &mut Project) -> usize {
+    let default = Line::new(DEFAULT_GROUP).expect("a line");
+    let mut updated = 0;
+    for kind in ListKind::ALL {
+        let stale: Vec<u32> = project
+            .list(kind)
+            .numbers()
+            .filter(|number| {
+                let item = project.list(kind).get(*number).expect("listed");
+                item.group().is_none() || item.get("order").is_some()
+            })
+            .collect();
+        for number in stale {
+            let id = ListId::of(kind, number).expect("an item's id is past 0");
+            let item = project.item_mut(id).expect("listed");
+            if item.group().is_none() {
+                item.set_group(&default);
+            }
+            item.remove("order");
+            updated += 1;
+        }
+    }
+    updated
 }
 
 fn read_list(list: &OldList) -> Result<Vec<Old>, Vec<Unplaced>> {

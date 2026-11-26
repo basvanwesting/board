@@ -2,14 +2,13 @@
 //!
 //! The parsers take anything, so a hand edit never stops the tool. Lint is
 //! where the edits that leave an item unusable come up: an id that names two
-//! things, an item without its place, a brief no command will move.
+//! things, an item without its group, a brief no command will move.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::brief::BadStatus;
 use crate::id::{BriefId, ItemId, ListId, ListKind};
-use crate::item::BadOrder;
 use crate::project::Project;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,11 +33,8 @@ pub enum Problem {
     /// An item's header `id:` is not the id of its file name, which is the
     /// one the tool goes by.
     ItemHeaderId { found: String, name: ListId },
-    /// An item's file without a key it needs: `id`, `order`, `created`, and
-    /// a chore's `group`.
+    /// An item's file without a key it needs: `id`, `group`, `created`.
     MissingKey(&'static str),
-    /// An item's `order:` that is no integer: it is listed last.
-    BadOrder(String),
     /// An item's file without its `# ` title line.
     NoTitle,
     /// An `.md` file below `briefs/`, `chores/` or `backlog/` that is not
@@ -85,12 +81,12 @@ impl fmt::Display for Problem {
                 "header id `{}` differs from the file name's {name}",
                 found.escape_debug()
             ),
-            Problem::MissingKey(key) => write!(f, "no `{key}:` line"),
-            Problem::BadOrder(found) => write!(
-                f,
-                "order `{}` is no integer, so the item is listed last",
-                found.escape_debug()
+            // The finding a file from before groups on the backlog gives:
+            // it names the command that fixes them all at once.
+            Problem::MissingKey("group") => f.write_str(
+                "no `group:` line, or an empty one; `board migrate` gives it `group: Default`",
             ),
+            Problem::MissingKey(key) => write!(f, "no `{key}:` line"),
             Problem::NoTitle => f.write_str("no `# ` title line after the header"),
             Problem::Misnamed => f.write_str(
                 "not named as the board names its files (briefs/[done/]<number>-<slug>.md, \
@@ -154,12 +150,20 @@ fn items(project: &Project, kind: ListKind, findings: &mut Vec<Finding>) {
                 problem,
             });
         };
-        let mut required = vec!["id", "order", "created"];
-        if kind == ListKind::Chores {
-            required.push("group");
-        }
-        for key in required {
-            if item.get(key).is_none() {
+        // An item without a group is a finding, not a refusal: it is listed
+        // under the empty name, so it is seen, and every command works on
+        // it. Rejected: refusing commands until `migrate`, as a list file
+        // is refused; that refusal is for a board that would look empty and
+        // a write landing beside items the tool cannot see, and neither
+        // holds here. An old order key is no finding either: a key the tool
+        // does not know.
+        for key in ["id", "group", "created"] {
+            let missing = match key {
+                // An empty value lists as a missing one does.
+                "group" => item.group().is_none(),
+                _ => item.get(key).is_none(),
+            };
+            if missing {
                 finding(Problem::MissingKey(key));
             }
         }
@@ -170,9 +174,6 @@ fn items(project: &Project, kind: ListKind, findings: &mut Vec<Finding>) {
                 found: String::from_utf8_lossy(found).into_owned(),
                 name: id,
             });
-        }
-        if let Err(BadOrder::NotANumber(found)) = item.order() {
-            finding(Problem::BadOrder(found));
         }
         if item.title().is_none() {
             finding(Problem::NoTitle);
@@ -396,20 +397,19 @@ mod tests {
     fn a_well_formed_item_has_no_findings_with_or_without_a_check() {
         let project = with_items(
             &[
-                (
-                    1,
-                    "id: c1\ngroup: Home\norder: 1000\ncreated: x\n\n# Do it\n",
-                ),
+                (1, "id: c1\ngroup: Home\ncreated: x\n\n# Do it\n"),
                 // No check, an empty check, a key the tool does not know.
                 (
                     2,
-                    "id: c2\ngroup: Home\norder: -5\ncheck:\nowner: me\ncreated: x\n\n# Do it\n",
+                    "id: c2\ngroup: Home\ncheck:\nowner: me\ncreated: x\n\n# Do it\n",
                 ),
             ],
-            &[(
-                1,
-                "id: b1\norder: 1000\ncreated: x\ngroup: kept\n\n# Later\n\nbody\n",
-            )],
+            &[
+                (1, "id: b1\ncreated: x\ngroup: kept\n\n# Later\n\nbody\n"),
+                // An order key left from before is a key the tool does not
+                // know, a number or not.
+                (2, "id: b2\ngroup: g\norder: x\ncreated: x\n\n# Later\n"),
+            ],
         );
         assert_eq!(lint(&project), []);
     }
@@ -418,16 +418,22 @@ mod tests {
     fn an_item_needs_its_keys() {
         let project = with_items(
             &[(1, "id: c1\n\n# Do it\n")],
-            &[(1, "order: 1000\n\n# Later\n")],
+            &[
+                (1, "from: 126\n\n# Later\n"),
+                // An empty group lists as a missing one does.
+                (2, "id: b2\ngroup: \ncreated: x\n\n# Later\n"),
+            ],
         );
         assert_eq!(
             lines(&project),
             [
-                "shop/chores/c1.md: no `order:` line",
+                "shop/chores/c1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`",
                 "shop/chores/c1.md: no `created:` line",
-                "shop/chores/c1.md: no `group:` line",
                 "shop/backlog/b1.md: no `id:` line",
+                "shop/backlog/b1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`",
                 "shop/backlog/b1.md: no `created:` line",
+                "shop/backlog/b2.md: no `group:` line, or an empty one; `board migrate` gives it \
+                 `group: Default`",
             ]
         );
     }
@@ -435,8 +441,8 @@ mod tests {
     #[test]
     fn an_item_s_header_id_is_its_file_name_s() {
         let project = with_items(
-            &[(1, "id: c2\ngroup: g\norder: 1\ncreated: x\n\n# Do it\n")],
-            &[(4, "id: c4\norder: 1\ncreated: x\n\n# Later\n")],
+            &[(1, "id: c2\ngroup: g\ncreated: x\n\n# Do it\n")],
+            &[(4, "id: c4\ngroup: g\ncreated: x\n\n# Later\n")],
         );
         assert_eq!(
             lines(&project),
@@ -448,19 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn an_item_s_order_is_an_integer() {
-        let project = with_items(&[], &[(1, "id: b1\norder: first\ncreated: x\n\n# Later\n")]);
-        assert_eq!(
-            lines(&project),
-            ["shop/backlog/b1.md: order `first` is no integer, so the item is listed last"]
-        );
-    }
-
-    #[test]
     fn an_item_has_a_title_line() {
         let project = with_items(
             &[],
-            &[(1, "id: b1\norder: 1\ncreated: x\n\nNo title here\n")],
+            &[(1, "id: b1\ngroup: g\ncreated: x\n\nNo title here\n")],
         );
         assert_eq!(
             lines(&project),

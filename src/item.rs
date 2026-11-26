@@ -5,8 +5,7 @@
 //! <project>/chores/c12.md            <project>/backlog/b41.md
 //!
 //! id: c12
-//! group: Deploy                      a chore's, required
-//! order: 3000                        the place in its group, or the backlog
+//! group: Deploy                      required, `Default` when none is given
 //! check: <one line>                  a chore's, optional
 //! from: 126                          optional: the item it came from
 //! created: 2026-11-25T14:08:18Z
@@ -19,22 +18,30 @@
 //! One file per item, as a brief has, decided by the owner (2026-11-25),
 //! reversing the list files of 2026-11-24: a body is Markdown (an SQL check
 //! can be copied whole, a list is a list), git merges and shows an item on
-//! its own, and order and group are keys on the item, as metadata. The file
+//! its own, and the group is a key on the item, as metadata. The file
 //! is named by its id only: a slug would rename the file at every retitle,
 //! and the merge of a rename is not worth it (owner).
+//!
+//! A backlog item has a group as a chore has (owner, 2026-11-26: "Make it
+//! required, just add "Default" to start with and then the logic is
+//! easier"): one rule for both lists, and `Default` is where an item lands
+//! that was given none. Neither kind has an order key any more (same day:
+//! "these items don't have order"); a file that still has one keeps it as
+//! an unknown key until `migrate` strips it.
 
 use std::collections::BTreeMap;
 
 use crate::brief::Stamp;
 use crate::header::Header;
 use crate::id::{ItemId, ListKind};
-use crate::list::{FindError, Line, Move, Side};
+use crate::list::{FindError, Line};
 use crate::raw;
 
-/// The gap between two neighbours' orders that a new item, or an item put
-/// first or last, keeps: room for many moves halfway between before a
-/// renumbering.
-pub(crate) const STEP: i64 = 1000;
+/// The group an item gets when none is given (`add` without `--group`, an
+/// item `migrate` finds without one): an inbox the planner sorts (owner,
+/// 2026-11-26: "just add "Default" to start with and then the logic is
+/// easier"), for chores and backlog items alike.
+pub const DEFAULT_GROUP: &str = "Default";
 
 /// A chore's or backlog item's file, lossless: written back unchanged it
 /// gives the bytes read. The parts a command changes (a key, the title, the
@@ -51,14 +58,6 @@ pub struct Item {
     separator: Vec<u8>,
     /// Everything after: the body, kept byte for byte.
     body: Vec<u8>,
-}
-
-/// Why an item's `order:` is no place.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BadOrder {
-    Missing,
-    /// Not an integer, as found.
-    NotANumber(String),
 }
 
 impl Item {
@@ -92,10 +91,7 @@ impl Item {
     pub(crate) fn new(new: New<'_>) -> Item {
         let mut header = Header::default();
         header.set("id", &new.id.to_string());
-        if let Some(group) = new.group {
-            header.set("group", group.as_str());
-        }
-        header.set("order", &new.order.to_string());
+        header.set("group", new.group.as_str());
         if let Some(check) = new.check {
             header.set("check", check.as_str());
         }
@@ -147,17 +143,10 @@ impl Item {
         &self.body
     }
 
-    pub fn order(&self) -> Result<i64, BadOrder> {
-        let value = self.get("order").ok_or(BadOrder::Missing)?;
-        str::from_utf8(value)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| BadOrder::NotANumber(String::from_utf8_lossy(value).into_owned()))
-    }
-
-    /// A chore's group; `None` without one.
+    /// The item's group; `None` without one, and an empty `group:` is
+    /// none: it lists under the empty name, as a missing line does.
     pub fn group(&self) -> Option<&[u8]> {
-        self.get("group")
+        self.get("group").filter(|group| !group.is_empty())
     }
 
     /// A chore's check; an empty `check:` is none.
@@ -177,6 +166,14 @@ impl Item {
 
     pub(crate) fn remove(&mut self, key: &str) {
         self.header.remove(key);
+    }
+
+    /// Puts the item in `group`: its `group:` line rewritten in place, or,
+    /// on an item without one, added right after `id:`, where a new item
+    /// has it, rather than at the end of the header as a new key lands.
+    pub(crate) fn set_group(&mut self, group: &Line) {
+        self.terminate_header();
+        self.header.set_after("group", group.as_str(), "id");
     }
 
     pub(crate) fn set_title(&mut self, title: &Line) {
@@ -305,8 +302,7 @@ fn join(title: &[u8]) -> &'static [u8] {
 /// A new item, as `add` gives it.
 pub(crate) struct New<'a> {
     pub id: ItemId,
-    pub group: Option<&'a Line>,
-    pub order: i64,
+    pub group: &'a Line,
     pub check: Option<&'a Line>,
     pub from: Option<ItemId>,
     pub created: Stamp,
@@ -391,24 +387,20 @@ impl Items {
         self.get(number).ok_or(FindError::Missing)
     }
 
-    /// The group a chore is listed under: its `group:`, the empty name
-    /// without one (lint reports it). A backlog item has none.
-    fn group_of<'a>(&self, item: &'a Item) -> &'a [u8] {
-        match self.kind {
-            ListKind::Chores => item.group().unwrap_or_default(),
-            ListKind::Backlog => b"",
-        }
+    /// The group an item is listed under: its `group:`, the empty name
+    /// without one (lint reports it, and no command refuses the item: it
+    /// is seen and listed, so a write beside it lands where it is seen).
+    fn group_of(item: &Item) -> &[u8] {
+        item.group().unwrap_or_default()
     }
 
-    /// The place an item is listed at: an order that is no number goes
-    /// last (lint reports it), ties by id.
-    fn place(item: &Item) -> i64 {
-        item.order().unwrap_or(i64::MAX)
-    }
-
-    /// The items in the board's order: by group (chores, by name, byte
-    /// order), then by `order`, ties by id. A group exists while a chore
-    /// names it.
+    /// The items in the board's order: by group (by name, byte order), then
+    /// by id, numerically, which is the order they were made in. A group
+    /// exists while an item names it.
+    ///
+    /// No order of their own (owner, 2026-11-26, reversing the `order` key
+    /// of 2026-11-25): "these items don't have order". The grouping is
+    /// what places an item.
     pub fn listed(&self) -> Vec<Listed<'_>> {
         let mut listed: Vec<Listed<'_>> = self
             .files
@@ -418,121 +410,25 @@ impl Items {
                 item,
             })
             .collect();
-        listed.sort_by(|a, b| {
-            (self.group_of(a.item), Self::place(a.item), a.number).cmp(&(
-                self.group_of(b.item),
-                Self::place(b.item),
-                b.number,
-            ))
-        });
+        // Stable, and the map gives them by id.
+        listed.sort_by(|a, b| Self::group_of(a.item).cmp(Self::group_of(b.item)));
         listed
     }
 
     /// The groups and items as `ls` lists them: a `## group` row above each
-    /// group's chores; the backlog has no groups.
+    /// group's items, for both kinds.
     pub fn rows(&self) -> Vec<Row<'_>> {
         let mut rows = Vec::new();
         let mut group: Option<&[u8]> = None;
         for listed in self.listed() {
-            if self.kind == ListKind::Chores {
-                let this = self.group_of(listed.item);
-                if group != Some(this) {
-                    rows.push(Row::Group(this));
-                    group = Some(this);
-                }
+            let this = Self::group_of(listed.item);
+            if group != Some(this) {
+                rows.push(Row::Group(this));
+                group = Some(this);
             }
             rows.push(Row::Item(listed));
         }
         rows
-    }
-
-    /// The order a new item gets: past the last of its group (a chore) or
-    /// of the backlog, by [`STEP`].
-    pub(crate) fn next_order(&self, group: Option<&[u8]>) -> i64 {
-        self.files
-            .values()
-            .filter(|item| self.kind == ListKind::Backlog || item.group() == group)
-            .filter_map(|item| item.order().ok())
-            .max()
-            .map_or(STEP, |last| last.saturating_add(STEP))
-    }
-
-    /// Moves an item next to another of its kind: gives the ids whose files
-    /// changed, none when the item already stands there.
-    ///
-    /// Only the moved item's file is written: its `order` goes halfway
-    /// between its new neighbours in their group, [`STEP`] before the first
-    /// or after the last, and a chore takes the target's group. When the
-    /// neighbours leave no integer between them, the group (or the backlog)
-    /// is renumbered by [`STEP`] in the same change. Rejected: an index file
-    /// of the order, which every move of any item would write.
-    pub(crate) fn move_item(&mut self, wanted: &Move) -> Result<Vec<u32>, MoveError> {
-        let (item, target) = (wanted.item().get(), wanted.target().get());
-        self.find(item).map_err(MoveError::Item)?;
-        self.find(target).map_err(MoveError::Target)?;
-        let before: Vec<u32> = self.listed().iter().map(|listed| listed.number).collect();
-        let mut order: Vec<u32> = before.iter().copied().filter(|n| *n != item).collect();
-        let at = order
-            .iter()
-            .position(|n| *n == target)
-            .expect("the target is listed");
-        let at = match wanted.side() {
-            Side::Before => at,
-            Side::After => at + 1,
-        };
-        order.insert(at, item);
-        let group = self.group_of(&self.files[&target]).to_vec();
-        let same_group = self.group_of(&self.files[&item]) == group.as_slice();
-        if order == before && same_group {
-            return Ok(Vec::new());
-        }
-        let in_group = |n: &u32| self.group_of(&self.files[n]) == group.as_slice() || *n == item;
-        let group_order: Vec<u32> = order.iter().copied().filter(in_group).collect();
-        let at = group_order
-            .iter()
-            .position(|n| *n == item)
-            .expect("the item is in its new group");
-        let order_of = |n: Option<&u32>| n.map(|n| self.files[n].order());
-        let place = match (
-            order_of(at.checked_sub(1).map(|above| &group_order[above])),
-            order_of(group_order.get(at + 1)),
-        ) {
-            (Some(Ok(above)), Some(Ok(below))) => {
-                let mid = above + (below - above) / 2;
-                (above < mid && mid < below).then_some(mid)
-            }
-            (Some(Ok(above)), None) => above.checked_add(STEP),
-            (None, Some(Ok(below))) => below.checked_sub(STEP),
-            // Alone in its group, as the target is in it: not reached.
-            (None, None) => Some(STEP),
-            // A neighbour without a number: the renumbering gives it one.
-            (Some(Err(_)), _) | (_, Some(Err(_))) => None,
-        };
-        let moved = self.files.get_mut(&item).expect("found above");
-        if self.kind == ListKind::Chores && !same_group {
-            moved.set("group", &String::from_utf8_lossy(&group));
-        }
-        match place {
-            Some(place) => {
-                moved.set("order", &place.to_string());
-                Ok(vec![item])
-            }
-            None => {
-                let mut changed = vec![item];
-                for (rank, n) in group_order.iter().enumerate() {
-                    let place = STEP * (i64::try_from(rank).unwrap_or(i64::MAX / STEP) + 1);
-                    let file = self.files.get_mut(n).expect("listed");
-                    if file.order() != Ok(place) {
-                        file.set("order", &place.to_string());
-                        if *n != item {
-                            changed.push(*n);
-                        }
-                    }
-                }
-                changed.sort_unstable();
-                Ok(changed)
-            }
-        }
     }
 }
 
@@ -543,18 +439,10 @@ pub enum Row<'a> {
     Item(Listed<'a>),
 }
 
-/// Why `move` moved nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MoveError {
-    Item(FindError),
-    Target(FindError),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{BacklogId, ChoreId, ListId};
-    use proptest::prelude::*;
+    use crate::id::ChoreId;
 
     fn line(text: &str) -> Line {
         Line::new(text).unwrap()
@@ -563,12 +451,12 @@ mod tests {
     #[test]
     fn a_file_reads_back_byte_for_byte() {
         for text in [
-            "id: c1\ngroup: Home\norder: 1000\ncreated: x\n\n# Title\n",
-            "id: b1\norder: 1\n\n# T\n\nbody\n\n```sql\nselect 1;\n```\n## not a section\n",
-            "id: b1\r\norder: 1\r\n\r\n# T\r\n\r\nbody\r\n",
+            "id: c1\ngroup: Home\ncreated: x\n\n# Title\n",
+            "id: b1\ngroup: g\n\n# T\n\nbody\n\n```sql\nselect 1;\n```\n## not a section\n",
+            "id: b1\r\ngroup: g\r\n\r\n# T\r\n\r\nbody\r\n",
             "no header at all\n",
             "id: b2\n# no blank line\n",
-            "id: b3\norder: 1\n\n# T",
+            "id: b3\ngroup: g\n\n# T",
             "",
         ] {
             assert_eq!(
@@ -581,43 +469,36 @@ mod tests {
 
     #[test]
     fn title_body_and_keys_read_as_written() {
-        let item = Item::parse(
-            b"id: c1\ngroup: Home\norder: -3\ncheck:\nfrom: 126\n\n#  Do it \n\n\nkept\n",
-        );
+        let item = Item::parse(b"id: c1\ngroup: Home\ncheck:\nfrom: 126\n\n#  Do it \n\n\nkept\n");
         assert_eq!(item.title(), Some(&b"Do it"[..]));
         // One blank line sets the body off; a second is the body's.
         assert_eq!(item.body(), b"\nkept\n");
-        assert_eq!(item.order(), Ok(-3));
         assert_eq!(item.group(), Some(&b"Home"[..]));
         assert_eq!(item.check(), None);
         assert_eq!(item.from(), Some(&b"126"[..]));
         assert_eq!(Item::parse(b"id: b1\n\nno title\n").title(), None);
-        assert_eq!(
-            Item::parse(b"order: x\n").order(),
-            Err(BadOrder::NotANumber("x".to_owned()))
-        );
-        assert_eq!(Item::parse(b"id: b1\n").order(), Err(BadOrder::Missing));
+        assert_eq!(Item::parse(b"id: b1\n").group(), None);
     }
 
     #[test]
     fn the_line_and_show_are_what_ls_and_show_print() {
-        let chore = Item::parse(b"id: c12\ngroup: g\norder: 1\ncheck: x\nfrom: 126\n\n# Do it\n");
+        let chore = Item::parse(b"id: c12\ngroup: g\ncheck: x\nfrom: 126\n\n# Do it\n");
         assert_eq!(
             chore.line(ListKind::Chores, 12),
             b"c12 Do it. Check: x  (126)"
         );
-        let ends = Item::parse(b"id: c3\ngroup: g\norder: 1\ncheck: x\n\n# Done?\n");
+        let ends = Item::parse(b"id: c3\ngroup: g\ncheck: x\n\n# Done?\n");
         assert_eq!(ends.line(ListKind::Chores, 3), b"c3 Done? Check: x");
-        let plain = Item::parse(b"id: c4\ngroup: g\norder: 1\n\n# Simple\n");
+        let plain = Item::parse(b"id: c4\ngroup: g\n\n# Simple\n");
         assert_eq!(plain.line(ListKind::Chores, 4), b"c4 Simple");
-        let backlog = Item::parse(b"id: b41\norder: 1\nfrom: c3\n\n# Later\n\nwhy\n\n## more\n");
+        let backlog = Item::parse(b"id: b41\ngroup: g\nfrom: c3\n\n# Later\n\nwhy\n\n## more\n");
         assert_eq!(backlog.line(ListKind::Backlog, 41), b"b41 Later  (from c3)");
         assert_eq!(
             backlog.shown(ListKind::Backlog, 41),
             b"b41 Later  (from c3)\n\nwhy\n\n## more\n"
         );
         assert_eq!(plain.shown(ListKind::Chores, 4), b"c4 Simple\n");
-        let open = Item::parse(b"id: b1\norder: 1\n\n# T\n\nno newline");
+        let open = Item::parse(b"id: b1\ngroup: g\n\n# T\n\nno newline");
         assert_eq!(open.shown(ListKind::Backlog, 1), b"b1 T\n\nno newline\n");
     }
 
@@ -633,8 +514,7 @@ mod tests {
         let created = "2026-11-25T14:08:18Z".parse().unwrap();
         let item = Item::new(New {
             id: ItemId::Chore(ChoreId::new(12).unwrap()),
-            group: Some(&line("Deploy")),
-            order: 3000,
+            group: &line("Deploy"),
             check: Some(&line("select 1")),
             from: Some(ItemId::Brief(crate::id::BriefId::new(126))),
             created,
@@ -643,116 +523,83 @@ mod tests {
         });
         assert_eq!(
             item.to_bytes(),
-            b"id: c12\ngroup: Deploy\norder: 3000\ncheck: select 1\nfrom: 126\n\
+            b"id: c12\ngroup: Deploy\ncheck: select 1\nfrom: 126\n\
               created: 2026-11-25T14:08:18Z\n\n# Check the states\n"
         );
     }
 
     #[test]
     fn edits_keep_a_file_without_final_line_breaks_well_formed() {
-        let mut item = Item::parse(b"id: b1\norder: 1\n\n# T");
+        let mut item = Item::parse(b"id: b1\ngroup: g\n\n# T");
         item.append_body(&Body::new(b"x"));
-        assert_eq!(item.to_bytes(), b"id: b1\norder: 1\n\n# T\n\nx\n");
-        let mut item = Item::parse(b"id: b1\norder: 1");
-        item.set("order", "2");
+        assert_eq!(item.to_bytes(), b"id: b1\ngroup: g\n\n# T\n\nx\n");
+        let mut item = Item::parse(b"id: b1\ngroup: g");
+        item.set("check", "2");
         item.set_title(&line("New"));
-        assert_eq!(item.to_bytes(), b"id: b1\norder: 2\n\n# New\n");
+        assert_eq!(item.to_bytes(), b"id: b1\ngroup: g\ncheck: 2\n\n# New\n");
     }
 
-    // ---- the order of a kind's items ----
+    // ---- the listing ----
 
-    #[derive(Debug, Clone)]
-    enum Op {
-        /// A chore into group `0..3` (or a backlog item).
-        Add(u8),
-        /// The item at index, next to the one at the other index.
-        Move(usize, bool, usize),
-        Delete(usize),
-        /// Every order set to its rank (1, 2, 3, …) by hand: no gap left
-        /// anywhere, so the next move into one renumbers.
-        Squash,
+    fn items(kind: ListKind, files: &[(u32, &str)]) -> Items {
+        let mut items = Items::new(kind);
+        for (number, text) in files {
+            items.insert(*number, Item::parse(text.as_bytes()));
+        }
+        items
     }
 
-    fn op() -> impl Strategy<Value = Op> {
-        prop_oneof![
-            3 => (0u8..3).prop_map(Op::Add),
-            5 => (any::<usize>(), any::<bool>(), any::<usize>()).prop_map(|(a, s, b)| Op::Move(a, s, b)),
-            1 => any::<usize>().prop_map(Op::Delete),
-            1 => Just(Op::Squash),
-        ]
-    }
-
-    fn list_id(kind: ListKind, number: u32) -> ListId {
-        match kind {
-            ListKind::Chores => ListId::Chore(ChoreId::new(number).unwrap()),
-            ListKind::Backlog => ListId::Backlog(BacklogId::new(number).unwrap()),
+    /// By group name, then by id as a number: `c9` before `c10`, whatever
+    /// the order key of an old file says, for both kinds.
+    #[test]
+    fn items_list_by_group_then_by_id() {
+        for (kind, p) in [(ListKind::Chores, 'c'), (ListKind::Backlog, 'b')] {
+            let files = [
+                (
+                    10,
+                    format!("id: {p}10\ngroup: Home\norder: 1000\n\n# ten\n"),
+                ),
+                (9, format!("id: {p}9\ngroup: Home\norder: 2000\n\n# nine\n")),
+                (2, format!("id: {p}2\ngroup: Away\n\n# two\n")),
+                (1, format!("id: {p}1\n\n# none\n")),
+            ];
+            let files: Vec<(u32, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            let items = items(kind, &files);
+            let listed: Vec<u32> = items.listed().iter().map(|l| l.number).collect();
+            assert_eq!(listed, [1, 2, 9, 10], "{kind:?}");
+            let groups: Vec<&[u8]> = items
+                .rows()
+                .into_iter()
+                .filter_map(|row| match row {
+                    Row::Group(name) => Some(name),
+                    Row::Item(_) => None,
+                })
+                .collect();
+            assert_eq!(groups, [&b""[..], b"Away", b"Home"], "{kind:?}");
         }
     }
 
-    proptest! {
-        /// After any adds, moves, deletes and hand renumberings, the
-        /// listing is what a plain list says (groups by name, the items of
-        /// each in the order the moves put them), and no two items of one
-        /// group share an order.
-        #[test]
-        fn the_listing_is_a_plain_list_s(
-            chores in any::<bool>(),
-            ops in prop::collection::vec(op(), 0..60),
-        ) {
-            let kind = if chores { ListKind::Chores } else { ListKind::Backlog };
-            let mut items = Items::new(kind);
-            // The model: the items in listing order, each with its group.
-            let mut model: Vec<(u32, u8)> = Vec::new();
-            let mut next = 1;
-            for op in ops {
-                match op {
-                    Op::Add(group) => {
-                        let group = if chores { group } else { 0 };
-                        let name = format!("g{group}");
-                        let order = items.next_order(Some(name.as_bytes()));
-                        let mut text = format!("id: x\norder: {order}\n\n# t\n");
-                        if chores {
-                            text = format!("group: {name}\n{text}");
-                        }
-                        items.insert(next, Item::parse(text.as_bytes()));
-                        let at = model.iter().rposition(|(_, g)| *g <= group).map_or(0, |at| at + 1);
-                        model.insert(at, (next, group));
-                        next += 1;
-                    }
-                    Op::Move(from, after, to) if model.len() > 1 => {
-                        let (item, target) = (model[from % model.len()].0, model[to % model.len()].0);
-                        if item == target {
-                            continue;
-                        }
-                        let side = if after { Side::After } else { Side::Before };
-                        let wanted = Move::new(list_id(kind, item), side, list_id(kind, target)).unwrap();
-                        items.move_item(&wanted).unwrap();
-                        let moved = model.remove(model.iter().position(|(n, _)| *n == item).unwrap());
-                        let at = model.iter().position(|(n, _)| *n == target).unwrap();
-                        let group = model[at].1;
-                        model.insert(if after { at + 1 } else { at }, (moved.0, group));
-                    }
-                    Op::Move(..) => {}
-                    Op::Delete(at) if !model.is_empty() => {
-                        let (number, _) = model.remove(at % model.len());
-                        items.remove(number);
-                    }
-                    Op::Delete(_) => {}
-                    Op::Squash => {
-                        for (rank, (number, _)) in model.iter().enumerate() {
-                            items.get_mut(*number).unwrap().set("order", &(rank + 1).to_string());
-                        }
-                    }
-                }
-                let listed: Vec<u32> = items.listed().iter().map(|listed| listed.number).collect();
-                let want: Vec<u32> = model.iter().map(|(n, _)| *n).collect();
-                prop_assert_eq!(listed, want);
-                let mut seen = std::collections::BTreeSet::new();
-                for listed in items.listed() {
-                    let key = (listed.item.group().map(<[u8]>::to_vec), listed.item.order().unwrap());
-                    prop_assert!(seen.insert(key), "an order twice in one group");
-                }
-            }
-        }
+    #[test]
+    fn set_group_rewrites_its_line_or_adds_one_right_after_id() {
+        let mut item = Item::parse(b"id: b1\nfrom: 3\ncreated: x\n\n# T\n");
+        item.set_group(&line("Later"));
+        assert_eq!(
+            item.to_bytes(),
+            b"id: b1\ngroup: Later\nfrom: 3\ncreated: x\n\n# T\n"
+        );
+        item.set_group(&line("Now"));
+        assert_eq!(
+            item.to_bytes(),
+            b"id: b1\ngroup: Now\nfrom: 3\ncreated: x\n\n# T\n"
+        );
+        let mut item = Item::parse(b"id: c1\r\ncreated: x\r\n\r\n# T\r\n");
+        item.set_group(&line("G"));
+        assert_eq!(
+            item.to_bytes(),
+            b"id: c1\r\ngroup: G\r\ncreated: x\r\n\r\n# T\r\n"
+        );
+        let mut open = Item::parse(b"id: c1");
+        open.set_group(&line("G"));
+        assert_eq!(open.to_bytes(), b"id: c1\ngroup: G\n");
     }
 }

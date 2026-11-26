@@ -92,26 +92,43 @@ fn add_prints_the_new_id_and_pushes_one_commit_with_the_one_file() {
             .ok(),
         "c2\n"
     );
+    // Without `--group`: `Default`, for both kinds; with it, that group.
+    assert_eq!(a.board(&["add", "chore", "Sweep"]).ok(), "c3\n");
+    assert_eq!(
+        a.board(&["add", "backlog", "Export", "--group", "Later"])
+            .ok(),
+        "b3\n"
+    );
+    assert_eq!(
+        stamped(world.remote_file("proj/chores/c3.md")),
+        "id: c3\ngroup: Default\ncreated: T\n\n# Sweep\n"
+    );
+    assert_eq!(
+        stamped(world.remote_file("proj/backlog/b3.md")),
+        "id: b3\ngroup: Later\ncreated: T\n\n# Export\n"
+    );
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b1.md")),
-        "id: b1\norder: 1000\ncreated: T\n\n# Dark mode\n"
+        "id: b1\ngroup: Default\ncreated: T\n\n# Dark mode\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b2.md")),
-        "id: b2\norder: 2000\nfrom: 126\ncreated: T\n\n# Faster search\n"
+        "id: b2\ngroup: Default\nfrom: 126\ncreated: T\n\n# Faster search\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/chores/c1.md")),
-        "id: c1\ngroup: Home\norder: 1000\ncheck: login works\nfrom: b2\ncreated: T\n\n\
+        "id: c1\ngroup: Home\ncheck: login works\nfrom: b2\ncreated: T\n\n\
          # Rotate the key\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/chores/c2.md")),
-        "id: c2\ngroup: Home\norder: 2000\ncreated: T\n\n# Water the plants\n"
+        "id: c2\ngroup: Home\ncreated: T\n\n# Water the plants\n"
     );
     assert_eq!(
         world.remote_log(),
         [
+            "proj: add b3",
+            "proj: add c3",
             "proj: add c2",
             "proj: add c1",
             "proj: add b2",
@@ -123,11 +140,12 @@ fn add_prints_the_new_id_and_pushes_one_commit_with_the_one_file() {
     in_step(&world, &a);
     assert_eq!(
         a.board(&["ls", "backlog"]).ok(),
-        "b1 Dark mode\nb2 Faster search  (from 126)\n"
+        "## Default\nb1 Dark mode\nb2 Faster search  (from 126)\n## Later\nb3 Export\n"
     );
     assert_eq!(
         a.board(&["ls", "chores"]).ok(),
-        "## Home\nc1 Rotate the key. Check: login works  (b2)\nc2 Water the plants\n"
+        "## Default\nc3 Sweep\n## Home\nc1 Rotate the key. Check: login works  (b2)\n\
+         c2 Water the plants\n"
     );
     assert_eq!(a.board(&["lint"]).ok(), "ok\n");
 }
@@ -160,7 +178,7 @@ fn done_and_drop_delete_the_files_all_or_nothing() {
 }
 
 /// `retitle` changes a title or a chore's check in one commit and keeps
-/// its id, place, reference, body and every other key; `--check ""`
+/// its id, group, reference, body and every other key; `--check ""`
 /// removes the check.
 #[test]
 fn retitle_changes_an_item_s_title_or_check_and_keeps_the_rest() {
@@ -185,7 +203,7 @@ fn retitle_changes_an_item_s_title_or_check_and_keeps_the_rest() {
     a.board(&["add", "backlog", "Dark mode", "--from", "c1"])
         .ok();
     // A key the tool does not know, typed by hand: kept.
-    let c1 = text(a.file("proj/chores/c1.md")).replace("order:", "owner: me\norder:");
+    let c1 = text(a.file("proj/chores/c1.md")).replace("created:", "owner: me\ncreated:");
     a.write("proj/chores/c1.md", &c1);
     assert_eq!(
         a.board(&["retitle", "c1", "Rotate both keys"]).ok(),
@@ -200,12 +218,12 @@ fn retitle_changes_an_item_s_title_or_check_and_keeps_the_rest() {
     a.board(&["retitle", "b1", "Dark theme"]).ok();
     assert_eq!(
         stamped(world.remote_file("proj/chores/c1.md")),
-        "id: c1\ngroup: Home\nowner: me\norder: 1000\ncheck: the old key fails\nfrom: 126\n\
+        "id: c1\ngroup: Home\ncheck: the old key fails\nfrom: 126\nowner: me\n\
          created: T\n\n# Rotate both keys\n\nthe steps\n"
     );
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b1.md")),
-        "id: b1\norder: 1000\nfrom: c1\ncreated: T\n\n# Dark theme\n"
+        "id: b1\ngroup: Default\nfrom: c1\ncreated: T\n\n# Dark theme\n"
     );
     a.board(&["retitle", "c1", "--check", ""]).ok();
     assert_eq!(
@@ -296,7 +314,7 @@ fn add_body_amend_and_replace_write_an_item_s_body() {
     assert_eq!(
         stamped(world.remote_file("proj/chores/c1.md")),
         format!(
-            "id: c1\ngroup: Deploy\norder: 1000\ncheck: the query below returns 0\ncreated: T\n\n\
+            "id: c1\ngroup: Deploy\ncheck: the query below returns 0\ncreated: T\n\n\
              # Check the orders\n\n{body}\n## Then\n- c9 not an item\n"
         )
     );
@@ -318,7 +336,7 @@ fn add_body_amend_and_replace_write_an_item_s_body() {
     assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n");
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b1.md")),
-        "id: b1\norder: 1000\ncreated: T\n\n# Dark mode\n"
+        "id: b1\ngroup: Default\ncreated: T\n\n# Dark mode\n"
     );
     a.board_with_input(&["amend", "b1", "--replace"], b"back")
         .ok();
@@ -390,176 +408,200 @@ fn a_command_refused_before_it_reads_stdin_is_judged_by_its_output() {
     );
 }
 
-/// `move` writes the moved item's file only: its order halfway between its
-/// new neighbours, a step before the first or after the last, and a chore
-/// takes the group of the item it is put next to.
+/// `group` writes the `group:` line of each item it names, chores and
+/// backlog items mixed, in one commit, and nothing else of the files.
 #[test]
-fn move_writes_the_moved_item_s_file_in_one_commit() {
+fn group_writes_the_group_lines_in_one_commit() {
     let world = World::new();
     let a = world.a();
-    for item in ["one", "two", "three"] {
+    for item in ["one", "two"] {
         a.board(&["add", "backlog", item]).ok();
     }
     for (chore, group) in [("x", "Home"), ("y", "Home"), ("z", "Work")] {
         a.board(&["add", "chore", chore, "--group", group]).ok();
     }
+    let files = [
+        "proj/backlog/b2.md",
+        "proj/chores/c1.md",
+        "proj/chores/c3.md",
+    ];
+    let before = files.map(|file| text(world.remote_file(file)));
+    let commits = world.remote_log().len();
     assert_eq!(
-        a.board(&["move", "b3", "--before", "b2"]).ok(),
-        "moved b3 before b2\n"
+        a.board(&["group", "c1", "b2", "c3", "b2", "--to", "Later"])
+            .ok(),
+        "grouped c1 b2 c3 under Later\n"
     );
-    assert_eq!(
-        stamped(world.remote_file("proj/backlog/b3.md")),
-        "id: b3\norder: 1500\ncreated: T\n\n# three\n"
-    );
-    assert_eq!(
-        a.board(&["ls", "backlog"]).ok(),
-        "b1 one\nb3 three\nb2 two\n"
-    );
-    a.board(&["move", "b2", "--before", "b1"]).ok();
-    assert_eq!(
-        a.board(&["ls", "backlog"]).ok(),
-        "b2 two\nb1 one\nb3 three\n"
-    );
-    // Into another group: the chore takes it.
-    assert_eq!(
-        a.board(&["move", "c1", "--after", "c3"]).ok(),
-        "moved c1 after c3\n"
-    );
-    assert_eq!(
-        stamped(world.remote_file("proj/chores/c1.md")),
-        "id: c1\ngroup: Work\norder: 2000\ncreated: T\n\n# x\n"
-    );
+    assert_eq!(world.remote_log().len(), commits + 1);
+    assert_eq!(world.remote_log()[0], "proj: grouped c1 b2 c3 under Later");
+    let mut changed = world.remote_changed("main");
+    changed.sort();
+    assert_eq!(changed, files);
+    for (file, before) in files.iter().zip(before) {
+        let group = before
+            .lines()
+            .find(|line| line.starts_with("group: "))
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            text(world.remote_file(file)),
+            before.replace(&group, "group: Later"),
+            "{file}"
+        );
+    }
     assert_eq!(
         a.board(&["ls", "chores"]).ok(),
-        "## Home\nc2 y\n## Work\nc3 z\nc1 x\n"
+        "## Home\nc2 y\n## Later\nc1 x\nc3 z\n"
     );
     assert_eq!(
-        world.remote_log()[..3],
-        ["proj: move c1", "proj: move b2", "proj: move b3"]
+        a.board(&["ls", "backlog"]).ok(),
+        "## Default\nb1 one\n## Later\nb2 two\n"
     );
-    // Each commit changed one file.
-    for (rev, file) in [
-        ("main~2", "proj/backlog/b3.md"),
-        ("main~1", "proj/backlog/b2.md"),
-        ("main", "proj/chores/c1.md"),
-    ] {
-        assert_eq!(world.remote_changed(rev), [file], "{rev}");
-    }
     in_step(&world, &a);
 
-    // Where it is already: said so, and no commit.
+    // An item there already is left out of the commit and of the print.
+    assert_eq!(
+        a.board(&["group", "c1", "c2", "--to", "Later"]).ok(),
+        "grouped c2 under Later\n"
+    );
+    assert_eq!(world.remote_changed("main"), ["proj/chores/c2.md"]);
+    // All of them: said so, and no commit.
     let log = world.remote_log();
     assert_eq!(
-        a.board(&["move", "b1", "--after", "b2"]).ok(),
-        "moved b1 after b2\n"
+        a.board(&["group", "c1", "b2", "--to", "Later"]).ok(),
+        "nothing to group: all are under Later already\n"
     );
     assert_eq!(world.remote_log(), log);
     in_step(&world, &a);
 }
 
-/// Two orders without an integer between them: the move renumbers its
-/// list in the same commit.
 #[test]
-fn a_move_into_no_gap_renumbers_the_list_in_one_commit() {
-    let world = World::new();
-    let a = world.a();
-    for (id, order) in [(1, 1), (2, 2), (3, 3)] {
-        a.write(
-            &format!("proj/backlog/b{id}.md"),
-            format!("id: b{id}\norder: {order}\ncreated: x\n\n# item {id}\n"),
-        );
-    }
-    a.board(&["sync"]).ok();
-    a.board(&["move", "b3", "--before", "b2"]).ok();
-    assert_eq!(
-        a.board(&["ls", "backlog"]).ok(),
-        "b1 item 1\nb3 item 3\nb2 item 2\n"
-    );
-    for (id, order) in [(1, 1000), (3, 2000), (2, 3000)] {
-        assert_eq!(
-            text(world.remote_file(&format!("proj/backlog/b{id}.md"))),
-            format!("id: b{id}\norder: {order}\ncreated: x\n\n# item {id}\n")
-        );
-    }
-    assert_eq!(world.remote_log()[0], "proj: move b3");
-    in_step(&world, &a);
-}
-
-#[test]
-fn move_refuses_ids_that_name_no_item() {
+fn group_refuses_an_unknown_id_and_a_missing_name_and_changes_nothing() {
     let world = World::new();
     let a = world.a();
     a.board(&["add", "backlog", "one"]).ok();
+    a.board(&["add", "chore", "x"]).ok();
     let log = world.remote_log();
+    let files = world.remote_blobs("proj");
     assert_eq!(
-        a.board(&["move", "b9", "--before", "b1"]).failed(1),
-        "board: move b9: no such backlog item\n"
+        a.board(&["group", "c1", "b9", "b1", "--to", "Later"])
+            .failed(1),
+        "board: group b9: no such backlog item\n"
     );
-    assert_eq!(
-        a.board(&["move", "b1", "--after", "b9"]).failed(1),
-        "board: move b1: after b9: no such backlog item\n"
-    );
-    assert_eq!(world.remote_log(), log);
-}
-
-/// Wrong whatever the files hold: told before the board is read.
-#[test]
-fn a_move_the_command_line_rules_out_is_a_usage_error() {
-    let world = World::new();
-    let a = world.a();
-    assert_eq!(
-        a.board(&["move", "c1", "--before", "b1"]).failed(2),
-        "board: move c1: c1 is a chore and b1 a backlog item; an item moves within its own list\n"
-    );
-    assert_eq!(
-        a.board(&["move", "b1", "--after", "b1"]).failed(2),
-        "board: move b1: b1 cannot go next to itself\n"
-    );
-    let brief = a.board(&["move", "128", "--before", "b1"]).failed(2);
-    assert!(
-        brief.starts_with(
-            "board: invalid value '128' for '<ID>': `128` is not a chore or backlog id like c12 or b41"
-        ),
-        "{brief}"
-    );
+    // Without `--to` the last id is no name: refused before the board is
+    // read.
     for args in [
-        &["move", "b1"][..],
-        &["move", "b1", "--before", "b2", "--after", "b3"],
-        &["move", "--before", "b2"],
-        &["move", "b1", "--after", "c012"],
+        &["group", "c1", "b1"][..],
+        &["group", "--to", "Later"],
+        &["group", "c1", "--to", " "],
+        &["group", "128", "--to", "Later"],
     ] {
         let said = a.board(args).failed(2);
         assert!(said.starts_with("board: "), "{args:?}: {said}");
     }
-    assert_eq!(world.remote_log(), ["start"]);
+    assert_eq!(world.remote_log(), log);
+    assert_eq!(world.remote_blobs("proj"), files);
+    in_step(&world, &a);
 }
 
-/// A move allocates no id: offline it is committed on the clone, and the
-/// next write that reaches the remote pushes it.
+/// An item file without a `group:` line is listed and no command refuses
+/// it; `group` puts the line right after `id:`.
 #[test]
-fn offline_a_move_waits_on_the_clone() {
+fn an_item_without_a_group_takes_every_item_command() {
+    let world = World::new();
+    let a = world.a();
+    a.write(
+        "proj/chores/c1.md",
+        "id: c1\nfrom: 126\ncreated: x\n\n# Water the plants\n",
+    );
+    a.write("proj/chores/c2.md", "id: c2\ncreated: x\n\n# Sweep\n");
+    a.write(
+        "proj/backlog/b1.md",
+        "id: b1\nowner: me\ncreated: x\n\n# Dark mode\n",
+    );
+    a.write("proj/backlog/b2.md", "id: b2\ncreated: x\n\n# Search\n");
+    // Every write says what lint finds as a note: the missing groups, of
+    // which some are left at every call below.
+    let ok = |args: &[&str], input: &[u8]| {
+        let ran = a.board_with_input(args, input);
+        assert_eq!(ran.code, 0, "{args:?}: {ran:?}");
+        assert!(!ran.stderr.is_empty(), "no lint note: {ran:?}");
+        assert!(
+            ran.stderr
+                .lines()
+                .all(|line| line.ends_with("gives it `group: Default`")),
+            "{ran:?}"
+        );
+        String::from_utf8(ran.stdout).unwrap()
+    };
+    ok(&["sync"], b"");
+    assert_eq!(
+        a.board(&["ls", "chores"]).ok(),
+        "## \nc1 Water the plants  (126)\nc2 Sweep\n"
+    );
+    ok(&["retitle", "c1", "Water them"], b"");
+    ok(&["retitle", "b1", "Dark theme"], b"");
+    ok(&["amend", "b1"], b"why");
+    ok(&["amend", "c1"], b"how");
+    assert_eq!(
+        ok(&["group", "c1", "b1", "--to", "Home"], b""),
+        "grouped c1 b1 under Home\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/chores/c1.md")),
+        "id: c1\ngroup: Home\nfrom: 126\ncreated: x\n\n# Water them\n\nhow\n"
+    );
+    assert_eq!(
+        text(world.remote_file("proj/backlog/b1.md")),
+        "id: b1\ngroup: Home\nowner: me\ncreated: x\n\n# Dark theme\n\nwhy\n"
+    );
+    assert_eq!(ok(&["done", "c2"], b""), "done c2\n");
+    assert_eq!(a.board(&["drop", "b2"]).ok(), "dropped b2\n");
+    in_step(&world, &a);
+}
+
+/// `move` went with the order of chores and backlog items.
+#[test]
+fn move_is_no_command() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "backlog", "one"]).ok();
+    a.board(&["add", "backlog", "two"]).ok();
+    let said = a.board(&["move", "b2", "--before", "b1"]).failed(2);
+    assert!(
+        said.starts_with("board: unrecognized subcommand 'move'"),
+        "{said}"
+    );
+}
+
+/// A regrouping allocates no id: offline it is committed on the clone, and
+/// the next write that reaches the remote pushes it.
+#[test]
+fn offline_a_group_waits_on_the_clone() {
     let world = World::new();
     let a = world.a();
     for item in ["one", "two"] {
         a.board(&["add", "backlog", item]).ok();
     }
     a.set_online(false);
-    let ran = a.board(&["move", "b2", "--before", "b1"]);
+    let ran = a.board(&["group", "b2", "--to", "Later"]);
     assert_eq!(
         (ran.code, ran.stdout.as_slice()),
-        (0, &b"moved b2 before b1\n"[..])
+        (0, &b"grouped b2 under Later\n"[..])
     );
     assert!(
         ran.stderr
             .starts_with("board: not pushed: 1 commit (fatal: "),
         "{ran:?}"
     );
-    assert_eq!(a.board(&["ls", "backlog"]).ok(), "b2 two\nb1 one\n");
+    assert_eq!(
+        a.board(&["ls", "backlog"]).ok(),
+        "## Default\nb1 one\n## Later\nb2 two\n"
+    );
     assert_eq!(world.remote_log()[0], "proj: add b2");
     a.set_online(true);
     a.board(&["sync"]).ok();
-    assert_eq!(world.remote_log()[0], "proj: move b2");
-    assert!(stamped(world.remote_file("proj/backlog/b2.md")).contains("order: 0\n"));
+    assert_eq!(world.remote_log()[0], "proj: grouped b2 under Later");
     in_step(&world, &a);
 }
 
@@ -571,8 +613,8 @@ fn what_is_no_command_line_for_a_write_is_a_usage_error() {
         &["done", "b41"][..],
         &["drop", "c12"],
         &["done"],
-        &["add", "chore", "text"],
         &["add", "chore", "text", "--group", " "],
+        &["add", "backlog", "text", "--group", ""],
         // A chore without a check leaves the flag out.
         &["add", "chore", "text", "--group", "Home", "--check", ""],
         &[
@@ -598,10 +640,7 @@ fn what_is_no_command_line_for_a_write_is_a_usage_error() {
 fn lint_findings_after_a_write_are_notes() {
     let world = World::new();
     let a = world.a();
-    a.write(
-        "proj/chores/c1.md",
-        "id: c1\norder: 1\ncreated: x\n\n# no group\n",
-    );
+    a.write("proj/chores/c1.md", "id: c1\ncreated: x\n\n# no group\n");
     a.commit_and_push("by hand");
     let ran = a.board(&["add", "backlog", "x"]);
     assert_eq!(
@@ -609,7 +648,7 @@ fn lint_findings_after_a_write_are_notes() {
         (
             0,
             &b"b1\n"[..],
-            "board: lint: proj/chores/c1.md: no `group:` line\n"
+            "board: lint: proj/chores/c1.md: no `group:` line, or an empty one; `board migrate` gives it `group: Default`\n"
         )
     );
 }
@@ -669,7 +708,7 @@ fn a_file_made_by_hand_raises_the_next_id() {
     let a = world.a();
     a.write(
         "proj/backlog/b40.md",
-        "id: b40\norder: 1\ncreated: x\n\n# by hand\n",
+        "id: b40\ngroup: Default\ncreated: x\n\n# by hand\n",
     );
     a.commit_and_push("by hand");
     assert_eq!(a.board(&["add", "backlog", "x"]).ok(), "b41\n");
@@ -704,7 +743,7 @@ fn an_item_file_added_and_deleted_on_a_merged_side_branch_is_used() {
     let world = World::new();
     let b = world.b();
     let data = b.data();
-    let item = |id: u32| format!("id: b{id}\norder: {id}\ncreated: x\n\n# x\n");
+    let item = |id: u32| format!("id: b{id}\ngroup: Default\ncreated: x\n\n# x\n");
     b.write("proj/backlog/b1.md", item(1));
     b.commit_and_push("one");
     b.git(&data, ["switch", "-q", "-c", "side"]);
@@ -970,7 +1009,10 @@ fn a_command_killed_after_its_push_is_healed_by_the_next() {
     assert_eq!(listed(&world, "backlog"), ["b1 landed"]);
     assert_eq!(a.file("proj/backlog/b1.md"), None);
     assert_eq!(a.board(&["add", "backlog", "next"]).ok(), "b2\n");
-    assert_eq!(a.board(&["ls", "backlog"]).ok(), "b1 landed\nb2 next\n");
+    assert_eq!(
+        a.board(&["ls", "backlog"]).ok(),
+        "## Default\nb1 landed\nb2 next\n"
+    );
     in_step(&world, &a);
 }
 
@@ -1006,7 +1048,7 @@ fn offline_an_id_is_refused_and_other_writes_wait_on_the_clone() {
     // A hand edit: `sync` commits it, and says it could not push.
     a.write(
         "proj/backlog/b5.md",
-        "id: b5\norder: 1\ncreated: x\n\n# by hand\n",
+        "id: b5\ngroup: Default\ncreated: x\n\n# by hand\n",
     );
     let said = a.board(&["sync"]).failed(3);
     let lines: Vec<&str> = said.lines().collect();
@@ -1093,7 +1135,7 @@ fn stale_locks_on_the_indexes_are_removed() {
     }
     a.write(
         "proj/chores/c1.md",
-        "id: c1\ngroup: g\norder: 1\ncreated: x\n\n# by hand\n",
+        "id: c1\ngroup: g\ncreated: x\n\n# by hand\n",
     );
     assert_eq!(a.board(&["add", "backlog", "x"]).ok(), "b1\n");
     for lock in &locks {
@@ -1149,7 +1191,7 @@ fn a_hostile_git_configuration_changes_nothing() {
     a.board(&["add", "backlog", "two"]).ok();
     a.write(
         "proj/backlog/b5.md",
-        "id: b5\norder: 5000\ncreated: x\n\n# signed\n",
+        "id: b5\ngroup: Default\ncreated: x\n\n# signed\n",
     );
     a.git(&a.data(), ["add", "proj"]);
     a.git(
@@ -1195,7 +1237,7 @@ fn a_hostile_git_configuration_changes_nothing() {
     );
     a.board(&["drop", "b1"]).ok();
     assert_eq!(listed(&world, "backlog"), ["b6 three"]);
-    assert_eq!(a.board(&["ls", "backlog"]).ok(), "b6 three\n");
+    assert_eq!(a.board(&["ls", "backlog"]).ok(), "## Default\nb6 three\n");
     in_step(&world, &a);
     // An untracked board file is seen with untracked files hidden; the
     // commit of hand edits and the merge go by the tool's settings, not
@@ -1212,7 +1254,7 @@ fn a_hostile_git_configuration_changes_nothing() {
     a.hook("pre-commit", "exit 1\n");
     a.hook("commit-msg", "exit 1\n");
     world.b().board(&["add", "backlog", "from b"]).ok();
-    let hand = "id: c1\ngroup: g\norder: 1\ncreated: x\n\n# hand\n";
+    let hand = "id: c1\ngroup: g\ncreated: x\n\n# hand\n";
     a.write("shop/chores/c1.md", hand);
     let b6 = text(a.file("proj/backlog/b6.md")).replace("# three", "# three, edited");
     a.write("proj/backlog/b6.md", &b6);
@@ -1233,12 +1275,7 @@ fn a_hostile_git_configuration_changes_nothing() {
 
 /// An item file as a hand edit writes it.
 fn by_hand(id: &str, title: &str) -> String {
-    let group = if id.starts_with('c') {
-        "group: g\n"
-    } else {
-        ""
-    };
-    format!("id: {id}\n{group}order: 1000\ncreated: x\n\n# {title}\n")
+    format!("id: {id}\ngroup: g\ncreated: x\n\n# {title}\n")
 }
 
 /// Every write commits the board files changed by hand first, in every
@@ -1565,19 +1602,22 @@ fn a_file_saved_during_the_push_is_merged_in() {
 
     // The file the write changes: committed and merged. The remote's
     // version stands (the write's), the save is kept beside it.
-    a.board(&["move", "b2", "--before", "b1"]).ok();
+    a.board(&["group", "b1", "--to", "Soon"]).ok();
     let saved = text(a.file("proj/backlog/b1.md")).replace("# one", "# one, edited");
     a.hook_once(
         "pre-push",
         &format!("printf '%s' {} >proj/backlog/b1.md\n", quote(&saved)),
     );
-    let ran = a.board(&["move", "b1", "--before", "b2"]);
+    let ran = a.board(&["group", "b1", "--to", "Later"]);
     assert_eq!(ran.code, 0, "{ran:?}");
     assert!(
         ran.stderr.starts_with("board: merged 1 local commit\n"),
         "{ran:?}"
     );
-    assert_eq!(a.board(&["ls", "backlog"]).ok(), "b1 one\nb2 two\n");
+    assert_eq!(
+        a.board(&["ls", "backlog"]).ok(),
+        "## Default\nb2 two\n## Later\nb1 one\n"
+    );
     assert_eq!(text(a.file("proj/backlog/b1.md.local")), saved);
     fs::remove_file(a.data().join("proj/backlog/b1.md.local")).unwrap();
     assert_eq!(a.status(), "");
@@ -1600,7 +1640,7 @@ fn a_file_deleted_during_the_push_of_its_write_stays_deleted() {
     let ran = a.board(&["retitle", "b1", "one, renamed"]);
     assert_eq!(ran.code, 0, "{ran:?}");
     assert!(!a.data().join("proj/backlog/b1.md").exists(), "{ran:?}");
-    assert_eq!(a.board(&["ls", "backlog"]).ok(), "b2 two\n");
+    assert_eq!(a.board(&["ls", "backlog"]).ok(), "## Default\nb2 two\n");
     assert_eq!(a.status(), "");
 
     // The next write pushes the delete.

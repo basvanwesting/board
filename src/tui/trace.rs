@@ -12,11 +12,11 @@
 //! - T2 each panel's cursor row is drawn: at its offset or below, above the
 //!   panel's bottom;
 //! - T3 a cursor stays on its item while the item is shown, whatever came
-//!   (a reload, a filter, a resize, a tab, a move), unless a key moved it;
+//!   (a reload, a filter, a resize, a tab), unless a key moved it;
 //!   one that moved lands where its key says;
 //! - T4 every command comes from the event that gives it, Esc gives none,
-//!   navigation none of its own (the move its key ends, as any other key
-//!   but Esc ends it), and a file change is one load;
+//!   navigation none, `J`/`K` none (no key of the TUI's since items lost
+//!   their order), and a file change is one load;
 //! - T5 Esc does one thing (stops a filter being typed, or answers no, or
 //!   closes help, or leaves the preview, or clears the focused panel's
 //!   filter) and nothing else;
@@ -29,21 +29,16 @@
 //!   to a question, which only `d` (on a chore) or `x` (on a backlog item)
 //!   asks, about the item under the cursor, by the id the CLI reads on
 //!   its line;
-//! - T10 a run of `J`/`K` ends in exactly one `board move`, the one that
-//!   puts the item where the screen showed it, or is dropped with a note
-//!   (its item or neighbour gone after a reload, or no neighbour with an id
-//!   to name), or came back where it began; it is kept across a reload
-//!   that keeps both, and while it runs the cursor is on its item;
-//! - T11 the state knows the writes out, in order; quit waits for them
+//! - T10 the state knows the writes out, in order; quit waits for them
 //!   (a second quit does not), and comes when the last one has answered;
-//! - T12 the editor never opens while a write is out, and on the item `e`
+//! - T11 the editor never opens while a write is out, and on the item `e`
 //!   was pressed on; one waited for opens at the load after the last
 //!   write, unless its item is gone, and any key but Esc calls it off
 //!   (only `e` asks again);
-//! - T13 a click lands where the screen drew what it hit: it focuses the
+//! - T12 a click lands where the screen drew what it hit: it focuses the
 //!   pane drawn under it and selects the item drawn on its row; the wheel
-//!   moves as `j`/`k`; either is an unrelated key first (it ends a run,
-//!   calls off an edit waited for, clears a pending `g` or `y`), and does
+//!   moves as `j`/`k`; either is an unrelated key first (it calls off an
+//!   edit waited for, clears a pending `g` or `y`), and does
 //!   nothing at all while the filter is typed, a question is asked, help
 //!   is open or a quit waits. Where a click lands comes from the frame
 //!   drawn before it (the panes' boxes found by their `[n]` titles and
@@ -74,8 +69,8 @@ struct Files {
     /// Group, id, and a variant of the text: the same item edited (2: no
     /// check). An id given twice is one item, the first.
     chores: Vec<(u8, u32, u8)>,
-    /// Id, and a variant of the text. An id given twice is one item.
-    backlog: Vec<(u32, u8)>,
+    /// Group, id, and a variant of the text. An id given twice is one item.
+    backlog: Vec<(u8, u32, u8)>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +126,7 @@ fn files() -> impl Strategy<Value = Files> {
         prop::collection::vec((1u32..10, status(), 0u8..60), 0..8),
         prop::collection::vec((1u32..10, 0u8..10), 0..4),
         prop::collection::vec((0u8..3, 1u32..12, 0u8..3), 0..14),
-        prop::collection::vec((1u32..14, 0u8..2), 0..30),
+        prop::collection::vec((0u8..3, 1u32..14, 0u8..2), 0..30),
     )
         .prop_map(|(open, filed, chores, backlog)| Files {
             open,
@@ -277,41 +272,6 @@ fn asked() -> impl Strategy<Value = Vec<Step>> {
         })
 }
 
-/// A run of `J`/`K` in a list, sometimes with a reload or Esc in it, and
-/// the key that ends it.
-fn moved() -> impl Strategy<Value = Vec<Step>> {
-    use Key::{Char, Esc};
-    let press = prop_oneof![
-        8 => prop::sample::select(vec![Char('J'), Char('K')]).prop_map(Step::Key),
-        1 => Just(Step::Key(Esc)),
-        1 => Just(Step::LoadSame),
-        1 => files().prop_map(Step::Load),
-    ];
-    (
-        prop::sample::select(vec!['2', '3']),
-        0usize..4,
-        prop::collection::vec(press, 1..8),
-        prop::sample::select(vec![
-            Char('j'),
-            Char('k'),
-            Char('r'),
-            Char('e'),
-            Char('y'),
-            Char('d'),
-            Char('?'),
-            Char('1'),
-            Char('q'),
-        ]),
-    )
-        .prop_map(|(panel, down, presses, end)| {
-            let mut steps = vec![Step::Key(Char(panel))];
-            steps.extend((0..down).map(|_| Step::Key(Char('j'))));
-            steps.extend(presses);
-            steps.push(Step::Key(end));
-            steps
-        })
-}
-
 /// `e` while a write is out: the editor waits for its answer and the load
 /// after it, which may give the item an id. Random steps rarely bring the
 /// three in that order.
@@ -372,34 +332,14 @@ fn yanked_whole() -> impl Strategy<Value = Vec<Step>> {
     })
 }
 
-/// A run of `J`/`K` ended by a click on the left column, where the panels
-/// are: a random click seldom comes during a run.
-fn moved_then_clicked() -> impl Strategy<Value = Vec<Step>> {
-    use Key::Char;
-    (
-        prop::sample::select(vec!['2', '3']),
-        prop::collection::vec(prop::sample::select(vec![Char('J'), Char('K')]), 1..4),
-        0u16..70,
-        0u16..40,
-    )
-        .prop_map(|(panel, presses, column, row)| {
-            let mut steps = vec![Step::Key(Char(panel))];
-            steps.extend(presses.into_iter().map(Step::Key));
-            steps.push(Step::Mouse(Mouse::Click { column, row }));
-            steps
-        })
-}
-
 fn trace() -> impl Strategy<Value = (Files, Vec<Step>)> {
     let steps = prop_oneof![
         30 => step().prop_map(|step| vec![step]),
         1 => filter_typed(),
         3 => asked(),
-        4 => moved(),
         1 => edit_waits(),
         1 => previewed(),
         1 => yanked_whole(),
-        1 => moved_then_clicked(),
     ];
     (
         files(),
@@ -453,15 +393,7 @@ fn data(files: &Files) -> Data {
             .map(|(number, lines)| brief(*number, Some(Status::Filed), *lines))
             .collect(),
         chores: ListLine::numbered(ListKind::Chores, chore_rows(&files.chores)),
-        backlog: ListLine::numbered(
-            ListKind::Backlog,
-            unique(&files.backlog, |(id, _)| *id)
-                .into_iter()
-                .map(|(id, variant)| {
-                    ListRow::Item(format!("b{id} backlog item ü v{variant}").into_bytes())
-                })
-                .collect(),
-        ),
+        backlog: ListLine::numbered(ListKind::Backlog, backlog_rows(&files.backlog)),
     }
 }
 
@@ -479,25 +411,34 @@ fn unique<T: Copy>(items: &[T], id: impl Fn(&T) -> u32) -> Vec<T> {
         .collect()
 }
 
-/// The chores as `ls` lists them: a group by name, its chores in the order
-/// given (their `order:`), a group only while a chore names it.
-fn chore_rows(chores: &[(u8, u32, u8)]) -> Vec<ListRow> {
-    let chores = unique(chores, |(_, id, _)| *id);
+/// A kind's items as `ls` lists them: a group by name, its items by id, a
+/// group only while an item names it.
+fn grouped_rows(items: &[(u8, u32, u8)], line: impl Fn(u32, u8) -> String) -> Vec<ListRow> {
+    let mut items = unique(items, |(_, id, _)| *id);
+    items.sort_by_key(|(group, id, _)| (*group, *id));
     let mut rows = Vec::new();
-    for group in 0..3 {
-        let mut items = chores.iter().filter(|(of, _, _)| *of == group).peekable();
-        if items.peek().is_some() {
+    let mut last = None;
+    for (group, id, variant) in items {
+        if last != Some(group) {
             rows.push(ListRow::Group(format!("group {group}").into_bytes()));
+            last = Some(group);
         }
-        for (_, id, variant) in items {
-            let text = match variant {
-                2 => format!("c{id} chore v2"),
-                _ => format!("c{id} chore v{variant}. Check: it is done"),
-            };
-            rows.push(ListRow::Item(text.into_bytes()));
-        }
+        rows.push(ListRow::Item(line(id, variant).into_bytes()));
     }
     rows
+}
+
+fn chore_rows(chores: &[(u8, u32, u8)]) -> Vec<ListRow> {
+    grouped_rows(chores, |id, variant| match variant {
+        2 => format!("c{id} chore v2"),
+        _ => format!("c{id} chore v{variant}. Check: it is done"),
+    })
+}
+
+fn backlog_rows(backlog: &[(u8, u32, u8)]) -> Vec<ListRow> {
+    grouped_rows(backlog, |id, variant| {
+        format!("b{id} backlog item ü v{variant}")
+    })
 }
 
 fn fetched(answer: &Answer) -> Fetched {
@@ -538,8 +479,6 @@ struct Depth {
     /// Esc closed help over the preview: the preview stays.
     esc_help_over_preview: u32,
     esc_filter: u32,
-    /// Esc during a run of `J`/`K`: the run goes on.
-    esc_moving: u32,
     esc_nothing: u32,
     /// A filter hid rows of a list with a cursor.
     filtered: u32,
@@ -554,15 +493,6 @@ struct Depth {
     confirmed: u32,
     /// A question answered no by a key that is not Esc.
     declined: u32,
-    moves_sent: u32,
-    /// A move sent whose item went past a heading, into another group.
-    moved_to_other_group: u32,
-    /// A move sent while another write was out.
-    moved_behind_a_write: u32,
-    dropped_on_reload: u32,
-    dropped_unnamed: u32,
-    kept_on_reload: u32,
-    came_back: u32,
     edits: u32,
     /// An edit that waited for the writes out.
     edits_waited: u32,
@@ -586,9 +516,9 @@ struct Depth {
     click_previewed: u32,
     /// A click or the wheel while a key is waited for: nothing.
     mouse_waited: u32,
-    /// A click that ended a run of `J`/`K`.
-    click_ended_run: u32,
     wheeled: u32,
+    /// `J` or `K` on a list item, which does nothing.
+    upper_jk: u32,
 }
 
 impl Depth {
@@ -609,7 +539,6 @@ impl Depth {
             esc_preview_filtered,
             esc_help_over_preview,
             esc_filter,
-            esc_moving,
             esc_nothing,
             filtered,
             fetches,
@@ -622,13 +551,6 @@ impl Depth {
             asked,
             confirmed,
             declined,
-            moves_sent,
-            moved_to_other_group,
-            moved_behind_a_write,
-            dropped_on_reload,
-            dropped_unnamed,
-            kept_on_reload,
-            came_back,
             edits,
             edits_waited,
             edit_called_off,
@@ -644,8 +566,8 @@ impl Depth {
             click_selected,
             click_previewed,
             mouse_waited,
-            click_ended_run,
-            wheeled
+            wheeled,
+            upper_jk
         );
     }
 }
@@ -809,7 +731,7 @@ fn run_trace(first: &Files, steps: &[Step]) -> Result<Depth, TestCaseError> {
     Ok(depth)
 }
 
-/// T1, T2, T7, T8, and what T9 to T11 need of every state.
+/// T1, T2, T7, T8, and what T9 and T10 need of every state.
 fn check(state: &State, depth: &mut Depth) -> Result<(), TestCaseError> {
     for source in Source::ALL {
         let items = state.items(source);
@@ -862,18 +784,11 @@ fn check(state: &State, depth: &mut Depth) -> Result<(), TestCaseError> {
     if state.tab == Tab::Filed && state.cursor(Source::Filed).key.is_some() {
         depth.filed_tab += 1;
     }
-    // T10: a run is on the item under the focused cursor, with no filter
-    // hiding its neighbours; a question waits alone.
-    if let Some(moving) = &state.moving {
-        prop_assert_eq!(state.source(), moving.source);
-        prop_assert_eq!(state.cursor(moving.source).key.as_ref(), Some(&moving.item));
-        prop_assert!(!state.filtered(moving.source));
-        prop_assert!(!state.typing && !state.help && state.question.is_none());
-    }
+    // A question waits alone.
     if state.question.is_some() {
         prop_assert!(!state.typing && !state.help && !state.quitting);
     }
-    // T11: quitting waits for something.
+    // T10: quitting waits for something.
     prop_assert!(!state.quitting || !state.writes.is_empty());
     let mut terminal = Terminal::new(TestBackend::new(state.width, state.height)).unwrap();
     terminal.draw(|frame| view::draw(frame, state)).unwrap();
@@ -915,7 +830,6 @@ fn untouched(state: &State) -> impl PartialEq + std::fmt::Debug {
             state.load_error.clone(),
         ),
         (
-            state.moving.clone(),
             state.writes.clone(),
             state.quitting,
             state.edit_wanted.clone(),
@@ -927,17 +841,6 @@ fn untouched(state: &State) -> impl PartialEq + std::fmt::Debug {
 /// The keys of rows, in order: what a list shows of its order.
 fn keys(rows: &[Row]) -> Vec<Option<ItemKey>> {
     rows.iter().map(|row| row.key.clone()).collect()
-}
-
-/// The oracle's id of a row: its item's, when on that row only.
-fn named(rows: &[Row], at: usize) -> Option<u32> {
-    let id = rows.get(at)?.key.as_ref()?.id()?;
-    (rows
-        .iter()
-        .filter(|row| row.key.as_ref().and_then(ItemKey::id) == Some(id))
-        .count()
-        == 1)
-        .then_some(id)
 }
 
 /// The id the CLI reads on a list row's line.
@@ -957,30 +860,8 @@ fn followed(source: Source, after: &State, key: &ItemKey) -> Option<ItemKey> {
         .then(|| key.clone())
 }
 
-/// The oracle's `board move`: the item's row taken out and put back next
-/// to the target's.
-fn moved_by(rows: &[Row], wanted: &Move) -> Vec<Option<ItemKey>> {
-    let mut keys = keys(rows);
-    let find = |keys: &[Option<ItemKey>], number: u32| {
-        keys.iter()
-            .position(|key| key.as_ref().and_then(ItemKey::id) == Some(number))
-    };
-    let Some(from) = find(&keys, wanted.item().get()) else {
-        return keys;
-    };
-    let item = keys.remove(from);
-    let Some(target) = find(&keys, wanted.target().get()) else {
-        return keys;
-    };
-    let at = match wanted.side() {
-        Side::Before => target,
-        Side::After => target + 1,
-    };
-    keys.insert(at, item);
-    keys
-}
-
-/// T3 to T6, T9 to T12: what holds of every step.
+/// T3 to T6, T9 to T12: what holds of every step, and that `J`/`K` do
+/// nothing.
 fn judge(
     before: &State,
     event: &Event,
@@ -998,7 +879,7 @@ fn judge(
         Event::Mouse(mouse) => Some(*mouse),
         _ => None,
     };
-    // T13: a mouse event while a key is waited for does nothing at all.
+    // T12: a mouse event while a key is waited for does nothing at all.
     let waited = before.quitting || before.typing || before.question.is_some() || before.help;
     let acts = mouse.is_some() && !waited;
     if mouse.is_some() && waited {
@@ -1042,14 +923,6 @@ fn judge(
         oracle.y_armed = None;
     }
 
-    let sent: Vec<&Move> = commands
-        .iter()
-        .filter_map(|command| match command {
-            Command::Run(Action::Move(wanted)) => Some(wanted),
-            _ => None,
-        })
-        .collect();
-
     // T3
     let moved = match (key, mouse) {
         (Some(key), _) if navigates(key) && plain && !before.in_preview => {
@@ -1067,7 +940,7 @@ fn judge(
     if acts && matches!(mouse, Some(Mouse::WheelUp | Mouse::WheelDown)) {
         depth.wheeled += 1;
     }
-    // T13: the click's item, drawn on the row clicked, gets its panel's
+    // T12: the click's item, drawn on the row clicked, gets its panel's
     // cursor; the rest of T3 holds for every other list.
     let clicked = match &drawn {
         Drawn::Panel(panel, Some(item)) => Some((before.source_of(*panel), item.clone())),
@@ -1096,23 +969,7 @@ fn judge(
         }
         match moved {
             Some((moved, navigation)) if moved == source => {
-                // The key ended a run first: it moves the cursor from where
-                // the run's move, sent or dropped, leaves the item.
-                let at = match &before.moving {
-                    Some(moving) if moving.source == source => {
-                        let rows = before.base_rows(source);
-                        let order = match sent.first() {
-                            Some(wanted) => moved_by(&rows, wanted),
-                            None => keys(&rows),
-                        };
-                        order
-                            .iter()
-                            .flatten()
-                            .position(|key| key == item)
-                            .expect("the run's item is there")
-                    }
-                    _ => before.cursor(source).at,
-                };
+                let at = before.cursor(source).at;
                 let want = landing(before, navigation, at, items.len());
                 prop_assert_eq!(
                     after.cursor(source).at,
@@ -1171,8 +1028,8 @@ fn judge(
                 );
                 depth.syncs += 1;
             }
-            // T9 and T10, below.
-            Command::Run(Action::Done(_) | Action::Drop(_) | Action::Move(_)) => {}
+            // T9, below.
+            Command::Run(Action::Done(_) | Action::Drop(_)) => {}
             Command::Edit { .. } => {
                 prop_assert!(pressed('e') || matches!(event, Event::Loaded(_)));
             }
@@ -1213,12 +1070,14 @@ fn judge(
     match event {
         Event::Key(Key::Esc) => prop_assert!(commands.is_empty(), "{commands:?} after Esc"),
         Event::Key(key) if navigates(*key) => {
-            prop_assert!(commands.len() == sent.len(), "{commands:?} after {key:?}");
+            prop_assert!(commands.is_empty(), "{commands:?} after {key:?}");
         }
-        // A click or the wheel gives no command of its own: the move of
-        // the run it ends.
+        Event::Key(Key::Char('J' | 'K')) => {
+            prop_assert!(commands.is_empty(), "{commands:?} after {event:?}");
+        }
+        // A click or the wheel gives no command.
         Event::Mouse(_) => {
-            prop_assert!(commands.len() == sent.len(), "{commands:?} after {event:?}");
+            prop_assert!(commands.is_empty(), "{commands:?} after {event:?}");
         }
         // The question of what is unpushed goes with it, unless one is out.
         Event::FilesChanged => {
@@ -1230,8 +1089,7 @@ fn judge(
             let want = [&[Command::Load][..], ask].concat();
             prop_assert_eq!(commands, want.as_slice());
         }
-        // A write's answer reads the files at once: the rows of a move no
-        // longer out stand where the files have them.
+        // A write's answer reads the files at once.
         Event::Ran(..) => prop_assert_eq!(commands.first(), Some(&Command::Load)),
         // What the editor saved is committed by a sync, if one ran.
         Event::Edited(Edited::Closed | Edited::Failed(_)) => {
@@ -1244,12 +1102,21 @@ fn judge(
         }
         _ => {}
     }
-    // A run's move comes before the command of the key that ended it.
-    if let Some(at) = commands
-        .iter()
-        .position(|command| matches!(command, Command::Run(Action::Move(_))))
-    {
-        prop_assert_eq!(at, 0, "{:?}", commands);
+    // `J`/`K`: no key of the TUI's. Pressed as a key, they change what any
+    // unrelated key changes (the messages, a pending `g` or `y`, an edit
+    // waited for) and nothing of the lists: the rows and the cursors stay.
+    if plain && matches!(key, Some(Key::Char('J' | 'K'))) {
+        for source in Source::ALL {
+            prop_assert_eq!(keys(&after.rows(source)), keys(&before.rows(source)));
+        }
+        prop_assert_eq!(&after.cursors, &before.cursors);
+        prop_assert_eq!(after.writes.len(), before.writes.len());
+        if before
+            .cursor_item()
+            .is_some_and(|(source, _)| source.list().is_some())
+        {
+            depth.upper_jk += 1;
+        }
     }
 
     // T5
@@ -1283,9 +1150,6 @@ fn judge(
             depth.esc_filter += 1;
         } else {
             depth.esc_nothing += 1;
-        }
-        if before.moving.is_some() {
-            depth.esc_moving += 1;
         }
         prop_assert_eq!(untouched(after), untouched(&want));
     }
@@ -1357,7 +1221,7 @@ fn judge(
         let (ask, kind) = match question.action {
             Action::Done(_) => ('d', ListKind::Chores),
             Action::Drop(_) => ('x', ListKind::Backlog),
-            Action::Move(_) | Action::Sync => panic!("asked {question:?}"),
+            Action::Sync => panic!("asked {question:?}"),
         };
         prop_assert!(pressed(ask), "asked {question:?} after {event:?}");
         let (source, row) = before.cursor_item().expect("asked about an item");
@@ -1365,7 +1229,7 @@ fn judge(
         let number = match question.action {
             Action::Done(id) => id.get(),
             Action::Drop(id) => id.get(),
-            Action::Move(_) | Action::Sync => unreachable!(),
+            Action::Sync => unreachable!(),
         };
         // The id the CLI reads on the line: the command names this item.
         prop_assert_eq!(cli_id(kind, &row), Some(number), "{:?}", row);
@@ -1379,98 +1243,7 @@ fn judge(
         depth.declined += 1;
     }
 
-    // T10: a run ends in one move, the one shown, or a note, or at home.
-    prop_assert!(sent.len() <= 1, "{commands:?}");
-    match &before.moving {
-        None => prop_assert!(sent.is_empty(), "{commands:?} with no run"),
-        Some(moving) => {
-            let kind = moving.source.list().expect("a list item moves");
-            let goes_on = after
-                .moving
-                .as_ref()
-                .is_some_and(|now| now.source == moving.source && now.item == moving.item);
-            let shown = before.arranged(moving.source);
-            let dropped = after.messages.iter().any(|message| {
-                message.text.starts_with(&format!(
-                    "dropped the move of {}",
-                    name_of(kind, &moving.item)
-                ))
-            });
-            if let Event::Loaded(_) = event {
-                let rows = after.base_rows(moving.source);
-                // Kept while a command can name its item, next to its
-                // neighbour.
-                let at = rows
-                    .iter()
-                    .position(|row| row.key.as_ref() == Some(&moving.item));
-                let nameable = at.is_some_and(|at| named(&rows, at).is_some());
-                let next_to = followed(moving.source, after, &moving.place.1);
-                prop_assert_eq!(goes_on, nameable && next_to.is_some());
-                if goes_on {
-                    let place = &after.moving.as_ref().expect("goes on").place;
-                    prop_assert_eq!(Some(&place.1), next_to.as_ref());
-                    depth.kept_on_reload += 1;
-                } else {
-                    prop_assert!(dropped);
-                    depth.dropped_on_reload += 1;
-                }
-            }
-            if acts {
-                prop_assert!(!goes_on, "{event:?} did not end the run");
-                if matches!(mouse, Some(Mouse::Click { .. })) {
-                    depth.click_ended_run += 1;
-                }
-            }
-            if goes_on {
-                prop_assert!(sent.is_empty(), "{commands:?} while the run goes on");
-                prop_assert!(
-                    matches!(key, None | Some(Key::Char('J' | 'K') | Key::Esc)),
-                    "{key:?} did not end the run"
-                );
-            } else if let Some(wanted) = sent.first() {
-                prop_assert_eq!(Some(wanted.item().get()), moving.item.id());
-                // The move that puts the item where the screen showed it.
-                prop_assert_eq!(
-                    moved_by(&before.base_rows(moving.source), wanted),
-                    keys(&shown)
-                );
-                depth.moves_sent += 1;
-                if !before.writes.is_empty() {
-                    depth.moved_behind_a_write += 1;
-                }
-                let base = before.base_rows(moving.source);
-                if moves::group_of(&base, &moving.item) != moves::group_of(&shown, &moving.item) {
-                    depth.moved_to_other_group += 1;
-                }
-            } else if matches!(key, Some(Key::Char('J' | 'K'))) && after.moving.is_none() {
-                depth.came_back += 1;
-            } else if !matches!(event, Event::Loaded(_)) {
-                // No command can name the place: neither neighbour.
-                prop_assert!(dropped, "the run of {moving:?} ended without a word");
-                let at = shown
-                    .iter()
-                    .position(|row| row.key.as_ref() == Some(&moving.item))
-                    .expect("the item is shown");
-                prop_assert!(named(&shown, at + 1).is_none());
-                prop_assert!(
-                    at.checked_sub(1)
-                        .is_none_or(|above| named(&shown, above).is_none())
-                );
-                depth.dropped_unnamed += 1;
-            }
-        }
-    }
-    // Sent once: what is out is not still being moved.
-    if let Some(wanted) = sent.first() {
-        prop_assert!(
-            after
-                .moving
-                .as_ref()
-                .is_none_or(|now| now.item.id() != Some(wanted.item().get()))
-        );
-    }
-
-    // T11: the state knows what is out, as the worker does.
+    // T10: the state knows what is out, as the worker does.
     for command in commands {
         match command {
             Command::Run(action) => oracle.writes.push_back(action.clone()),
@@ -1500,7 +1273,7 @@ fn judge(
         depth.quit_waited += 1;
     }
 
-    // T12: the editor, on what `e` was pressed on, with no write out; an
+    // T11: the editor, on what `e` was pressed on, with no write out; an
     // edit waited for opens at the load after the last write, unless its
     // item is gone (or a filter hides it).
     if let (Event::Loaded(_), Some((source, item))) = (event, &before.edit_wanted)
@@ -1517,7 +1290,7 @@ fn judge(
             .any(|command| matches!(command, Command::Edit { .. }));
         prop_assert_eq!(opened, there, "edit of {:?} waited for", item);
     }
-    // T12: a key but Esc calls a wait off; only `e` asks for a new one, on
+    // T11: a key but Esc calls a wait off; only `e` asks for a new one, on
     // the item under the cursor.
     if let Some(key) = key
         && key != Key::Esc
@@ -1570,7 +1343,7 @@ fn judge(
         }
     }
 
-    // T13: the focus goes where the frame drew the click.
+    // T12: the focus goes where the frame drew the click.
     if acts {
         prop_assert!(!after.pending_g && after.pending_y.is_none());
         match &drawn {
@@ -1732,7 +1505,6 @@ fn the_traces_get_deep() {
         ("esc_preview_filtered", depth.esc_preview_filtered > 0),
         ("esc_help_over_preview", depth.esc_help_over_preview > 0),
         ("esc_filter", depth.esc_filter > 0),
-        ("esc_moving", depth.esc_moving > 0),
         ("esc_nothing", depth.esc_nothing > 0),
         ("filtered", depth.filtered > 0),
         ("fetches", depth.fetches > 0),
@@ -1745,12 +1517,6 @@ fn the_traces_get_deep() {
         ("asked", depth.asked > 0),
         ("confirmed", depth.confirmed > 0),
         ("declined", depth.declined > 0),
-        ("moves_sent", depth.moves_sent > 0),
-        ("moved_to_other_group", depth.moved_to_other_group > 0),
-        ("moved_behind_a_write", depth.moved_behind_a_write > 0),
-        ("dropped_on_reload", depth.dropped_on_reload > 0),
-        ("kept_on_reload", depth.kept_on_reload > 0),
-        ("came_back", depth.came_back > 0),
         ("edits", depth.edits > 0),
         ("edits_waited", depth.edits_waited > 0),
         ("edit_called_off", depth.edit_called_off > 0),
@@ -1766,8 +1532,8 @@ fn the_traces_get_deep() {
         ("click_selected", depth.click_selected > 0),
         ("click_previewed", depth.click_previewed > 0),
         ("mouse_waited", depth.mouse_waited > 0),
-        ("click_ended_run", depth.click_ended_run > 0),
         ("wheeled", depth.wheeled > 0),
+        ("upper_jk", depth.upper_jk > 0),
     ];
     let missed: Vec<&str> = reached
         .iter()
@@ -1784,7 +1550,7 @@ fn focus_along(keys: &[Key]) -> Vec<(Panel, bool)> {
             open: vec![(1, None, 1)],
             filed: Vec::new(),
             chores: vec![(0, 1, 0)],
-            backlog: vec![(1, 0)],
+            backlog: vec![(0, 1, 0)],
         },
         keys,
     )
