@@ -12,7 +12,7 @@ use super::state::{Panel, Row, Source, State, Tab};
 use crate::board::Shown;
 use crate::brief::Status;
 
-const HELP: [(&str, &str); 20] = [
+const HELP: [(&str, &str); 21] = [
     ("j k", "down, up"),
     ("wheel", "down, up, as j k"),
     ("gg G", "first, last"),
@@ -25,6 +25,7 @@ const HELP: [(&str, &str); 20] = [
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
     ("d", "done: delete the chore, asked first (y/n)"),
     ("x", "drop: delete the backlog item, asked first (y/n)"),
+    ("F", "put the queued brief first in the queue"),
     ("e", "edit the brief, or the list at the item, in $EDITOR"),
     ("r", "sync: commit hand edits, fetch, push"),
     ("y Y yy", "yank the id, the line, the whole item"),
@@ -142,7 +143,22 @@ fn panel_title(state: &State, panel: Panel, focused: bool) -> Line<'static> {
 /// colour. Both are found from what the row knows (its key, its status),
 /// not read off the text; a filed brief's status stays plain.
 fn row_spans(row: &Row, source: Source) -> Vec<Span<'static>> {
-    let text = row.text.as_str();
+    // What the row still waits on, dim: it says why a brief is not taken,
+    // and is not what the eye looks up.
+    let waits = &row.text[row.dim_from..];
+    let mut spans = line_spans(row, source, &row.text[..row.dim_from]);
+    if !waits.is_empty() {
+        spans.push(Span::styled(
+            waits.to_owned(),
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    }
+    spans
+}
+
+/// The row's text before its `  after <id>`: its id cyan, and an open
+/// brief's status in its colour.
+fn line_spans(row: &Row, source: Source, text: &str) -> Vec<Span<'static>> {
     let lead = text.len() - text.trim_start_matches(' ').len();
     let Some(id) = row.id_text(source).filter(|id| {
         text[lead..]
@@ -413,6 +429,8 @@ mod tests {
                 status: Some(status),
                 slug: slug.to_owned(),
                 unpushed: false,
+                queue: Default::default(),
+                waits: None,
             },
             started.map(|at| Stamp::from_unix(at).unwrap()),
             format!("id: {number}\nstatus: {status}\n\n{body}").into_bytes(),
@@ -698,6 +716,149 @@ mod tests {
                 ],
                 "{title}"
             );
+        }
+    }
+
+    /// A project from files: briefs at their paths, chores and backlog
+    /// items by number.
+    fn from_files(
+        briefs: &[(&str, &str)],
+        chores: &[(u32, &str)],
+        backlog: &[(u32, &str)],
+    ) -> Data {
+        use crate::project::{BoardPath, BriefFile, Project};
+        let name = ProjectName::parse("shop").unwrap();
+        let mut project = Project::empty(name.clone());
+        project.briefs = briefs
+            .iter()
+            .map(
+                |(path, text)| match BoardPath::parse(&format!("shop/{path}")) {
+                    Some(BoardPath::Brief { name, filed, .. }) => BriefFile {
+                        name,
+                        filed,
+                        brief: crate::brief::Brief::parse(text.as_bytes()),
+                    },
+                    _ => panic!("{path} is no brief path"),
+                },
+            )
+            .collect();
+        for (kind, items) in [(ListKind::Chores, chores), (ListKind::Backlog, backlog)] {
+            for (number, text) in items {
+                project
+                    .list_mut(kind)
+                    .insert(*number, crate::item::Item::parse(text.as_bytes()));
+            }
+        }
+        Data::of(&project)
+    }
+
+    /// Queued briefs in queue order (one marked first, then by `queued:`
+    /// time, the reverse of their numbers here), and what a brief or an
+    /// item waits on, dim at the end of its row; gone once the wait is over.
+    #[test]
+    fn the_queue_shows_in_its_order_and_a_wait_dim() {
+        let briefs = [
+            (
+                "briefs/1-one.md",
+                "status: queued\nqueued: 2026-11-26T10:00:03Z\nafter: c9\n",
+            ),
+            (
+                "briefs/2-two.md",
+                "status: queued\nqueued: 2026-11-26T10:00:02Z\n",
+            ),
+            (
+                "briefs/3-three.md",
+                "status: queued\nqueued: 2026-11-26T10:00:01Z\n",
+            ),
+            (
+                "briefs/4-four.md",
+                "status: queued\nqueued: 2026-11-26T10:00:04Z\nfirst: 1\n",
+            ),
+        ];
+        let chores = [
+            (9, "id: c9\ngroup: g\n\n# deploy\n"),
+            (10, "id: c10\ngroup: g\nafter: c9\n\n# clean\n"),
+        ];
+        let backlog = [(3, "id: b3\ngroup: g\nafter: 2\n\n# later\n")];
+        let data = from_files(&briefs, &chores, &backlog);
+        let (state, _) = State::new(data, 100, 40, Stamp::from_unix(NOW).unwrap());
+        let lines = screen(&state);
+        let rows: Vec<&str> = lines
+            .iter()
+            .filter_map(|line| line.split('│').nth(1))
+            .map(str::trim_end)
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert_eq!(
+            rows[..4],
+            [
+                "▶4 queued    four",
+                " 3 queued    three",
+                " 2 queued    two",
+                " 1 queued    one  after c9",
+            ]
+        );
+        assert!(rows.contains(&" c10 clean  after c9"), "{rows:?}");
+        assert!(rows.contains(&"▶b3 later  after 2"), "{rows:?}");
+        let buffer = cells(&state);
+        for (row, plain) in [
+            ("one  after c9", "one"),
+            ("clean  after c9", "clean"),
+            ("later  after 2", "later"),
+        ] {
+            let (x, y) = find(&buffer, row);
+            let at = x + u16::try_from(plain.len()).unwrap();
+            assert!(
+                !buffer[(at - 1, y)].modifier.contains(Modifier::DIM),
+                "{row}"
+            );
+            assert!(
+                buffer[(at + 1, y)].modifier.contains(Modifier::DIM),
+                "{row}"
+            );
+        }
+        // c9 done: nothing shows.
+        let data = from_files(&briefs, &chores[1..], &backlog);
+        let (state, _) = State::new(data, 100, 40, Stamp::from_unix(NOW).unwrap());
+        let lines = screen(&state).join("\n");
+        assert!(lines.contains(" 1 queued    one "), "{lines}");
+        assert!(!lines.contains("after c9"), "{lines}");
+    }
+
+    /// `F` on a queued brief sends one `queue --first`; on another brief it
+    /// says why it does not, and on a list item it does nothing.
+    #[test]
+    fn f_puts_a_queued_brief_first_and_nothing_else() {
+        let data = from_files(
+            &[
+                ("briefs/1-draft.md", "status: draft\n"),
+                ("briefs/2-started.md", "status: started\n"),
+                (
+                    "briefs/3-queued.md",
+                    "status: queued\nqueued: 2026-11-26T10:00:00Z\n",
+                ),
+            ],
+            &[(1, "id: c1\ngroup: g\n\n# chore\n")],
+            &[(1, "id: b1\ngroup: g\n\n# item\n")],
+        );
+        let (state, _) = State::new(data, 100, 20, Stamp::from_unix(NOW).unwrap());
+        let press_f = |keys: &str| {
+            let state = press(state.clone(), keys);
+            state.step(Event::Key(Key::Char('F')))
+        };
+        // Started first, then queued, then the draft.
+        let (_, commands) = press_f("j");
+        assert_eq!(commands, [Command::Run(Action::First(BriefId::new(3)))]);
+        for (keys, note) in [
+            ("", Some("F puts a queued brief first; 2 is started")),
+            ("jj", Some("F puts a queued brief first; 1 is draft")),
+            ("2", None),
+            ("3", None),
+        ] {
+            let (after, commands) = press_f(keys);
+            assert_eq!(commands, Vec::<Command>::new(), "{keys:?}");
+            let said: Vec<&str> = after.messages().iter().map(|m| m.text.as_str()).collect();
+            assert_eq!(said, note.into_iter().collect::<Vec<_>>(), "{keys:?}");
         }
     }
 

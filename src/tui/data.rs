@@ -2,10 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::board::{BriefRow, arrange};
+use crate::board::{BriefRow, arrange, item_waits};
 use crate::brief::Stamp;
-use crate::id::{BriefId, ListKind};
-use crate::item::{Items, Row};
+use crate::id::{BriefId, ItemId, ListKind};
+use crate::item::Row;
 use crate::project::{BoardPath, BriefFile, Project, ProjectName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,8 @@ pub enum ListEntry {
         shown: Vec<u8>,
         /// Whether its file has a body.
         body: bool,
+        /// What it still waits on: its row ends with `  after <id>`.
+        waits: Option<ItemId>,
     },
 }
 
@@ -60,10 +62,10 @@ impl BriefItem {
         (&mut self.row, in_done)
     }
 
-    fn of(project: &ProjectName, file: &BriefFile) -> BriefItem {
+    fn of(project: &Project, file: &BriefFile) -> BriefItem {
         BriefItem {
-            row: BriefRow::of(file),
-            path: file.path(project),
+            row: BriefRow::of(project, file),
+            path: file.path(project.name()),
             started: file
                 .brief
                 .get("started")
@@ -82,14 +84,14 @@ impl Data {
         let briefs = project
             .briefs()
             .iter()
-            .map(|file| BriefItem::of(name, file));
+            .map(|file| BriefItem::of(project, file));
         let (open, filed) = arrange(briefs, &BTreeSet::new(), BriefItem::row_in_done);
         Data {
             project: name.clone(),
             open,
             filed,
-            chores: list_lines(project.list(ListKind::Chores)),
-            backlog: list_lines(project.list(ListKind::Backlog)),
+            chores: list_lines(project, ListKind::Chores),
+            backlog: list_lines(project, ListKind::Backlog),
         }
     }
 
@@ -117,7 +119,8 @@ impl Data {
 }
 
 /// The rows `ls` shows of a kind (`board::list_rows`).
-fn list_lines(items: &Items) -> Vec<ListLine> {
+fn list_lines(project: &Project, kind: ListKind) -> Vec<ListLine> {
+    let items = project.list(kind);
     items
         .rows()
         .into_iter()
@@ -129,6 +132,7 @@ fn list_lines(items: &Items) -> Vec<ListLine> {
                     text: listed.item.line(items.kind(), listed.number),
                     shown: listed.item.shown(items.kind(), listed.number),
                     body: !listed.item.body().is_empty(),
+                    waits: item_waits(project, kind, listed.number),
                 },
             },
         })
@@ -180,6 +184,7 @@ impl ListLine {
                             text,
                             shown,
                             body: false,
+                            waits: None,
                         }
                     }
                 },

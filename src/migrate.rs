@@ -130,6 +130,7 @@ pub(crate) fn migrate(project: &mut Project, now: Stamp) -> Result<Migrated, Vec
                 // A chore the heading it stood under; the backlog had none.
                 group: old.group.as_ref().unwrap_or(&default),
                 check: old.check.as_ref(),
+                after: None,
                 from: old.from,
                 created: now,
                 title: &old.title,

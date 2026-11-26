@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use board::{
     BacklogId, Board, Body, BriefId, BriefRow, CheckChange, ChoreId, CommitCheck, DEFAULT_GROUP,
     EmptyText, Env, Error, Exit, ItemId, Line, ListId, ListKind, ListRow, NewBacklog, NewChore,
-    Shown, Slug, Snapshot, Text,
+    Next, Queueing, Shown, Slug, Snapshot, Text,
 };
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
@@ -45,15 +45,24 @@ enum Command {
         #[command(subcommand)]
         item: NewItem,
     },
-    /// Hand a draft brief to the worker
+    /// Hand a draft brief to the worker, or put a queued brief first
     Queue {
         /// Like 128
         id: BriefId,
         /// The backlog items the brief resolves, deleted when it is filed
         #[arg(long, value_name = "IDS", value_delimiter = ',')]
         closes: Option<Vec<BacklogId>>,
+        /// What it waits on: `next` skips it until that brief is reported or
+        /// filed, or that chore or backlog item is gone
+        #[arg(long, value_name = "ID")]
+        after: Option<ItemId>,
+        /// First in the queue, before every brief queued; also on a brief
+        /// queued already, alone. The latest --first wins
+        #[arg(long)]
+        first: bool,
     },
-    /// Claim the brief queued longest; prints its path, or `queue empty`
+    /// Claim the first queued brief that waits on nothing; prints its path,
+    /// or `queue empty` (with what the queued briefs wait on, if any)
     Next,
     /// Stop on a started brief with a question, put under ## Questions
     Block {
@@ -133,6 +142,18 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         to: Line,
     },
+    /// Make a chore, a backlog item or a draft or queued brief wait on
+    /// another item of the board, or on nothing
+    #[command(group(ArgGroup::new("wait").required(true).args(["target", "none"])))]
+    After {
+        /// Like 128, c12 or b41
+        id: ItemId,
+        /// What it waits on, like 128, c12 or b41
+        target: Option<ItemId>,
+        /// Wait on nothing: the `after:` line goes
+        #[arg(long)]
+        none: bool,
+    },
     /// Bring the board-data clone and the remote to the same commit
     Sync,
     /// Convert the project's chores.md and backlog.md, the storage before item files, to a file per item, and bring the item files up to date (a `group:` line on each, no `order:`), in one write; while a list file is there every other command is refused on the project
@@ -160,6 +181,9 @@ enum AddItem {
         /// How to see that it is done, when the title does not show it
         #[arg(long)]
         check: Option<Line>,
+        /// What it waits on, like 128, c12 or b41: shown, never enforced
+        #[arg(long, value_name = "ID")]
+        after: Option<ItemId>,
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
@@ -173,6 +197,9 @@ enum AddItem {
         /// The group it is listed under; a new name makes a new group
         #[arg(long, default_value = DEFAULT_GROUP)]
         group: Line,
+        /// What it waits on, like 128, c12 or b41: shown, never enforced
+        #[arg(long, value_name = "ID")]
+        after: Option<ItemId>,
         /// The item it came from, like 128
         #[arg(long, value_name = "ID")]
         from: Option<ItemId>,
@@ -273,7 +300,12 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Some(Command::New {
             item: NewItem::Brief { slug },
         }) => Run::NewBrief(slug),
-        Some(Command::Queue { id, closes }) => Run::Queue(id, closes),
+        Some(Command::Queue {
+            id,
+            closes,
+            after,
+            first,
+        }) => Run::Queue(id, closes, after, first),
         Some(Command::Next) => Run::Next,
         Some(Command::Block { id, question }) => Run::Block(id, question),
         Some(Command::Amend { id, replace }) => amend(id, replace)?,
@@ -292,6 +324,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
                     text,
                     group,
                     check,
+                    after,
                     from,
                     body,
                 },
@@ -299,6 +332,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
             text,
             group,
             check,
+            after,
             from,
             body: stdin_body(body, "add chore")?,
         }),
@@ -307,18 +341,23 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
                 AddItem::Backlog {
                     text,
                     group,
+                    after,
                     from,
                     body,
                 },
         }) => Run::AddBacklog(NewBacklog {
             text,
             group,
+            after,
             from,
             body: stdin_body(body, "add backlog")?,
         }),
         Some(Command::Done { ids }) => Run::Done(ids),
         Some(Command::Drop { ids }) => Run::Drop(ids),
         Some(Command::Group { ids, to }) => Run::Group(ids, to),
+        Some(Command::After { id, target, none }) => {
+            Run::After(id, if none { None } else { target })
+        }
         Some(Command::Retitle { id, text, check }) => retitle(id, text, check)?,
         Some(Command::Sync) => Run::Sync,
         Some(Command::Migrate) => Run::Migrate,
@@ -336,13 +375,17 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Run::Ls(selection) => Ok((ls(&board.snapshot()?, &selection), Exit::Ok)),
         Run::Show(id) => Ok((board.show(id)?, Exit::Ok)),
         Run::NewBrief(slug) => Ok((path_line(&board.new_brief(&slug)?), Exit::Ok)),
-        Run::Queue(id, closes) => {
-            board.queue(id, closes.as_deref())?;
-            line(format!("queued {id}"))
-        }
+        Run::Queue(id, closes, after, first) => line(board.queue(
+            id,
+            Queueing {
+                closes: closes.as_deref(),
+                after,
+                first,
+            },
+        )?),
         Run::Next => match board.next()? {
-            Some(path) => Ok((path_line(&path), Exit::Ok)),
-            None => line("queue empty".to_owned()),
+            Next::Claimed(path) => Ok((path_line(&path), Exit::Ok)),
+            Next::Nothing(said) => line(said),
         },
         Run::Block(id, question) => {
             board.block(id, &question)?;
@@ -360,6 +403,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         Run::Done(ids) => line(board.done(&ids)?),
         Run::Drop(ids) => line(board.drop_items(&ids)?),
         Run::Group(ids, to) => line(board.group(&ids, &to)?),
+        Run::After(id, target) => line(board.after(id, target)?),
         Run::Retitle(id, text, check) => line(board.retitle(id, text.as_ref(), check.as_ref())?),
         Run::Sync => {
             board.sync()?;
@@ -388,7 +432,7 @@ enum Run {
     Show(ItemId),
     Lint,
     NewBrief(Slug),
-    Queue(BriefId, Option<Vec<BacklogId>>),
+    Queue(BriefId, Option<Vec<BacklogId>>, Option<ItemId>, bool),
     Next,
     Block(BriefId, Text),
     Amend(BriefId, Text),
@@ -400,6 +444,7 @@ enum Run {
     Done(Vec<ChoreId>),
     Drop(Vec<BacklogId>),
     Group(Vec<ListId>, Line),
+    After(ItemId, Option<ItemId>),
     Retitle(ListId, Option<Line>, Option<CheckChange>),
     Sync,
     Migrate,
@@ -629,6 +674,7 @@ mod docs {
     fn samples(word: &str) -> Vec<&str> {
         match word {
             "<id>" => vec!["128", "c12", "b41"],
+            "<target>" => vec!["c9", "126", "b40"],
             "<slug>" => vec!["fix-login"],
             "<question>" | "…" => vec!["Which table holds the orders?"],
             "<text>" => vec!["Rotate the key"],

@@ -451,7 +451,47 @@ pub struct BriefFile {
     pub brief: Brief,
 }
 
+/// Where a queued brief stands in the queue, first to last: the briefs
+/// put first by `queue --first` (a `first:` counter), the highest counter
+/// first; then the rest by their `queued:` time, one without a readable time
+/// last; ties by number, which the caller adds. One order for `next`, `ls`
+/// and the TUI.
+///
+/// A counter and not a time (planner, 2026-11-26): a stamp is whole
+/// seconds, so two `F` presses in one second would tie and the earlier
+/// could win. Rejected: moving a brief first by rewriting `queued:`, a
+/// false time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QueuePlace {
+    unmarked: bool,
+    first: std::cmp::Reverse<u64>,
+    untimed: bool,
+    queued: Option<Stamp>,
+}
+
+/// The header key `queue --first` writes.
+pub(crate) const FIRST: &str = "first";
+
 impl BriefFile {
+    /// The brief's `first:` counter; `None` without a readable one.
+    pub fn first(&self) -> Option<u64> {
+        str::from_utf8(self.brief.get(FIRST)?).ok()?.parse().ok()
+    }
+
+    pub fn queue_place(&self) -> QueuePlace {
+        let first = self.first();
+        let queued = self
+            .brief
+            .get("queued")
+            .and_then(|value| str::from_utf8(value).ok()?.parse::<Stamp>().ok());
+        QueuePlace {
+            unmarked: first.is_none(),
+            first: std::cmp::Reverse(first.unwrap_or(0)),
+            untimed: queued.is_none(),
+            queued,
+        }
+    }
+
     /// The brief's status on the board.
     ///
     /// Where the file sits decides whether a brief is filed, not its header:

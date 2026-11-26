@@ -32,14 +32,14 @@ draft → queued → started ⇄ blocked → reported → filed
 |---|---|---|---|
 | `draft` | The planner is writing it; the header is in place. | planner | `board new brief <slug>` |
 | `queued` | Approved and complete, waiting for the worker. Refused while a required section is empty. | planner | `board queue <id>` |
-| `started` | The worker claimed it, the one queued longest. Also where a blocked brief goes back to. | worker, then planner | `board next`, `board amend <id>` |
+| `started` | The worker claimed it: the first of the queue that waits on nothing. Also where a blocked brief goes back to. | worker, then planner | `board next`, `board amend <id>` |
 | `blocked` | The worker stopped on a question, written into the brief. | worker | `board block <id> "<question>"` |
 | `reported` | Done: the worker's report is the last section. | worker | `board report <id>` |
 | `filed` | Checked and closed; the file moves to `briefs/done/`. | planner | `board file <id>` |
 
 `reported` waits for the planner's read, not for you: the planner files a reported brief as soon as the worker's one-line `reported` wakes it (or at the start of its next turn, if that line never came), turning the report's leftovers into chores and backlog items. What waits for you is the push: a filed brief whose commits are not pushed yet (a commit with its trailer in the project repository's `@{upstream}..HEAD`) is listed with the open ones as `unpushed`, in yellow in the TUI, until you push. It is a label from git, not a status: nothing stores it, and `board ls briefs --status unpushed` lists those briefs.
 
-`board queue <id> --closes b41,b52` names the backlog items the brief resolves. `board file <id>` checks the repository it runs in, also when the board is named (`board file <id> --board shop`), for commits carrying the trailer `Brief: <id>` on a line of their own (a rebase keeps it, where it would change every SHA), refuses a brief with none (`board file <id> --no-commits` for one that changed no code, such as an investigation), deletes the backlog items it closes and moves the brief to `briefs/done/`. `board amend <id>` adds to a queued, started or blocked brief without changing who has it; only on a blocked one does it resume the work.
+`board queue <id> --closes b41,b52` names the backlog items the brief resolves. `board queue <id> --after <id>` makes it wait: `board next` skips it until that brief is reported or filed, or that chore or backlog item is gone, and says what the queue waits on when nothing else is left (`queue empty, 1 waiting on c9`). `board queue <id> --first` puts a queued brief before the others (the latest one put first wins). Chores and backlog items can wait too (`board add chore "<text>" --after <id>`, or later `board after <id> <id>`, `board after <id> --none`), shown at the end of their line (`c3 Clean  after c9`) and never enforced. `board file <id>` checks the repository it runs in, also when the board is named (`board file <id> --board shop`), for commits carrying the trailer `Brief: <id>` on a line of their own (a rebase keeps it, where it would change every SHA), refuses a brief with none (`board file <id> --no-commits` for one that changed no code, such as an investigation), deletes the backlog items it closes and moves the brief to `briefs/done/`. `board amend <id>` adds to a queued, started or blocked brief without changing who has it; only on a blocked one does it resume the work.
 
 ## Install and setup
 
@@ -97,7 +97,7 @@ The user runs `board` without a command for the TUI (piped, it prints the board 
 
 - `j`/`k` move, `1` `2` `3` or Tab focus a panel, `0` or Enter scrolls the preview, `/` filters the panel.
 - A click focuses a pane and selects the row clicked; the wheel moves as `j`/`k`. The TUI captures the mouse for that, so selecting text with the mouse takes the terminal's bypass (Shift-drag in most); `y`, `Y` and `yy` copy.
-- `d` marks a chore done, `x` drops a backlog item (each asks once), `e` opens the item in `$EDITOR`.
+- `d` marks a chore done, `x` drops a backlog item (each asks once), `F` puts a queued brief first, `e` opens the item in `$EDITOR`.
 - `r` syncs, `?` shows every key, `q` quits. Esc only ever backs out.
 
 The TUI edits no text itself: every action is the CLI command of the same name, so an agent can do whatever the user does.

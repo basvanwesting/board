@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use crate::after;
 use crate::brief::{EntryText, Stamp, Status, Text};
 use crate::error::Error;
 use crate::git::{Failure, Git, Oid};
@@ -13,8 +14,8 @@ use crate::item::{Body, Items, Row};
 use crate::lint::{Finding, lint};
 use crate::list::{FindError, Line};
 use crate::migrate;
-use crate::ops::{self, CheckChange, Commits, Filed, NewBacklog, NewChore};
-use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, Slug, resolve};
+use crate::ops::{self, CheckChange, Claim, Commits, Filed, NewBacklog, NewChore, Queueing};
+use crate::project::{BoardPath, BriefFile, Env, Project, ProjectName, QueuePlace, Slug, resolve};
 use crate::sync::{self, Fetched, Note};
 
 pub struct Board {
@@ -175,6 +176,9 @@ impl Board {
     pub fn add_chore(&self, new: &NewChore) -> Result<ChoreId, Error> {
         let now = now()?;
         self.command("add chore", &|tx| {
+            if let Some(target) = new.after {
+                tx.require_given("add chore", target)?;
+            }
             let id = tx.alloc_chore()?;
             ops::add_chore(&mut tx.project, id, new, now);
             Ok((id, format!("add {id}")))
@@ -186,6 +190,9 @@ impl Board {
     pub fn add_backlog(&self, new: &NewBacklog) -> Result<BacklogId, Error> {
         let now = now()?;
         self.command("add backlog", &|tx| {
+            if let Some(target) = new.after {
+                tx.require_given("add backlog", target)?;
+            }
             let id = tx.alloc_backlog()?;
             ops::add_backlog(&mut tx.project, id, new, now);
             Ok((id, format!("add {id}")))
@@ -261,32 +268,53 @@ impl Board {
         Ok(self.path(&path))
     }
 
-    /// Queues a draft, writing the backlog items it closes when `closes` is
-    /// given.
-    pub fn queue(&self, id: BriefId, closes: Option<&[BacklogId]>) -> Result<(), Error> {
+    /// Queues a draft, writing what `asked` gives (the backlog items it
+    /// closes, what it waits on, first in the queue), or puts a queued brief
+    /// first; gives what it did, as `queued 128`.
+    pub fn queue(&self, id: BriefId, asked: Queueing<'_>) -> Result<String, Error> {
         let now = now()?;
         self.command("queue", &|tx| {
-            let queued = ops::queue(&mut tx.project, id, closes, now)?;
-            Ok(((), queued))
+            if let Some(target) = asked.after {
+                tx.require_given(&format!("queue {id}"), target)?;
+            }
+            let queued = ops::queue(&mut tx.project, id, asked, now)?;
+            Ok((queued.clone(), queued))
         })
     }
 
-    /// Claims the brief queued longest; gives its path, `None` when the queue
-    /// is empty.
+    /// Makes an item or a brief wait on another, or on nothing; gives what
+    /// it did, as `c3 after c9`. Allocates nothing, so it works offline
+    /// like `done`.
+    pub fn after(&self, id: ItemId, target: Option<ItemId>) -> Result<String, Error> {
+        self.command("after", &|tx| {
+            if let Some(target) = target {
+                tx.require_given(&format!("after {id}"), target)?;
+            }
+            let said = ops::set_after(&mut tx.project, id, target)?;
+            Ok((said.clone(), said))
+        })
+    }
+
+    /// Claims the first brief of the queue that waits on nothing.
     ///
     /// Only with the remote: a claim is shared like an id, and two clones
     /// claiming one brief offline would each hand it to a worker.
-    pub fn next(&self) -> Result<Option<PathBuf>, Error> {
+    pub fn next(&self) -> Result<Next, Error> {
         let now = now()?;
-        let path = self.command("next", &|tx| {
+        let claim = self.command("next", &|tx| {
             tx.require_remote()?;
-            Ok(match ops::next(&mut tx.project, now)? {
-                Some((number, path)) => (Some(path), format!("started {number}")),
+            let claim = ops::next(&mut tx.project, now)?;
+            let subject = match &claim {
+                Claim::Claimed(..) => claim.to_string(),
                 // Nothing changed, so nothing is committed under a subject.
-                None => (None, String::new()),
-            })
+                Claim::Empty | Claim::Waiting(..) => String::new(),
+            };
+            Ok((claim, subject))
         })?;
-        Ok(path.map(|path| self.path(&path)))
+        Ok(match claim {
+            Claim::Claimed(_, path) => Next::Claimed(self.path(&path)),
+            other => Next::Nothing(other.to_string()),
+        })
     }
 
     /// Blocks a started brief on a question, which goes under
@@ -537,13 +565,23 @@ fn shown(items: &Items, number: u32) -> Result<Vec<u8>, String> {
         .ok_or_else(|| ops::not_one(items.kind(), number, FindError::Missing))
 }
 
+/// What `next` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Next {
+    /// The path of the brief it claimed.
+    Claimed(PathBuf),
+    /// Nothing claimed, as said: `queue empty`, or `queue empty, 2 waiting
+    /// on c9` when the queued briefs all wait.
+    Nothing(String),
+}
+
 /// What the board shows of a project: the briefs, the chores and the
 /// backlog by group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub project: ProjectName,
     /// The briefs outside `briefs/done/`, in the order of [`BriefRow::rank`],
-    /// then by number.
+    /// the queued ones in queue order ([`QueuePlace`]), then by number.
     pub open: Vec<BriefRow>,
     /// The briefs in `briefs/done/`, by number.
     pub filed: Vec<BriefRow>,
@@ -605,15 +643,22 @@ pub struct BriefRow {
     /// ([`Board::unpushed`]): shown among the open briefs as `unpushed`
     /// until the owner pushes. A label, not a status: nothing stores it.
     pub unpushed: bool,
+    /// Its place in the queue ([`QueuePlace`]); read only while queued.
+    pub queue: QueuePlace,
+    /// What it still waits on (`after:`, unsatisfied); `None` for nothing.
+    pub waits: Option<ItemId>,
 }
 
 impl BriefRow {
-    pub(crate) fn of(file: &BriefFile) -> BriefRow {
+    pub(crate) fn of(project: &Project, file: &BriefFile) -> BriefRow {
+        let number = file.name.number();
         BriefRow {
-            number: file.name.number(),
+            number,
             status: file.status().ok(),
             slug: file.name.slug().to_owned(),
             unpushed: false,
+            queue: file.queue_place(),
+            waits: after::waits_on(project, ItemId::Brief(number)),
         }
     }
 
@@ -659,7 +704,13 @@ impl BriefRow {
     /// The row as `board ls` prints it, without the newline; the TUI's `Y`
     /// yanks the same.
     pub fn ls_line(&self) -> String {
-        format!("{} {} {}", self.number, self.status_word(), self.slug)
+        format!(
+            "{} {} {}{}",
+            self.number,
+            self.status_word(),
+            self.slug,
+            waits_suffix(self.waits)
+        )
     }
 }
 
@@ -673,13 +724,28 @@ pub enum ListRow {
     Item(Vec<u8>),
 }
 
+/// Where a brief stands among the open or the filed ones: its rank, its
+/// place in the queue while queued, its number.
+type BriefOrder = (u8, Option<QueuePlace>, BriefId);
+
+/// What a line or row ends with while its item waits: `  after c9`; empty
+/// once the wait is over, when the line is as it was. Two blanks, as the
+/// reference `  (126)` is set off: after a chore's check one blank would
+/// read as part of it ("Check: it is up after c1").
+pub fn waits_suffix(waits: Option<ItemId>) -> String {
+    waits
+        .map(|target| format!("  after {target}"))
+        .unwrap_or_default()
+}
+
 /// The label of a filed brief with unpushed commits.
 pub const UNPUSHED: &str = "unpushed";
 
 /// Labels the briefs by `unpushed` and splits them into the open ones and
 /// the filed ones, in the order the board shows them: by [`BriefRow::rank`],
-/// then by number. One order for `ls` and the TUI, which hold a brief as a
-/// row or as an item: `row` gives an item's row and whether its file is in
+/// the queued ones in queue order ([`QueuePlace`]), then by number. One
+/// order for `ls` and the TUI, which hold a brief as a row or as an item:
+/// `row` gives an item's row and whether its file is in
 /// `briefs/done/`. Filed ones go by number: a brief in `briefs/done/` is
 /// filed whatever its header says ([`BriefFile::status`]), so all rank
 /// alike.
@@ -693,14 +759,17 @@ pub(crate) fn arrange<T>(
     for mut brief in briefs {
         let (row, in_done) = row(&mut brief);
         row.unpushed = row.status == Some(Status::Filed) && unpushed.contains(&row.number);
-        let key = (row.rank(), row.number);
+        // Queued briefs in queue order, so `--first` shows; the others by
+        // number, as before.
+        let queue = (row.status == Some(Status::Queued) && !row.unpushed).then_some(row.queue);
+        let key = (row.rank(), queue, row.number);
         if row.open(in_done) {
             open.push((key, brief));
         } else {
             filed.push((key, brief));
         }
     }
-    let sorted = |mut briefs: Vec<((u8, BriefId), T)>| -> Vec<T> {
+    let sorted = |mut briefs: Vec<(BriefOrder, T)>| -> Vec<T> {
         briefs.sort_by_key(|(key, _)| *key);
         briefs.into_iter().map(|(_, brief)| brief).collect()
     };
@@ -712,15 +781,15 @@ impl Snapshot {
         let rows = project
             .briefs()
             .iter()
-            .map(|file| (BriefRow::of(file), file.filed));
+            .map(|file| (BriefRow::of(project, file), file.filed));
         let (open, filed) = arrange(rows, unpushed, |(row, in_done)| (row, *in_done));
         let rows = |briefs: Vec<(BriefRow, bool)>| briefs.into_iter().map(|(row, _)| row).collect();
         Snapshot {
             project: project.name().clone(),
             open: rows(open),
             filed: rows(filed),
-            chores: list_rows(project.list(ListKind::Chores)),
-            backlog: list_rows(project.list(ListKind::Backlog)),
+            chores: list_rows(project, ListKind::Chores),
+            backlog: list_rows(project, ListKind::Backlog),
         }
     }
 
@@ -747,15 +816,28 @@ impl Snapshot {
     }
 }
 
-fn list_rows(items: &Items) -> Vec<ListRow> {
+fn list_rows(project: &Project, kind: ListKind) -> Vec<ListRow> {
+    let items = project.list(kind);
     items
         .rows()
         .into_iter()
         .map(|row| match row {
             Row::Group(name) => ListRow::Group(name.to_vec()),
-            Row::Item(listed) => ListRow::Item(listed.item.line(items.kind(), listed.number)),
+            Row::Item(listed) => {
+                let mut line = listed.item.line(kind, listed.number);
+                line.extend_from_slice(
+                    waits_suffix(item_waits(project, kind, listed.number)).as_bytes(),
+                );
+                ListRow::Item(line)
+            }
         })
         .collect()
+}
+
+/// What the item `number` of `kind` still waits on.
+pub(crate) fn item_waits(project: &Project, kind: ListKind, number: u32) -> Option<ItemId> {
+    let id = ListId::of(kind, number).expect("an item's id is past 0");
+    after::waits_on(project, ItemId::from(id))
 }
 
 #[cfg(test)]
@@ -900,17 +982,19 @@ mod tests {
 
     #[test]
     fn a_kind_lists_its_groups_by_name_and_its_items_by_id() {
-        let mut chores = Items::new(ListKind::Chores);
+        let mut project = Project::empty(ProjectName::parse("shop").unwrap());
         for (number, text) in [
             (1, "id: c1\ngroup: Work\n\n# one\n"),
             (2, "id: c2\ngroup: Home\ncheck: x\nfrom: 126\n\n# two.\n"),
             (3, "id: c3\ngroup: Home\n\n# three\n\nbody\n"),
             (4, "id: c4\ngroup: Home\n\n# four\n"),
         ] {
-            chores.insert(number, crate::item::Item::parse(text.as_bytes()));
+            project
+                .list_mut(ListKind::Chores)
+                .insert(number, crate::item::Item::parse(text.as_bytes()));
         }
         assert_eq!(
-            list_rows(&chores),
+            list_rows(&project, ListKind::Chores),
             [
                 ListRow::Group(b"Home".to_vec()),
                 ListRow::Item(b"c2 two. Check: x  (126)".to_vec()),
@@ -920,13 +1004,12 @@ mod tests {
                 ListRow::Item(b"c1 one".to_vec()),
             ]
         );
-        let mut backlog = Items::new(ListKind::Backlog);
-        backlog.insert(
+        project.list_mut(ListKind::Backlog).insert(
             41,
             crate::item::Item::parse(b"id: b41\ngroup: Default\nfrom: 126\n\n# Later\n"),
         );
         assert_eq!(
-            list_rows(&backlog),
+            list_rows(&project, ListKind::Backlog),
             [
                 ListRow::Group(b"Default".to_vec()),
                 ListRow::Item(b"b41 Later  (from 126)".to_vec())

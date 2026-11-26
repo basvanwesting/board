@@ -203,6 +203,56 @@ impl Tx<'_> {
         }
     }
 
+    /// Refuses a wait on `target` when no such id was ever given on the
+    /// board: past the highest brief number or item id ever used, as
+    /// history counts them for numbering. Here and not in lint: only a
+    /// write reads history, under the lock. On the clone's history, so it
+    /// works offline; an id given meanwhile on another machine is refused
+    /// until the next fetch.
+    /// `what` names the refusal, as `queue 5` or `after c1`.
+    pub(crate) fn require_given(&self, what: &str, target: ItemId) -> Result<(), Error> {
+        let name = self.project.name();
+        let (number, highest) = match target {
+            ItemId::Brief(number) => (
+                number.get(),
+                self.project
+                    .briefs()
+                    .iter()
+                    .map(|file| file.name.number().get())
+                    .chain(brief_mark(self.git, &self.base, name)?)
+                    .max(),
+            ),
+            ItemId::Chore(_) | ItemId::Backlog(_) => {
+                let kind = match target {
+                    ItemId::Chore(_) => ListKind::Chores,
+                    _ => ListKind::Backlog,
+                };
+                let number = match target {
+                    ItemId::Chore(id) => id.get(),
+                    ItemId::Backlog(id) => id.get(),
+                    ItemId::Brief(_) => unreachable!("matched above"),
+                };
+                (
+                    number,
+                    [
+                        self.project.list(kind).numbers().max(),
+                        item_mark(self.git, &self.base, name, kind)?,
+                        list_mark(self.git, &self.base, name, kind)?,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max(),
+                )
+            }
+        };
+        if highest.is_some_and(|highest| number <= highest) {
+            return Ok(());
+        }
+        Err(Error::Refused(format!(
+            "{what}: {target} was never given on this board, so nothing can wait on it"
+        )))
+    }
+
     /// Refuses a command that has to act on what the remote has. Where an id
     /// is allocated this is checked for every command; a command that
     /// allocates none but claims something shared (`next`) asks for it.

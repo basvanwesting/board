@@ -13,7 +13,7 @@ use std::fmt;
 
 use super::data::{BriefItem, Data, ListEntry};
 use super::layout::{self, Areas};
-use crate::board::Shown;
+use crate::board::{Shown, waits_suffix};
 use crate::brief::{Stamp, Status};
 use crate::id::{BacklogId, BriefId, ChoreId, ListId, ListKind};
 use crate::project::BoardPath;
@@ -141,6 +141,8 @@ pub(crate) enum Command {
 pub(crate) enum Action {
     Done(ChoreId),
     Drop(BacklogId),
+    /// `queue <id> --first`: `F` on a queued brief.
+    First(BriefId),
     Sync,
 }
 
@@ -150,6 +152,7 @@ impl fmt::Display for Action {
         match self {
             Action::Done(id) => write!(f, "done {id}"),
             Action::Drop(id) => write!(f, "drop {id}"),
+            Action::First(id) => write!(f, "queue {id} --first"),
             Action::Sync => f.write_str("sync"),
         }
     }
@@ -225,6 +228,10 @@ pub(crate) struct Row {
     /// What a brief is shown as (its status, or `unpushed`), for its
     /// colour; `None` for a list row.
     pub status: Option<Shown>,
+    /// Where in `text` the `  after <id>` of an item that waits starts, drawn
+    /// dim; `text.len()` when it waits on nothing. Part of the text, so the
+    /// filter and `Y` see the line as `ls` prints it.
+    pub dim_from: usize,
 }
 
 impl Row {
@@ -325,7 +332,7 @@ impl Question {
         let verb = match self.action {
             Action::Done(_) => "done",
             Action::Drop(_) => "drop",
-            Action::Sync => unreachable!("only d and x ask"),
+            Action::First(_) | Action::Sync => unreachable!("only d and x ask"),
         };
         format!("{verb} {}? y/n", self.text)
     }
@@ -574,6 +581,7 @@ impl State {
             }
             Key::Char('d') => self.ask(ListKind::Chores),
             Key::Char('x') => self.ask(ListKind::Backlog),
+            Key::Char('F') => commands.extend(self.first()),
             Key::Char('e') => commands.extend(self.edit_key()),
             Key::Char('r') => commands.extend(self.run(Action::Sync)),
             // The id at once, as `gg` is read: no timer for a key that can
@@ -835,6 +843,32 @@ impl State {
             }
             None => self.no_id(&row),
         }
+    }
+
+    /// `F`: the queued brief under the cursor first in the queue, with no
+    /// question: a second `F` on another brief undoes it. The one action on
+    /// a brief (owner, 2026-11-26: "it needs a single key in the TUI on a
+    /// brief as well"); queueing a draft stays the planner's, so on any
+    /// other brief it says why it does nothing, and on a list item it does
+    /// nothing.
+    fn first(&mut self) -> Vec<Command> {
+        let Some((source, row)) = self.cursor_item() else {
+            return Vec::new();
+        };
+        if source.list().is_some() {
+            return Vec::new();
+        }
+        let brief = &self.brief(source, &row).row;
+        if brief.status == Some(Status::Queued) && !brief.unpushed {
+            return self.run(Action::First(brief.number));
+        }
+        let said = format!(
+            "F puts a queued brief first; {} is {}",
+            brief.number,
+            brief.status_word()
+        );
+        self.say(said, true);
+        Vec::new()
     }
 
     fn no_id(&mut self, row: &Row) {
@@ -1367,13 +1401,15 @@ fn brief_rows(briefs: &[BriefItem]) -> Vec<Row> {
         .map(|(at, brief)| {
             let row = &brief.row;
             let in_flight = matches!(row.status, Some(Status::Started | Status::Blocked));
+            let text = format!(
+                "{:>digits$} {:<9} {}",
+                row.number,
+                row.status_word(),
+                row.slug
+            );
+            let dim_from = text.len();
             Row {
-                text: format!(
-                    "{:>digits$} {:<9} {}",
-                    row.number,
-                    row.status_word(),
-                    row.slug
-                ),
+                text: text + &waits_suffix(row.waits),
                 key: Some(ItemKey {
                     ident: Ident::Brief(row.number, row.slug.clone()),
                     nth: 0,
@@ -1381,6 +1417,7 @@ fn brief_rows(briefs: &[BriefItem]) -> Vec<Row> {
                 at,
                 since: brief.started.filter(|_| in_flight),
                 status: row.shown(),
+                dim_from,
             }
         })
         .collect()
@@ -1391,21 +1428,28 @@ fn list_rows(kind: ListKind, data: &Data) -> Vec<Row> {
         .iter()
         .enumerate()
         .map(|(at, line)| match &line.entry {
-            ListEntry::Group(name) => Row {
-                text: format!("## {}", String::from_utf8_lossy(name)),
-                key: None,
-                at,
-                since: None,
-                status: None,
-            },
-            ListEntry::Item { id, text, .. } => {
+            ListEntry::Group(name) => {
+                let text = format!("## {}", String::from_utf8_lossy(name));
+                Row {
+                    dim_from: text.len(),
+                    text,
+                    key: None,
+                    at,
+                    since: None,
+                    status: None,
+                }
+            }
+            ListEntry::Item {
+                id, text, waits, ..
+            } => {
                 let text = String::from_utf8_lossy(text).into_owned();
                 Row {
                     key: Some(ItemKey {
                         ident: Ident::Id(*id),
                         nth: 0,
                     }),
-                    text,
+                    dim_from: text.len(),
+                    text: text + &waits_suffix(*waits),
                     at,
                     since: None,
                     status: None,

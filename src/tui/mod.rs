@@ -537,6 +537,13 @@ fn worker(board: Board, messages: Sender<Message>) -> impl FnMut(Job) -> Event +
             let result = match &action {
                 Action::Done(id) => board.done(&[*id]),
                 Action::Drop(id) => board.drop_items(&[*id]),
+                Action::First(id) => board.queue(
+                    *id,
+                    crate::ops::Queueing {
+                        first: true,
+                        ..Default::default()
+                    },
+                ),
                 Action::Sync => board.sync().map(|()| "synced".to_owned()),
             };
             Event::Ran(action, result.map_err(|error| error.to_string()))

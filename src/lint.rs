@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use crate::after;
 use crate::brief::BadStatus;
 use crate::id::{BriefId, ItemId, ListId, ListKind};
 use crate::project::Project;
@@ -37,6 +38,14 @@ pub enum Problem {
     MissingKey(&'static str),
     /// An item's file without its `# ` title line.
     NoTitle,
+    /// An `after:` that is no id, as found: it holds nothing up.
+    BadAfter(String),
+    /// An `after:` a write would refuse: the item itself, a loop, or a
+    /// backlog item the brief closes, none of which would ever be over
+    /// (`after::refusal`). The highest id ever given
+    /// is not checked: only a write reads history, and an `after:` to an id
+    /// never given has no file, so it holds nothing up.
+    Wait(String),
     /// An `.md` file below `briefs/`, `chores/` or `backlog/` that is not
     /// named as the board names its files.
     Misnamed,
@@ -88,6 +97,12 @@ impl fmt::Display for Problem {
             ),
             Problem::MissingKey(key) => write!(f, "no `{key}:` line"),
             Problem::NoTitle => f.write_str("no `# ` title line after the header"),
+            Problem::BadAfter(found) => write!(
+                f,
+                "after `{}` is no id like 128, c12 or b41, so it waits on nothing",
+                found.escape_debug()
+            ),
+            Problem::Wait(why) => write!(f, "after: {why}"),
             Problem::Misnamed => f.write_str(
                 "not named as the board names its files (briefs/[done/]<number>-<slug>.md, \
                  chores/c<id>.md, backlog/b<id>.md), so it is not synced",
@@ -178,6 +193,9 @@ fn items(project: &Project, kind: ListKind, findings: &mut Vec<Finding>) {
         if item.title().is_none() {
             finding(Problem::NoTitle);
         }
+        if let Some(problem) = wait(project, ItemId::from(id), item.get(after::KEY)) {
+            finding(problem);
+        }
     }
 }
 
@@ -189,6 +207,17 @@ fn list_id(kind: ListKind, number: u32) -> ListId {
         ListKind::Backlog => {
             ListId::Backlog(crate::id::BacklogId::new(number).expect("an item's id is past 0"))
         }
+    }
+}
+
+/// What is wrong with the `after:` value of `id`, if anything.
+fn wait(project: &Project, id: ItemId, value: Option<&[u8]>) -> Option<Problem> {
+    let value = value?;
+    match after::parse(value) {
+        None => Some(Problem::BadAfter(
+            String::from_utf8_lossy(value).into_owned(),
+        )),
+        Some(target) => after::refusal(project, id, target, None).map(Problem::Wait),
     }
 }
 
@@ -213,6 +242,9 @@ fn briefs(project: &Project, findings: &mut Vec<Finding>) {
         }
         if let Err(bad) = file.status() {
             finding(Problem::Status(bad));
+        }
+        if let Some(problem) = wait(project, ItemId::Brief(number), file.brief.get(after::KEY)) {
+            finding(problem);
         }
         // A brief without an `id:` line is fine: the file name has the
         // number, and an archived brief has no header at all.

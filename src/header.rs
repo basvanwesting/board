@@ -96,8 +96,9 @@ impl Header {
     }
 
     /// Rewrites the key's line in place, or adds the key right after the
-    /// line of `after` (first in the header without one).
-    pub(crate) fn set_after(&mut self, key: &str, value: &str, after: &str) {
+    /// last line of one of the keys `after` (first in the header without
+    /// any): where the board writes it in a new file.
+    pub(crate) fn set_after(&mut self, key: &str, value: &str, after: &[&str]) {
         if self.position(key).is_some() {
             self.set(key, value);
             return;
@@ -108,7 +109,13 @@ impl Header {
         {
             last.extend_from_slice(terminator);
         }
-        let at = self.position(after).map_or(0, |at| at + 1);
+        let at = self
+            .lines
+            .iter()
+            .rposition(|line| {
+                key_of(raw::content(line)).is_some_and(|k| after.iter().any(|a| a.as_bytes() == k))
+            })
+            .map_or(0, |at| at + 1);
         let line = format!("{key}: {value}").into_bytes();
         self.lines
             .insert(at, [line.as_slice(), terminator].concat());
@@ -153,10 +160,14 @@ mod tests {
         open.set("group", "3");
         assert_eq!(open.to_bytes(), b"id: c1\ngroup: 3\n");
         let (mut after, _) = Header::split(b"x: 1\nid: c1\nother: y\n");
-        after.set_after("group", "G", "id");
+        after.set_after("group", "G", &["id"]);
         assert_eq!(after.to_bytes(), b"x: 1\nid: c1\ngroup: G\nother: y\n");
         let (mut first, _) = Header::split(b"other: y\n");
-        first.set_after("group", "G", "id");
+        first.set_after("group", "G", &["id"]);
         assert_eq!(first.to_bytes(), b"group: G\nother: y\n");
+        // After the last of the keys there are.
+        let (mut many, _) = Header::split(b"id: c1\ngroup: g\nfrom: 1\n");
+        many.set_after("after", "c2", &["id", "group", "check"]);
+        assert_eq!(many.to_bytes(), b"id: c1\ngroup: g\nafter: c2\nfrom: 1\n");
     }
 }

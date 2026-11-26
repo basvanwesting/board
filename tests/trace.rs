@@ -140,6 +140,17 @@ enum Op {
         pick: Index,
         write: bool,
         closes: Option<Index>,
+        /// `--after`: an item of the board of this kind (0 a brief, 1 a chore, 2 a backlog item).
+        after: Option<(u8, Index)>,
+        first: bool,
+    },
+    /// `queue <id> --first` on a queued brief of the clone or the remote.
+    First(Index),
+    /// `after <id> <target>`, or `--none`: an item or a brief of the clone
+    /// or the remote, of a kind: 0 a brief, 1 a chore, 2 a backlog item.
+    After {
+        item: (u8, Index),
+        target: Option<(u8, Index)>,
     },
     Next,
     /// A started brief of the clone or the remote, picked when the step
@@ -256,7 +267,12 @@ fn op() -> impl Strategy<Value = Op> {
             .prop_map(|(backlog, item, text, check)| Op::Retitle { backlog, item, text, check }),
         2 => Just(Op::NewBrief),
         3 => (any::<Index>(), prop::bool::weighted(0.8), prop::option::of(any::<Index>()))
-            .prop_map(|(pick, write, closes)| Op::Queue { pick, write, closes }),
+            .prop_map(|(pick, write, closes)| Op::Queue { pick, write, closes, after: None, first: false }),
+        2 => (any::<Index>(), prop::option::of((0..3u8, any::<Index>())), any::<bool>())
+            .prop_map(|(pick, after, first)| Op::Queue { pick, write: true, closes: None, after, first }),
+        1 => any::<Index>().prop_map(Op::First),
+        2 => ((0..3u8, any::<Index>()), prop::option::weighted(0.8, (0..3u8, any::<Index>())))
+            .prop_map(|(item, target)| Op::After { item, target }),
         2 => Just(Op::Next),
         2 => any::<Index>().prop_map(Op::Block),
         2 => any::<Index>().prop_map(Op::Amend),
@@ -407,11 +423,47 @@ fn scene() -> impl Strategy<Value = Vec<Step>> {
         })
 }
 
+/// A brief queued to wait on a chore, the queue drained by `next` until it
+/// says the rest waits, the chore done, and `next` again; at times put
+/// first meanwhile. Left to chance, a wait is seldom what holds the queue,
+/// and seldom over before the trace ends.
+fn waited() -> impl Strategy<Value = Vec<Step>> {
+    (
+        who(),
+        any::<Index>(),
+        any::<Index>(),
+        any::<bool>(),
+        1..4usize,
+    )
+        .prop_map(|(who, chore, brief, first, drains)| {
+            let cmd = |op| Step::Cmd {
+                who,
+                op,
+                fault: None,
+            };
+            let mut steps = vec![
+                cmd(Op::AddChore { group: true }),
+                cmd(Op::NewBrief),
+                cmd(Op::Queue {
+                    pick: brief,
+                    write: true,
+                    closes: None,
+                    after: Some((1, chore)),
+                    first,
+                }),
+            ];
+            steps.extend((0..drains).map(|_| cmd(Op::Next)));
+            steps.extend([cmd(Op::First(brief)), cmd(Op::Done(chore)), cmd(Op::Next)]);
+            steps
+        })
+}
+
 fn steps() -> impl Strategy<Value = Vec<Step>> {
     prop::collection::vec(
         prop_oneof![
             12 => step().prop_map(|step| vec![step]),
             1 => scene(),
+            1 => waited(),
         ],
         1..=30,
     )
@@ -478,6 +530,14 @@ struct BriefSeen {
     /// The value of the first `status:` line of the header.
     status: Option<String>,
     text: String,
+}
+
+/// The value of a brief's `after:` header line.
+fn after_of(text: &str) -> Option<String> {
+    text.lines()
+        .take_while(|line| is_key_line(line))
+        .find_map(|line| line.strip_prefix("after: "))
+        .map(|value| value.trim().to_owned())
 }
 
 /// Whether the planner's sections are in the brief.
@@ -703,6 +763,10 @@ enum Subject {
     /// The slug, a token.
     NewBrief(String),
     Queue(u32),
+    /// `queue <n> --first`.
+    First(u32),
+    /// `after <id> …`: the id.
+    After(String),
     Next,
     /// The brief, and the token of the line the command writes into it.
     Block(u32, String),
@@ -728,6 +792,8 @@ impl Subject {
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
+            | Subject::First(_)
+            | Subject::After(_)
             | Subject::Next
             | Subject::File(..) => None,
         }
@@ -742,6 +808,8 @@ impl Subject {
             | Subject::Close(_)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
+            | Subject::First(_)
+            | Subject::After(_)
             | Subject::Next
             | Subject::Block(..)
             | Subject::Amend(..)
@@ -761,6 +829,8 @@ impl Subject {
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
+            | Subject::First(_)
+            | Subject::After(_)
             | Subject::Next
             | Subject::Block(..)
             | Subject::Amend(..)
@@ -781,6 +851,8 @@ impl Subject {
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
             | Subject::Queue(_)
+            | Subject::First(_)
+            | Subject::After(_)
             | Subject::Next
             | Subject::File(..) => None,
         }
@@ -871,6 +943,13 @@ struct Depth {
     briefs_created: u32,
     briefs_queued: u32,
     briefs_claimed: u32,
+    /// A claimed brief with an `after:`, its wait over.
+    claimed_after_wait: u32,
+    /// `next` with only waiting briefs queued.
+    queue_waiting: u32,
+    briefs_put_first: u32,
+    /// `after` runs that set or removed a wait.
+    waits_set: u32,
     queue_empty: u32,
     briefs_blocked: u32,
     briefs_resumed: u32,
@@ -930,6 +1009,10 @@ impl Depth {
         self.briefs_created += other.briefs_created;
         self.briefs_queued += other.briefs_queued;
         self.briefs_claimed += other.briefs_claimed;
+        self.claimed_after_wait += other.claimed_after_wait;
+        self.queue_waiting += other.queue_waiting;
+        self.briefs_put_first += other.briefs_put_first;
+        self.waits_set += other.waits_set;
         self.queue_empty += other.queue_empty;
         self.briefs_blocked += other.briefs_blocked;
         self.briefs_resumed += other.briefs_resumed;
@@ -1439,6 +1522,8 @@ impl<'w> Oracle<'w> {
             Op::Queue {
                 pick: draft,
                 closes,
+                after,
+                first,
                 ..
             } => {
                 // Nothing to pick: a brief that is not there, for a refusal.
@@ -1457,7 +1542,34 @@ impl<'w> Oracle<'w> {
                         args.extend(["--closes".to_owned(), format!("b{item}")]);
                     }
                 }
+                if let Some(target) = after {
+                    args.extend(["--after".to_owned(), self.target(who, *target)]);
+                }
+                if *first {
+                    args.push("--first".to_owned());
+                }
                 (args, Subject::Queue(number))
+            }
+            Op::First(index) => {
+                let numbers = self.open_with(who, &["queued"]);
+                let number = if numbers.is_empty() {
+                    999_999
+                } else {
+                    *index.get(&numbers)
+                };
+                (
+                    owned(&["queue", &number.to_string(), "--first"]),
+                    Subject::First(number),
+                )
+            }
+            Op::After { item, target } => {
+                let id = self.target(who, *item);
+                let mut args = owned(&["after", &id]);
+                match target {
+                    Some(target) => args.push(self.target(who, *target)),
+                    None => args.push("--none".to_owned()),
+                }
+                (args, Subject::After(id))
             }
             Op::File { pick, trailer } => {
                 let numbers = self.open_with(who, &["reported"]);
@@ -1546,6 +1658,62 @@ impl<'w> Oracle<'w> {
 
     /// The numbers of the open briefs of the clone and the remote that have
     /// one of these statuses.
+    /// An id of the clone or the remote of a kind, picked by
+    /// `index`: a brief (0), a chore (1), a backlog item (2). Nothing to
+    /// pick: an id no item has, for a refusal.
+    fn target(&self, who: Who, (kind, index): (u8, Index)) -> String {
+        match kind {
+            0 => {
+                let numbers: BTreeSet<u32> = [who.slot(), 2]
+                    .into_iter()
+                    .flat_map(|place| self.briefs(place))
+                    .map(|brief| brief.number)
+                    .collect();
+                let numbers: Vec<u32> = numbers.into_iter().collect();
+                if numbers.is_empty() {
+                    "999999".to_owned()
+                } else {
+                    index.get(&numbers).to_string()
+                }
+            }
+            _ => {
+                let prefix = if kind == 1 { 'c' } else { 'b' };
+                let ids: BTreeSet<u32> = self
+                    .ids_in(who.slot(), prefix)
+                    .into_iter()
+                    .chain(self.ids_in(2, prefix))
+                    .collect();
+                let ids: Vec<u32> = ids.into_iter().collect();
+                if ids.is_empty() {
+                    format!("{prefix}999999")
+                } else {
+                    format!("{prefix}{}", index.get(&ids))
+                }
+            }
+        }
+    }
+
+    /// What a brief of `place` waits on, as the oracle reads the files
+    /// there, written out here rather than taken from the tool: its
+    /// `after:` while that names a brief that is not reported or filed, or
+    /// an item whose file is there.
+    fn waits_on(&self, place: usize, brief: &BriefSeen) -> Option<String> {
+        let target = after_of(&brief.text)?;
+        let waiting = match target.chars().next() {
+            Some(prefix @ ('c' | 'b')) => {
+                id_of(prefix, &target).is_some_and(|id| self.read(place).items.contains_key(&id))
+            }
+            _ => target.parse::<u32>().is_ok_and(|number| {
+                self.briefs(place).iter().any(|other| {
+                    other.number == number
+                        && !other.filed
+                        && !matches!(other.status.as_deref(), Some("reported" | "filed"))
+                })
+            }),
+        };
+        waiting.then_some(target)
+    }
+
     fn open_with(&self, who: Who, statuses: &[&str]) -> Vec<u32> {
         let numbers: BTreeSet<u32> = [who.slot(), 2]
             .into_iter()
@@ -1953,6 +2121,8 @@ impl<'w> Oracle<'w> {
             | Op::Drop(_)
             | Op::NewBrief
             | Op::Queue { .. }
+            | Op::First(_)
+            | Op::After { .. }
             | Op::Next => return Ok(()),
             Op::Group { items, .. } => {
                 for backlog in [false, true] {
@@ -1981,6 +2151,8 @@ impl<'w> Oracle<'w> {
                     pick: first(),
                     write: true,
                     closes: Some(first()),
+                    after: None,
+                    first: false,
                 }
             } else {
                 Op::NewBrief
@@ -2172,7 +2344,7 @@ impl<'w> Oracle<'w> {
         let (mut printed, mut unsure) = (0, 0);
         for (_, run) in runs {
             match run.code {
-                Some(0) if run.stdout != "queue empty\n" => printed += 1,
+                Some(0) if !run.stdout.starts_with("queue empty") => printed += 1,
                 Some(0 | 1) => {}
                 Some(_) | None => unsure += 1,
             }
@@ -2314,6 +2486,8 @@ impl<'w> Oracle<'w> {
                             | Subject::Group(..)
                             | Subject::Retitle(..)
                             | Subject::Queue(_)
+                            | Subject::First(_)
+                            | Subject::After(_)
                             | Subject::File(..)
                     ) || subject.brief_line().is_some(),
                     "{run:?}"
@@ -2513,9 +2687,50 @@ impl<'w> Oracle<'w> {
                     }
                 }
             }
+            Subject::First(number) => match run.code {
+                Some(0) => {
+                    // Picked as queued; a draft when it ran (the remote's
+                    // version kept over a clone's offline queue) is queued
+                    // and put first.
+                    prop_assert!(
+                        run.stdout == format!("{number} first\n")
+                            || run.stdout == format!("queued {number}, first\n"),
+                        "{run:?}"
+                    );
+                    self.depth.briefs_put_first += 1;
+                }
+                Some(1) => prop_assert!(
+                    run.stderr
+                        .lines()
+                        .last()
+                        .is_some_and(|last| last.starts_with(&format!("board: queue {number}: "))),
+                    "{:?}",
+                    run
+                ),
+                Some(_) | None => {}
+            },
+            Subject::After(id) => match run.code {
+                Some(0) => {
+                    prop_assert!(run.stdout.starts_with(&format!("{id} after ")), "{run:?}");
+                    self.depth.waits_set += 1;
+                }
+                Some(1) => prop_assert!(
+                    run.stderr
+                        .lines()
+                        .last()
+                        .is_some_and(|last| last.starts_with("board: after")),
+                    "{:?}",
+                    run
+                ),
+                Some(_) | None => {}
+            },
             Subject::Queue(number) => match run.code {
                 Some(0) => {
-                    prop_assert_eq!(&run.stdout, &format!("queued {number}\n"));
+                    prop_assert!(
+                        run.stdout == format!("queued {number}\n")
+                            || run.stdout == format!("queued {number}, first\n"),
+                        "{run:?}"
+                    );
                     // Queued, or claimed since: a queue run in the window of
                     // a `next` is claimed by its retry.
                     let place = if pushed { 2 } else { slot };
@@ -2536,7 +2751,8 @@ impl<'w> Oracle<'w> {
                 Some(1) => {
                     let last = run.stderr.lines().last().unwrap_or_default();
                     prop_assert!(
-                        last.starts_with(&format!("board: queue {number}: ")),
+                        last.starts_with(&format!("board: queue {number}: "))
+                            || last.starts_with("board: queue: "),
                         "{:?}",
                         run
                     );
@@ -2548,16 +2764,23 @@ impl<'w> Oracle<'w> {
                     return Ok(());
                 }
                 let remote = self.briefs(2);
-                if run.stdout == "queue empty\n" {
-                    // In a window the step's command may queue one after.
+                if run.stdout.starts_with("queue empty") {
+                    // In a window the step's command may queue one after, or
+                    // satisfy what one waits on.
+                    let claimable = remote.iter().any(|brief| {
+                        !brief.filed
+                            && brief.status.as_deref() == Some("queued")
+                            && self.waits_on(2, brief).is_none()
+                    });
                     prop_assert!(
-                        window
-                            || !remote.iter().any(|brief| {
-                                !brief.filed && brief.status.as_deref() == Some("queued")
-                            }),
-                        "queue empty with a queued brief on the remote: {:?}",
+                        window || !claimable,
+                        "queue empty with a claimable brief on the remote: {:?}",
                         run
                     );
+                    if run.stdout != "queue empty\n" {
+                        prop_assert!(run.stdout.starts_with("queue empty, "), "{run:?}");
+                        self.depth.queue_waiting += 1;
+                    }
                     self.depth.queue_empty += 1;
                     return Ok(());
                 }
@@ -2579,6 +2802,19 @@ impl<'w> Oracle<'w> {
                     "next printed a brief that is not started on the remote: {:?}",
                     run
                 );
+                // No brief is started while what it waits on is not over,
+                // as the remote has it after the claim: its push is the
+                // last change, and a wait once over stays over.
+                prop_assert!(
+                    self.waits_on(2, claimed[0]).is_none(),
+                    "{} claimed while it waits on {:?}: {:?}",
+                    claimed[0].number,
+                    self.waits_on(2, claimed[0]),
+                    run
+                );
+                if after_of(&claimed[0].text).is_some() {
+                    self.depth.claimed_after_wait += 1;
+                }
                 self.depth.briefs_claimed += 1;
             }
             Subject::Block(number, token)
@@ -3443,6 +3679,10 @@ fn the_traces_get_deep() {
     assert!(depth.briefs_created > 0, "{depth:?}");
     assert!(depth.briefs_queued > 0, "{depth:?}");
     assert!(depth.briefs_claimed > 0, "{depth:?}");
+    assert!(depth.claimed_after_wait > 0, "{depth:?}");
+    assert!(depth.queue_waiting > 0, "{depth:?}");
+    assert!(depth.briefs_put_first > 0, "{depth:?}");
+    assert!(depth.waits_set > 0, "{depth:?}");
     assert!(depth.queue_empty > 0, "{depth:?}");
     assert!(depth.briefs_blocked > 0, "{depth:?}");
     assert!(depth.briefs_resumed > 0, "{depth:?}");
@@ -3600,6 +3840,8 @@ fn next_runs_while_queue_pushes() {
                     pick: first(),
                     write,
                     closes: None,
+                    after: None,
+                    first: false,
                 },
                 fault: Some(Fault::WindowOp(Op::Next)),
             },
@@ -3623,6 +3865,8 @@ fn next_after_a_queue_whose_brief_was_saved_during_the_push() {
                 pick: first(),
                 write: false,
                 closes: None,
+                after: None,
+                first: false,
             },
             fault: Some(Fault::WindowEdit(Edit::Brief(BriefPick::First))),
         },

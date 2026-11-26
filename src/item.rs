@@ -95,6 +95,9 @@ impl Item {
         if let Some(check) = new.check {
             header.set("check", check.as_str());
         }
+        if let Some(after) = new.after {
+            header.set(crate::after::KEY, &after.to_string());
+        }
         if let Some(from) = new.from {
             header.set("from", &from.to_string());
         }
@@ -168,12 +171,26 @@ impl Item {
         self.header.remove(key);
     }
 
+    /// What the item waits on (`after:`), where a new item has it: after
+    /// `id`, `group` and `check`; `None` removes the line.
+    pub(crate) fn set_wait(&mut self, target: Option<ItemId>) {
+        self.terminate_header();
+        match target {
+            Some(target) => self.header.set_after(
+                crate::after::KEY,
+                &target.to_string(),
+                &["id", "group", "check"],
+            ),
+            None => self.header.remove(crate::after::KEY),
+        }
+    }
+
     /// Puts the item in `group`: its `group:` line rewritten in place, or,
     /// on an item without one, added right after `id:`, where a new item
     /// has it, rather than at the end of the header as a new key lands.
     pub(crate) fn set_group(&mut self, group: &Line) {
         self.terminate_header();
-        self.header.set_after("group", group.as_str(), "id");
+        self.header.set_after("group", group.as_str(), &["id"]);
     }
 
     pub(crate) fn set_title(&mut self, title: &Line) {
@@ -304,6 +321,7 @@ pub(crate) struct New<'a> {
     pub id: ItemId,
     pub group: &'a Line,
     pub check: Option<&'a Line>,
+    pub after: Option<ItemId>,
     pub from: Option<ItemId>,
     pub created: Stamp,
     pub title: &'a Line,
@@ -516,6 +534,7 @@ mod tests {
             id: ItemId::Chore(ChoreId::new(12).unwrap()),
             group: &line("Deploy"),
             check: Some(&line("select 1")),
+            after: None,
             from: Some(ItemId::Brief(crate::id::BriefId::new(126))),
             created,
             title: &line("Check the states"),

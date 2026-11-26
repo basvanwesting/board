@@ -7,6 +7,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use crate::after;
 use crate::brief::{
     BadStatus, Brief, EntryText, NotABacklogId, Stamp, Status, Text, Transition, TransitionError,
 };
@@ -50,20 +51,81 @@ pub(crate) fn new_brief(
     path
 }
 
-/// Queues a draft whose required sections hold text, and writes the backlog
-/// items it closes when `closes` is given; gives what `queue` prints.
+/// What `queue` is asked besides the brief.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Queueing<'a> {
+    /// The backlog items it closes (`--closes`).
+    pub closes: Option<&'a [BacklogId]>,
+    /// What it waits on (`--after`).
+    pub after: Option<ItemId>,
+    /// Put it first in the queue (`--first`).
+    pub first: bool,
+}
+
+/// Queues a draft whose required sections hold text, writing the backlog
+/// items it closes, what it waits on and its place first in the queue when
+/// asked; or puts a queued brief first. Gives what `queue` prints.
+///
+/// `--first` on a queued brief stands alone (planner, 2026-11-26): its
+/// `closes` was fixed when it was queued, and what it waits on has its own
+/// command. Its `queued:` time stays: the counter is what puts it first.
 pub(crate) fn queue(
     project: &mut Project,
     number: BriefId,
-    closes: Option<&[BacklogId]>,
+    asked: Queueing<'_>,
     now: Stamp,
 ) -> Result<String, Error> {
+    let Queueing {
+        closes,
+        after,
+        first,
+    } = asked;
     let refused = |why: String| Error::Refused(format!("queue {number}: {why}"));
     let file = project
         .find_brief(number)
         .map_err(|why| refused(no_brief(number, why)))?;
     match file.status() {
         Ok(Status::Draft) => {}
+        Ok(Status::Queued) if first => {
+            if closes.is_some() || after.is_some() {
+                return Err(refused(
+                    "it is queued, so --first stands alone: its --closes was fixed when it was \
+                     queued, and `board after` changes what it waits on"
+                        .to_owned(),
+                ));
+            }
+            // First already, alone at the top: no write, so a press of `F`
+            // too many is no commit and no push.
+            let others = project
+                .briefs()
+                .iter()
+                .filter(|other| other.name.number() != number)
+                .filter(|other| other.status() == Ok(Status::Queued))
+                .filter_map(BriefFile::first)
+                .max();
+            if let Some(mine) = file.first()
+                && others.is_none_or(|others| others < mine)
+            {
+                return Ok(format!("{number} first"));
+            }
+            let counter = next_first(project);
+            project
+                .brief_mut(number)
+                .map_err(|why| refused(no_brief(number, why)))?
+                .brief
+                .set_first(counter);
+            return Ok(format!("{number} first"));
+        }
+        Ok(Status::Queued) if after.is_some() => {
+            return Err(refused(format!(
+                "it is queued; `board after {number} <id>` changes what it waits on"
+            )));
+        }
+        Ok(status) if first => {
+            return Err(refused(format!(
+                "it is {status}; --first is for a draft or a queued brief"
+            )));
+        }
         Ok(status) => return Err(refused(format!("it is {status}, not draft"))),
         Err(bad) => return Err(refused(bad_status(&bad))),
     }
@@ -99,42 +161,109 @@ pub(crate) fn queue(
                 ))
             })?;
     }
+    // What it waits on after this write: the `--after` given, else the
+    // file's, checked against the `closes` it gets now too.
+    let id = ItemId::Brief(number);
+    if let Some(target) = after.or_else(|| after::target_of(project, id))
+        && let Some(why) = after::refusal(project, id, target, closes.as_deref())
+    {
+        return Err(refused(why));
+    }
+    let counter = first.then(|| next_first(project));
     let file = project
         .brief_mut(number)
         .map_err(|why| refused(no_brief(number, why)))?;
     if let Some(closes) = &closes {
         file.brief.set_closes(closes);
     }
+    if after.is_some() {
+        file.brief.set_after(after);
+    }
+    if let Some(counter) = counter {
+        file.brief.set_first(counter);
+    }
     file.transition(Transition::Queue, now)
         .map_err(|error| refused(not_moved(&error, Status::Draft)))?;
-    Ok(format!("queued {number}"))
+    Ok(if first {
+        format!("queued {number}, first")
+    } else {
+        format!("queued {number}")
+    })
 }
 
-/// Claims the brief that has waited longest: the earliest `queued:` time,
-/// then the lowest number. `None` when nothing is queued.
+/// The `first:` a brief put first now gets: one above the highest among
+/// the queued briefs, 1 when there is none. The latest `--first` wins.
+fn next_first(project: &Project) -> u64 {
+    project
+        .briefs()
+        .iter()
+        .filter(|file| file.status() == Ok(Status::Queued))
+        .filter_map(BriefFile::first)
+        .max()
+        .map_or(1, |highest| highest.saturating_add(1))
+}
+
+/// What `next` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Claim {
+    /// The brief it claimed, at its path.
+    Claimed(BriefId, BoardPath),
+    /// Nothing queued.
+    Empty,
+    /// Briefs queued, each waiting on an unsatisfied target: how many, and
+    /// the targets, each once, in the queue order of their briefs.
+    Waiting(usize, Vec<ItemId>),
+}
+
+impl fmt::Display for Claim {
+    /// What `next` prints when it claims nothing; a claim prints its path.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Claim::Claimed(number, _) => write!(f, "started {number}"),
+            Claim::Empty => f.write_str("queue empty"),
+            Claim::Waiting(count, targets) => {
+                let targets: Vec<String> = targets.iter().map(ItemId::to_string).collect();
+                write!(f, "queue empty, {count} waiting on {}", targets.join(", "))
+            }
+        }
+    }
+}
+
+/// Claims the first brief of the queue ([`QueuePlace`]: those put first,
+/// then the earliest `queued:` time, then the lowest number) that waits on
+/// nothing unsatisfied (`after:`). A waiting brief holds up only itself
+/// and what is chained to it.
 ///
 /// A queued brief without a readable `queued:` time (one queued by hand)
 /// comes after those with one: it has no place in the order, and the rest
 /// keep theirs.
-pub(crate) fn next(
-    project: &mut Project,
-    now: Stamp,
-) -> Result<Option<(BriefId, BoardPath)>, Error> {
-    let queued_at = |file: &BriefFile| {
-        file.brief
-            .get("queued")
-            .and_then(|value| str::from_utf8(value).ok()?.parse::<Stamp>().ok())
-    };
-    let first = project
+///
+/// The one place `after:` is enforced (owner, 2026-11-26): so no order of
+/// the queue, `--first` included, can break a dependency, and a queue of
+/// waiting briefs says so rather than read as done.
+pub(crate) fn next(project: &mut Project, now: Stamp) -> Result<Claim, Error> {
+    let mut queued: Vec<&BriefFile> = project
         .briefs()
         .iter()
         .filter(|file| file.status() == Ok(Status::Queued))
-        .min_by_key(|file| {
-            let at = queued_at(file);
-            (at.is_none(), at, file.name.number())
-        });
-    let Some(number) = first.map(|file| file.name.number()) else {
-        return Ok(None);
+        .collect();
+    queued.sort_by_key(|file| (file.queue_place(), file.name.number()));
+    let waits = |file: &&BriefFile| after::waits_on(project, ItemId::Brief(file.name.number()));
+    let Some(number) = queued
+        .iter()
+        .find(|file| waits(file).is_none())
+        .map(|file| file.name.number())
+    else {
+        if queued.is_empty() {
+            return Ok(Claim::Empty);
+        }
+        let mut targets: Vec<ItemId> = Vec::new();
+        for target in queued.iter().filter_map(waits) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        return Ok(Claim::Waiting(queued.len(), targets));
     };
     let refused = |why: String| Error::Refused(format!("next: {why}"));
     let name = project.name().clone();
@@ -143,7 +272,73 @@ pub(crate) fn next(
         .map_err(|why| refused(no_brief(number, why)))?;
     file.transition(Transition::Claim, now)
         .map_err(|error| refused(not_moved(&error, Status::Queued)))?;
-    Ok(Some((number, file.path(&name))))
+    Ok(Claim::Claimed(number, file.path(&name)))
+}
+
+/// Makes `id` wait on `target`, or on nothing (`None`); gives what `after`
+/// prints, as `c3 after c9`. Any chore or backlog item; a brief only while
+/// it is draft or queued, as a started brief no longer waits for anything.
+/// Refused for the item itself and a loop ([`after::refusal`]); a target
+/// that is satisfied already is accepted and holds nothing up.
+pub(crate) fn set_after(
+    project: &mut Project,
+    id: ItemId,
+    target: Option<ItemId>,
+) -> Result<String, Error> {
+    let refused = |why: String| Error::Refused(format!("after {id}: {why}"));
+    match id {
+        ItemId::Brief(number) => {
+            let file = project
+                .find_brief(number)
+                .map_err(|why| refused(no_brief(number, why)))?;
+            match file.status() {
+                Ok(Status::Draft | Status::Queued) => {}
+                Ok(status) => {
+                    return Err(refused(format!(
+                        "it is {status}; only a draft or a queued brief waits, as a started \
+                         one no longer waits for anything"
+                    )));
+                }
+                Err(bad) => return Err(refused(bad_status(&bad))),
+            }
+        }
+        ItemId::Chore(_) | ItemId::Backlog(_) => {
+            let list = list_id(id);
+            project
+                .list(list.kind())
+                .find(list.get())
+                .map_err(|why| refused(not_one(list.kind(), list.get(), why)))?;
+        }
+    }
+    if let Some(target) = target
+        && let Some(why) = after::refusal(project, id, target, None)
+    {
+        return Err(refused(why));
+    }
+    match id {
+        ItemId::Brief(number) => project
+            .brief_mut(number)
+            .map_err(|why| refused(no_brief(number, why)))?
+            .brief
+            .set_after(target),
+        ItemId::Chore(_) | ItemId::Backlog(_) => project
+            .item_mut(list_id(id))
+            .expect("found above")
+            .set_wait(target),
+    }
+    Ok(match target {
+        Some(target) => format!("{id} after {target}"),
+        None => format!("{id} after nothing"),
+    })
+}
+
+/// A chore's or backlog item's id as the lists take it.
+fn list_id(id: ItemId) -> ListId {
+    match id {
+        ItemId::Chore(chore) => ListId::Chore(chore),
+        ItemId::Backlog(backlog) => ListId::Backlog(backlog),
+        ItemId::Brief(_) => unreachable!("a list item's id"),
+    }
 }
 
 /// The tool's sections, each the place of one command's entries.
@@ -386,6 +581,8 @@ pub struct NewChore {
     /// How to see it is done; optional (owner, 2026-11-25: "some chores are
     /// just that, simple actions. A check would repeat it").
     pub check: Option<Line>,
+    /// What it waits on (`--after`), shown, never enforced.
+    pub after: Option<ItemId>,
     pub from: Option<ItemId>,
     /// Empty for none.
     pub body: Body,
@@ -396,6 +593,8 @@ pub struct NewChore {
 pub struct NewBacklog {
     pub text: Line,
     pub group: Line,
+    /// What it waits on (`--after`), shown, never enforced.
+    pub after: Option<ItemId>,
     pub from: Option<ItemId>,
     /// Empty for none.
     pub body: Body,
@@ -416,6 +615,7 @@ pub(crate) fn add_chore(project: &mut Project, id: ChoreId, new: &NewChore, now:
         id: ItemId::Chore(id),
         group: &new.group,
         check: new.check.as_ref(),
+        after: new.after,
         from: new.from,
         created: now,
         title: &new.text,
@@ -432,6 +632,7 @@ pub(crate) fn add_backlog(project: &mut Project, id: BacklogId, new: &NewBacklog
         id: ItemId::Backlog(id),
         group: &new.group,
         check: None,
+        after: new.after,
         from: new.from,
         created: now,
         title: &new.text,
@@ -663,6 +864,7 @@ mod tests {
             text: line(text),
             group: line(group),
             check: check.map(line),
+            after: None,
             from: None,
             body: Body::new(body),
         };
@@ -697,6 +899,7 @@ mod tests {
         let new = NewBacklog {
             text: line("Dark mode"),
             group: line("Later"),
+            after: None,
             from,
             body: Body::new(b""),
         };
@@ -957,6 +1160,13 @@ mod tests {
 
     // ---- briefs ----
 
+    fn closing(closes: Option<&[BacklogId]>) -> Queueing<'_> {
+        Queueing {
+            closes,
+            ..Queueing::default()
+        }
+    }
+
     const SECTIONS: &str = "# Title\n## Task\nt\n## Design\nd\n## Premises\np\n## Out of scope\no\n\
                             ## Verification\nv\n## Not doable by the worker\nn\n## Worker protocol\nw\n";
 
@@ -1026,7 +1236,7 @@ mod tests {
             queue(
                 &mut shop,
                 BriefId::new(1),
-                Some(&closes),
+                closing(Some(&closes)),
                 at("2026-11-20T16:40:12Z")
             )
             .unwrap(),
@@ -1043,7 +1253,13 @@ mod tests {
         // Without --closes a `closes:` written by hand stays.
         let by_hand = format!("id: 2\nstatus: draft\ncloses: b9\n\n{SECTIONS}");
         let mut shop = with_briefs(&[("briefs/2-b.md", &by_hand)], &[]);
-        queue(&mut shop, BriefId::new(2), None, at("2026-11-20T16:40:12Z")).unwrap();
+        queue(
+            &mut shop,
+            BriefId::new(2),
+            Queueing::default(),
+            at("2026-11-20T16:40:12Z"),
+        )
+        .unwrap();
         assert!(text_of(&shop, "briefs/2-b.md").contains("\ncloses: b9\n"));
     }
 
@@ -1059,7 +1275,7 @@ mod tests {
             refused(queue(
                 &mut shop,
                 BriefId::new(1),
-                None,
+                Queueing::default(),
                 at("2026-11-20T16:40:12Z")
             )),
             "queue 1: no text under ## Design, ## Out of scope, ## Not doable by the worker, \
@@ -1086,7 +1302,7 @@ mod tests {
         );
         let now = at("2026-11-20T16:40:12Z");
         let mut queue_one = |number: u32, closes: Option<&[BacklogId]>| {
-            refused(queue(&mut shop, BriefId::new(number), closes, now))
+            refused(queue(&mut shop, BriefId::new(number), closing(closes), now))
         };
         assert_eq!(queue_one(1, None), "queue 1: it is queued, not draft");
         assert_eq!(
@@ -1120,7 +1336,9 @@ mod tests {
             &[],
         );
         let mut order = Vec::new();
-        while let Some((number, path)) = next(&mut shop, at("2026-11-20T17:00:00Z")).unwrap() {
+        while let Claim::Claimed(number, path) =
+            next(&mut shop, at("2026-11-20T17:00:00Z")).unwrap()
+        {
             order.push((number.get(), path.to_string()));
         }
         assert_eq!(
@@ -1141,7 +1359,10 @@ mod tests {
     #[test]
     fn next_on_an_empty_queue_changes_nothing() {
         let mut shop = with_briefs(&[("briefs/1-a.md", "status: draft\n")], &[]);
-        assert_eq!(next(&mut shop, at("2026-11-20T17:00:00Z")).unwrap(), None);
+        assert_eq!(
+            next(&mut shop, at("2026-11-20T17:00:00Z")).unwrap(),
+            Claim::Empty
+        );
         assert_eq!(changed(&shop), Vec::<String>::new());
     }
 

@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::header::Header;
-use crate::id::{BacklogId, BriefId, ListKind};
+use crate::id::{BacklogId, BriefId, ItemId, ListKind};
 use crate::raw;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -531,6 +531,29 @@ impl Brief {
     /// header. Private: `status` has one writer, [`Brief::transition`].
     fn set(&mut self, key: &str, value: &str) {
         self.header.set(key, value);
+    }
+
+    /// What the brief waits on (`after:`), after `closes` where the header
+    /// has it; `None` removes the line.
+    pub(crate) fn set_after(&mut self, target: Option<ItemId>) {
+        match target {
+            Some(target) => self.header.set_after(
+                crate::after::KEY,
+                &target.to_string(),
+                &["id", "status", "base", "closes"],
+            ),
+            None => self.header.remove(crate::after::KEY),
+        }
+    }
+
+    /// Puts the brief first in the queue: `first: <n>`, after `after` and
+    /// `closes` where the header has them.
+    pub(crate) fn set_first(&mut self, counter: u64) {
+        self.header.set_after(
+            crate::project::FIRST,
+            &counter.to_string(),
+            &["id", "status", "base", "closes", crate::after::KEY],
+        );
     }
 
     /// Writes the backlog items the brief resolves, which `file` deletes:

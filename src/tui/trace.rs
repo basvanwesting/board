@@ -42,7 +42,10 @@
 //!   nothing at all while the filter is typed, a question is asked, help
 //!   is open or a quit waits. Where a click lands comes from the frame
 //!   drawn before it (the panes' boxes found by their `[n]` titles and
-//!   corners), not from the state's own hit test.
+//!   corners), not from the state's own hit test;
+//! - T13 `queue --first` is sent only by `F` on the queued brief under
+//!   the cursor, alone; `F` on another brief sends nothing and says why,
+//!   on a list item nothing at all.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -54,7 +57,7 @@ use proptest::test_runner::{
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
-use super::super::data::{BriefItem, Data, ListLine};
+use super::super::data::{BriefItem, Data, ListEntry, ListLine};
 use super::super::layout::inner_height;
 use super::super::view;
 use super::*;
@@ -189,6 +192,8 @@ fn key() -> impl Strategy<Value = Key> {
         Char('e'),
         Char('r'),
         Char('Y'),
+        Char('F'),
+        Char('F'),
         Ctrl('c'),
     ])
 }
@@ -363,6 +368,9 @@ fn data(files: &Files) -> Data {
             status,
             slug: format!("s{number}"),
             unpushed: false,
+            queue: Default::default(),
+            // Some briefs wait, for rows with the dim `  after <id>`.
+            waits: number.is_multiple_of(3).then(|| "c1".parse().unwrap()),
         };
         let mut text = format!(
             "id: {number}\nstatus: {}\n\n# Brief {number}\n## Task\n",
@@ -392,9 +400,32 @@ fn data(files: &Files) -> Data {
             .iter()
             .map(|(number, lines)| brief(*number, Some(Status::Filed), *lines))
             .collect(),
-        chores: ListLine::numbered(ListKind::Chores, chore_rows(&files.chores)),
-        backlog: ListLine::numbered(ListKind::Backlog, backlog_rows(&files.backlog)),
+        chores: waiting(ListLine::numbered(
+            ListKind::Chores,
+            chore_rows(&files.chores),
+        )),
+        backlog: waiting(ListLine::numbered(
+            ListKind::Backlog,
+            backlog_rows(&files.backlog),
+        )),
     }
+}
+
+/// Some items waiting, so the rows that end with `  after <id>` (a text
+/// longer than its line, drawn dim) go through every invariant: those of a
+/// variant 1 (chores) or an even id (backlog), on c1.
+fn waiting(mut lines: Vec<ListLine>) -> Vec<ListLine> {
+    for line in &mut lines {
+        if let ListEntry::Item {
+            id, text, waits, ..
+        } = &mut line.entry
+            && (text.ends_with(b"v1. Check: it is done")
+                || (text.starts_with(b"b") && *id % 2 == 0))
+        {
+            *waits = Some("c1".parse().unwrap());
+        }
+    }
+    lines
 }
 
 /// The items whose id has not come before: one file per id.
@@ -519,6 +550,10 @@ struct Depth {
     wheeled: u32,
     /// `J` or `K` on a list item, which does nothing.
     upper_jk: u32,
+    /// `F` on a queued brief: one `queue --first`.
+    firsts: u32,
+    /// `F` on a brief that is not queued: a note, nothing sent.
+    first_refused: u32,
 }
 
 impl Depth {
@@ -567,7 +602,9 @@ impl Depth {
             click_previewed,
             mouse_waited,
             wheeled,
-            upper_jk
+            upper_jk,
+            firsts,
+            first_refused
         );
     }
 }
@@ -1028,8 +1065,8 @@ fn judge(
                 );
                 depth.syncs += 1;
             }
-            // T9, below.
-            Command::Run(Action::Done(_) | Action::Drop(_)) => {}
+            // T9 and T13, below.
+            Command::Run(Action::Done(_) | Action::Drop(_) | Action::First(_)) => {}
             Command::Edit { .. } => {
                 prop_assert!(pressed('e') || matches!(event, Event::Loaded(_)));
             }
@@ -1042,7 +1079,9 @@ fn judge(
                     && let Some((source, row)) = before.cursor_item()
                 {
                     let want = match source.list() {
-                        Some(_) => format!("{}\n", row.text),
+                        // As `show` prints it: the line without what it
+                        // waits on.
+                        Some(_) => format!("{}\n", &row.text[..row.dim_from]),
                         None => {
                             String::from_utf8_lossy(&before.brief(source, &row).text).into_owned()
                         }
@@ -1221,7 +1260,7 @@ fn judge(
         let (ask, kind) = match question.action {
             Action::Done(_) => ('d', ListKind::Chores),
             Action::Drop(_) => ('x', ListKind::Backlog),
-            Action::Sync => panic!("asked {question:?}"),
+            Action::First(_) | Action::Sync => panic!("asked {question:?}"),
         };
         prop_assert!(pressed(ask), "asked {question:?} after {event:?}");
         let (source, row) = before.cursor_item().expect("asked about an item");
@@ -1229,11 +1268,51 @@ fn judge(
         let number = match question.action {
             Action::Done(id) => id.get(),
             Action::Drop(id) => id.get(),
-            Action::Sync => unreachable!(),
+            Action::First(_) | Action::Sync => unreachable!(),
         };
         // The id the CLI reads on the line: the command names this item.
         prop_assert_eq!(cli_id(kind, &row), Some(number), "{:?}", row);
         depth.asked += 1;
+    }
+    // T13: `queue --first` only by `F`, on the queued brief under the
+    // cursor, and alone; `F` on anything else sends nothing, and says why
+    // on a brief.
+    let firsts: Vec<BriefId> = commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::Run(Action::First(id)) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if pressed('F') {
+        let under = before.cursor_item();
+        let queued = under.as_ref().and_then(|(source, row)| {
+            source
+                .list()
+                .is_none()
+                .then(|| before.brief(*source, row).row.clone())
+        });
+        match queued {
+            Some(brief) if brief.status == Some(Status::Queued) && !brief.unpushed => {
+                prop_assert_eq!(&firsts, &vec![brief.number]);
+                prop_assert_eq!(commands.len(), 1);
+                depth.firsts += 1;
+            }
+            Some(brief) => {
+                prop_assert!(commands.is_empty(), "{commands:?} for {brief:?}");
+                prop_assert!(
+                    after
+                        .messages
+                        .iter()
+                        .any(|m| m.error && m.text.starts_with("F puts a queued brief first")),
+                    "no note after F on {brief:?}"
+                );
+                depth.first_refused += 1;
+            }
+            None => prop_assert!(commands.is_empty(), "{commands:?} after F"),
+        }
+    } else {
+        prop_assert!(firsts.is_empty(), "{firsts:?} after {event:?}");
     }
     if before.question.is_some()
         && after.question.is_none()
@@ -1556,6 +1635,8 @@ fn the_traces_get_deep() {
         ("mouse_waited", depth.mouse_waited > 0),
         ("wheeled", depth.wheeled > 0),
         ("upper_jk", depth.upper_jk > 0),
+        ("firsts", depth.firsts > 0),
+        ("first_refused", depth.first_refused > 0),
     ];
     let missed: Vec<&str> = reached
         .iter()
