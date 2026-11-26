@@ -1512,7 +1512,16 @@ fn drawn_hit(state: &State, column: u16, row: u16) -> Drawn {
             for x in 0..width.saturating_sub(4) {
                 if (0..5).all(|i| cell(x + i, y) == title[usize::from(i)]) {
                     let right = (x + 1..width).find(|&x| cell(x, y) == "╮")?;
-                    let bottom = (y + 1..height).find(|&y| cell(x, y) == "╰")?;
+                    // Its own bottom corner, the next corner down the
+                    // column; when that is another box's top, this box is
+                    // one row, cut to its top border (a screen too low for
+                    // more), and ends on its own row.
+                    let below = (y + 1..height).find(|&y| matches!(cell(x, y).as_str(), "╰" | "╭"));
+                    let bottom = match below {
+                        Some(below) if cell(x, below) == "╰" => below,
+                        Some(_) => y,
+                        None => return None,
+                    };
                     return Some((x, y, right, bottom));
                 }
             }
@@ -1896,4 +1905,32 @@ fn a_waited_edit_follows_its_brief_s_file_into_the_other_tab() {
         Err(error) => panic!("{error}"),
     };
     assert_eq!((depth.edits_waited, depth.edits), (1, 1), "{depth:?}");
+}
+
+/// The shrunk case of a random trace: on a screen so low that Briefs is
+/// one row, only its top border is drawn, and a click on Chores' top edge
+/// is Chores', not Briefs' read off the corner of the box below.
+#[test]
+fn a_click_below_a_box_cut_to_one_row_is_the_next_box_s() {
+    let empty = Files {
+        open: Vec::new(),
+        filed: Vec::new(),
+        chores: Vec::new(),
+        backlog: Vec::new(),
+    };
+    let steps = [
+        Step::Resize(20, 8),
+        Step::Load(Files {
+            chores: vec![(0, 1, 0)],
+            backlog: vec![(0, 1, 0)],
+            ..empty.clone()
+        }),
+        Step::Mouse(Mouse::Click { column: 0, row: 1 }),
+    ];
+    let depth = match run_trace(&empty, &steps) {
+        Ok(depth) => depth,
+        Err(error) => panic!("{error}"),
+    };
+    // Judged, from Briefs to Chores: not left unknown.
+    assert_eq!(depth.click_focused, 1, "{depth:?}");
 }
