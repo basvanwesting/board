@@ -102,8 +102,8 @@ impl Preview {
     }
 }
 
-/// The preview of the row at `at` in the data of `source`: a brief's file,
-/// headings highlighted, or an item as `show` prints it.
+/// The preview of the row at `at` in the data of `source`: a brief's or an
+/// item's file, as `show` prints it, headings highlighted.
 ///
 /// Plain text: no markdown renderer, which is much machinery for a pane
 /// briefs are read in (SPEC.md, TUI).
@@ -114,21 +114,7 @@ pub(crate) fn preview(data: &Data, source: Source, row: &Row) -> Preview {
         Source::Chores | Source::Backlog => None,
     };
     if let Some(brief) = brief {
-        let lines: Vec<Line<'static>> = String::from_utf8_lossy(&brief.text)
-            .lines()
-            .map(|line| {
-                // A tab has no width of its own on the screen.
-                let line = line.replace('\t', "    ");
-                if line.starts_with('#') {
-                    Line::styled(
-                        line,
-                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    Line::raw(line)
-                }
-            })
-            .collect();
+        let lines = file_lines(&brief.text);
         return Preview {
             title: Line::from(vec![
                 Span::styled(brief.row.number.to_string(), id_style()),
@@ -142,22 +128,40 @@ pub(crate) fn preview(data: &Data, source: Source, row: &Row) -> Preview {
         .and_then(|kind| row.id_word(kind))
         .map(|id| Line::from(Span::styled(id, id_style())))
         .unwrap_or_default();
-    // What `show` prints of it: the line, a blank line and the body as its
-    // file has it.
-    let shown = source
+    // Its file, as `show` prints it, drawn as a brief's is.
+    let lines = source
         .list()
         .and_then(|kind| data.list(kind).get(row.at))
         .and_then(|line| match &line.entry {
-            ListEntry::Item { shown, .. } => Some(String::from_utf8_lossy(shown).into_owned()),
+            ListEntry::Item { file, .. } => Some(file_lines(file)),
             ListEntry::Group(_) => None,
         })
-        .unwrap_or_else(|| row.text.clone());
-    let lines: Vec<Line<'static>> = shown
-        .lines()
-        .map(|line| Line::raw(line.replace('\t', "    ")))
-        .collect();
+        .unwrap_or_else(|| vec![Line::raw(row.text.clone())]);
     Preview {
         title,
         text: Text::from(lines),
     }
+}
+
+/// A brief's or an item's file as the preview draws it: a line that starts
+/// with `#` highlighted as a heading, the rest plain. One rule for both, so
+/// an item reads as a brief does.
+fn file_lines(file: &[u8]) -> Vec<Line<'static>> {
+    String::from_utf8_lossy(file)
+        .lines()
+        .map(|line| {
+            // A tab has no width of its own on the screen.
+            let line = line.replace('\t', "    ");
+            if line.starts_with('#') {
+                Line::styled(line, heading_style())
+            } else {
+                Line::raw(line)
+            }
+        })
+        .collect()
+}
+
+/// A heading's style in the preview.
+pub(crate) fn heading_style() -> Style {
+    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
 }

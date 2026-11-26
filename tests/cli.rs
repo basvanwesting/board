@@ -224,7 +224,7 @@ fn a_title_is_printed_as_its_file_has_it() {
     assert_eq!(ran.stdout, b"## Default\nb1 caf\xe9\n");
     let ran = a.board(&["show", "b1"]);
     assert_eq!((ran.code, ran.stderr.as_str()), (0, ""));
-    assert_eq!(ran.stdout, b"b1 caf\xe9\n");
+    assert_eq!(ran.stdout, a.file("proj/backlog/b1.md").unwrap());
 }
 
 // ---- show ----
@@ -244,40 +244,73 @@ fn show_prints_a_brief_as_the_file_has_it() {
     assert_eq!(a.board(&["show", "7"]).ok(), "# An old brief\n");
 }
 
+/// A chore's or backlog item's `show` is its file as stored, byte for byte,
+/// as a brief's is (owner, 2026-11-26: "I would do it like briefs do for
+/// chores and backlogs as well"): every header line, an unknown key
+/// included, the title, the body with its blank and `## ` lines.
 #[test]
-fn show_prints_an_item_as_its_line() {
+fn show_prints_an_item_as_its_file() {
     let world = World::new();
     let a = world.a();
-    fill(&a);
-    assert_eq!(
-        a.board(&["show", "c3"]).ok(),
-        "c3 Rotate the key. Check: login works  (126)\n"
-    );
-    assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n");
-}
-
-/// An item's body is Markdown: shown after its line and a blank line, byte
-/// for byte, not indented; stdin without a final line break got one.
-#[test]
-fn show_prints_an_item_with_its_body_as_the_file_has_it() {
-    let world = World::new();
-    let a = world.a();
-    let body = "why: the night shift\n\n## Steps\n```sql\nselect count(*)\n  from orders;\n```\n\t- a list\n";
+    a.board(&["add", "chore", "Deploy"]).ok();
+    a.board_with_input(
+        &[
+            "add",
+            "chore",
+            "Rotate the key",
+            "--check",
+            "login works",
+            "--from",
+            "126",
+            "--body",
+        ],
+        b"why: the night shift\n\n## Steps\n```sql\nselect 1;\n```\n",
+    )
+    .ok();
+    a.board_with_input(
+        &["add", "backlog", "Dark mode", "--from", "c1", "--body"],
+        b"first\n\n## more\n",
+    )
+    .ok();
+    a.board(&["add", "backlog", "Plain"]).ok();
+    // A key the tool does not know, by hand.
+    for file in ["proj/chores/c2.md", "proj/backlog/b1.md"] {
+        let text = String::from_utf8(a.file(file).unwrap()).unwrap();
+        a.write(
+            file,
+            text.replacen("\ncreated:", "\nowner: me\ncreated:", 1),
+        );
+    }
+    // A file without a final line break: shown as it is.
     a.write(
-        "proj/backlog/b1.md",
-        format!("id: b1\ngroup: Default\ncreated: x\n\n# Dark mode\n\n{body}"),
+        "proj/backlog/b3.md",
+        "id: b3\ngroup: Default\ncreated: x\n\n# Open\n\nno final line break",
     );
+    a.board(&["sync"]).ok();
+    for (id, file) in [
+        ("c2", "proj/chores/c2.md"),
+        ("b1", "proj/backlog/b1.md"),
+        ("b2", "proj/backlog/b2.md"),
+        ("b3", "proj/backlog/b3.md"),
+    ] {
+        let ran = a.board(&["show", id]);
+        assert_eq!((ran.code, ran.stderr.as_str()), (0, ""), "{id}");
+        assert_eq!(ran.stdout, a.file(file).unwrap(), "{id}");
+    }
+    assert!(
+        a.file("proj/chores/c2.md")
+            .unwrap()
+            .starts_with(b"id: c2\n")
+    );
+    assert!(!a.file("proj/backlog/b3.md").unwrap().ends_with(b"\n"));
+    for file in ["proj/chores/c2.md", "proj/backlog/b1.md"] {
+        let text = String::from_utf8(a.file(file).unwrap()).unwrap();
+        assert!(text.contains("\nowner: me\n"), "{text}");
+    }
+    // `ls` keeps the line.
     assert_eq!(
-        a.board(&["show", "b1"]).ok(),
-        format!("b1 Dark mode\n\n{body}")
-    );
-    a.write(
-        "proj/backlog/b2.md",
-        "id: b2\ngroup: Default\ncreated: x\n\n# Other\n\nno final line break",
-    );
-    assert_eq!(
-        a.board(&["show", "b2"]).ok(),
-        "b2 Other\n\nno final line break\n"
+        a.board(&["ls", "chores"]).ok(),
+        "## Default\nc1 Deploy\nc2 Rotate the key. Check: login works  (126)\n"
     );
 }
 
@@ -410,13 +443,16 @@ fn the_project_is_the_repository_s_path_below_work() {
     // From anywhere inside the repository.
     let inside = a.proj().join("src").join("deep");
     fs::create_dir_all(&inside).unwrap();
-    assert_eq!(a.board_in(&inside, &["show", "b1"]).ok(), "b1 of proj\n");
+    assert_eq!(
+        a.board_in(&inside, &["ls", "backlog"]).ok(),
+        "## Default\nb1 of proj\n"
+    );
 
     // A repository deeper below Work: `/` becomes `-`.
     let nested = a.repository("Work/tools/shop");
     assert_eq!(
-        a.board_in(&nested, &["show", "b1"]).ok(),
-        "b1 of tools-shop\n"
+        a.board_in(&nested, &["ls", "backlog"]).ok(),
+        "## Default\nb1 of tools-shop\n"
     );
 
     // The checkout names the project, wherever its git directory is kept (a
@@ -439,8 +475,8 @@ fn the_project_is_the_repository_s_path_below_work() {
         "id: b1\ngroup: Default\ncreated: x\n\n# of tools-till\n",
     );
     assert_eq!(
-        a.board_in(&kept_elsewhere, &["show", "b1"]).ok(),
-        "b1 of tools-till\n"
+        a.board_in(&kept_elsewhere, &["ls", "backlog"]).ok(),
+        "## Default\nb1 of tools-till\n"
     );
 }
 
@@ -488,20 +524,20 @@ fn a_linked_worktree_is_on_the_board_of_its_repository() {
         let worktree = a.home().join(place);
         add_worktree(&a, &a.proj(), &worktree);
         assert_eq!(
-            a.board_in(&worktree, &["show", "b1"]).ok(),
-            "b1 of proj\n",
+            a.board_in(&worktree, &["ls", "backlog"]).ok(),
+            "## Default\nb1 of proj\n",
             "{place}"
         );
         let inside = worktree.join("src");
         fs::create_dir(&inside).unwrap();
         assert_eq!(
-            a.board_in(&inside, &["show", "b1"]).ok(),
-            "b1 of proj\n",
+            a.board_in(&inside, &["ls", "backlog"]).ok(),
+            "## Default\nb1 of proj\n",
             "{place}"
         );
     }
     // The repository's own checkout still is what it was.
-    assert_eq!(a.board(&["show", "b1"]).ok(), "b1 of proj\n");
+    assert_eq!(a.board(&["ls", "backlog"]).ok(), "## Default\nb1 of proj\n");
 }
 
 #[test]
@@ -622,9 +658,9 @@ fn the_board_data_clone_gives_no_project() {
                 .command()
                 .env("BOARD_ROOT", root)
                 .current_dir(&data)
-                .args(["show", "b1"]))
+                .args(["ls", "backlog"]))
             .ok(),
-            "b1 of board-data\n"
+            "## Default\nb1 of board-data\n"
         );
         assert_eq!(
             run(a
@@ -655,21 +691,21 @@ fn a_symlink_on_the_way_to_work_does_not_move_the_project() {
 
     // The home, the directory, and both.
     assert_eq!(
-        run(a.command().env("HOME", &link).args(["show", "b1"])).ok(),
-        "b1 of proj\n"
+        run(a.command().env("HOME", &link).args(["ls", "backlog"])).ok(),
+        "## Default\nb1 of proj\n"
     );
     assert_eq!(
-        a.board_in(&through_link, &["show", "b1"]).ok(),
-        "b1 of proj\n"
+        a.board_in(&through_link, &["ls", "backlog"]).ok(),
+        "## Default\nb1 of proj\n"
     );
     assert_eq!(
         run(a
             .command()
             .env("HOME", &link)
             .current_dir(&through_link)
-            .args(["show", "b1"]))
+            .args(["ls", "backlog"]))
         .ok(),
-        "b1 of proj\n"
+        "## Default\nb1 of proj\n"
     );
     // And what is outside Work stays outside.
     let outside = a.repository("elsewhere/shop");
@@ -704,21 +740,30 @@ fn a_given_board_replaces_the_derived_one() {
         "other/backlog/b1.md",
         "id: b1\ngroup: Default\ncreated: x\n\n# of other\n",
     );
-    let show = |command: &mut std::process::Command| run(command.args(["show", "b1"])).ok();
+    let show = |command: &mut std::process::Command| run(command.args(["ls", "backlog"])).ok();
 
-    assert_eq!(show(a.command().args(["--board", "shop"])), "b1 of shop\n");
     assert_eq!(
-        a.board(&["show", "b1", "--board", "shop"]).ok(),
-        "b1 of shop\n"
+        show(a.command().args(["--board", "shop"])),
+        "## Default\nb1 of shop\n"
     );
-    assert_eq!(show(a.command().env("BOARD", "shop")), "b1 of shop\n");
+    assert_eq!(
+        a.board(&["ls", "backlog", "--board", "shop"]).ok(),
+        "## Default\nb1 of shop\n"
+    );
+    assert_eq!(
+        show(a.command().env("BOARD", "shop")),
+        "## Default\nb1 of shop\n"
+    );
     // The argument is nearer than the environment.
     assert_eq!(
         show(a.command().env("BOARD", "shop").args(["--board", "other"])),
-        "b1 of other\n"
+        "## Default\nb1 of other\n"
     );
     // Empty is unset.
-    assert_eq!(show(a.command().env("BOARD", "")), "b1 of proj\n");
+    assert_eq!(
+        show(a.command().env("BOARD", "")),
+        "## Default\nb1 of proj\n"
+    );
 }
 
 #[test]
@@ -730,9 +775,9 @@ fn a_given_board_works_where_no_project_can_be_derived() {
         "id: b1\ngroup: Default\ncreated: x\n\n# of shop\n",
     );
     assert_eq!(
-        a.board_in(&a.home(), &["--board", "shop", "show", "b1"])
+        a.board_in(&a.home(), &["--board", "shop", "ls", "backlog"])
             .ok(),
-        "b1 of shop\n"
+        "## Default\nb1 of shop\n"
     );
 }
 
@@ -817,8 +862,8 @@ fn git_s_own_variables_do_not_move_the_project() {
             a.data().join(".git").join("no-such-index"),
         )
         .env("GIT_PREFIX", "proj/")
-        .args(["show", "b1"]));
-    assert_eq!(ran.ok(), "b1 of proj\n");
+        .args(["ls", "backlog"]));
+    assert_eq!(ran.ok(), "## Default\nb1 of proj\n");
 }
 
 // ---- where the board is ----
@@ -895,7 +940,7 @@ fn a_read_of_a_named_board_runs_no_git() {
     assert_eq!(board(&["--board", "proj", "ls", "briefs"]).ok(), BRIEFS);
     assert_eq!(
         board(&["--board", "proj", "show", "b1"]).ok(),
-        "b1 Dark mode\n"
+        "id: b1\ngroup: Default\ncreated: x\n\n# Dark mode\n"
     );
     assert_eq!(board(&["--board", "proj", "lint"]).ok(), "ok\n");
     // Deriving the project is the one thing that needs it.

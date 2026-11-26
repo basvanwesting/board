@@ -1072,15 +1072,14 @@ fn judge(
             }
             Command::Yank(text) => {
                 prop_assert!(pressed('y') || pressed('Y'), "yank after {event:?}");
-                // `yy`: the whole item; the trace's items have no body, so
-                // an item is its line, a brief its file.
+                // `yy`: the whole item, its file; the trace's stand-in file
+                // is the line, without what it waits on. From the row, not
+                // from the data the state reads, so a stale `row.at` shows.
                 if pressed('y')
                     && whole
                     && let Some((source, row)) = before.cursor_item()
                 {
                     let want = match source.list() {
-                        // As `show` prints it: the line without what it
-                        // waits on.
                         Some(_) => format!("{}\n", &row.text[..row.dim_from]),
                         None => {
                             String::from_utf8_lossy(&before.brief(source, &row).text).into_owned()

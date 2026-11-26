@@ -1102,44 +1102,41 @@ mod tests {
         assert_eq!(filed[(x, y)].fg, Color::Reset);
     }
 
-    /// A list item's preview: what `show` prints, its body as the file has
-    /// it, blank lines and all.
+    /// A list item's preview is its file, as `show` prints it: every line,
+    /// in order, header first; its `# ` title a heading as a brief's is, a
+    /// header line plain.
     #[test]
-    fn an_item_s_preview_is_what_show_prints() {
+    fn an_item_s_preview_is_its_file() {
+        const C3: &str = "id: c3\ngroup: Deploy\ncheck: the page loads\nowner: me\nfrom: 126\n\
+                          created: 2026-11-26T10:00:00Z\n\n# Rotate the key\n\nsteps:\n\n\
+                          ## first\n- a list\n";
         let mut project = crate::project::Project::empty(ProjectName::parse("shop").unwrap());
-        for (number, text) in [
-            (
-                41,
-                "id: b41\ngroup: Default\n\n# Cache the prices\n\nwhy: slow\n\n- a list\n  - nested\n",
-            ),
-            (42, "id: b42\ngroup: Default\n\n# plain\n"),
-        ] {
+        for (number, text) in [(3, C3), (4, "id: c4\ngroup: Deploy\n\n# plain")] {
             project
-                .list_mut(ListKind::Backlog)
+                .list_mut(ListKind::Chores)
                 .insert(number, crate::item::Item::parse(text.as_bytes()));
         }
         let data = Data {
-            backlog: Data::of(&project).backlog,
+            chores: Data::of(&project).chores,
             ..data()
         };
-        let (state, _) = State::new(data, 100, 12, Stamp::from_unix(NOW).unwrap());
+        let (state, _) = State::new(data, 100, 30, Stamp::from_unix(NOW).unwrap());
         let text = |state: &State| -> Vec<String> {
             let preview = state.preview_content().unwrap();
             preview.text.lines.iter().map(ToString::to_string).collect()
         };
-        let state = press(state, "3");
+        let state = press(state, "2");
+        assert_eq!(text(&state), C3.lines().collect::<Vec<_>>());
+        let preview = state.preview_content().unwrap();
+        let style = |at: usize| preview.text.lines[at].style;
+        assert_eq!(preview.text.lines[0].to_string(), "id: c3");
+        assert_eq!(style(7), layout::heading_style());
+        assert_eq!(style(0), Style::default());
+        // The file without a final line break: nothing added.
         assert_eq!(
-            text(&state),
-            [
-                "b41 Cache the prices",
-                "",
-                "why: slow",
-                "",
-                "- a list",
-                "  - nested"
-            ]
+            text(&press(state, "j")),
+            ["id: c4", "group: Deploy", "", "# plain"]
         );
-        assert_eq!(text(&press(state, "j")), ["b42 plain"]);
     }
 
     #[test]

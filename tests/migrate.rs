@@ -12,8 +12,6 @@ const CHORES: &str = include_str!("fixtures/migrate/chores.md");
 const BACKLOG: &str = include_str!("fixtures/migrate/backlog.md");
 /// The old `ls chores` and `ls backlog`.
 const OLD_LS: &str = include_str!("fixtures/migrate/ls.txt");
-/// The old `show` of every item, in file order, each followed by `--`.
-const OLD_SHOW: &str = include_str!("fixtures/migrate/show.txt");
 
 fn text(bytes: Option<Vec<u8>>) -> String {
     String::from_utf8(bytes.expect("the file is there")).expect("UTF-8")
@@ -42,7 +40,7 @@ fn old_board(world: &World) -> Machine<'_> {
 }
 
 #[test]
-fn the_old_writers_lists_become_item_files_that_show_as_before() {
+fn the_old_writers_lists_become_item_files_that_list_as_before() {
     let world = World::new();
     let a = old_board(&world);
     let commits = world.remote_log().len();
@@ -86,26 +84,6 @@ fn the_old_writers_lists_become_item_files_that_show_as_before() {
     new.sort_unstable();
     old.sort_unstable();
     assert_eq!(new, old);
-
-    // `show`: the same, but for the body: the old one printed it as stored,
-    // indented, the new one after a blank line, as the file has it.
-    for old in OLD_SHOW.split_terminator("--\n") {
-        let (line, body) = old.split_once('\n').expect("a line");
-        let id = line.split(' ').next().expect("an id");
-        let expected = if body.is_empty() {
-            format!("{line}\n")
-        } else {
-            let body: String = body
-                .lines()
-                .map(|l| {
-                    let l = l.strip_prefix("  ").unwrap_or_else(|| &l[1..]);
-                    format!("{l}\n")
-                })
-                .collect();
-            format!("{line}\n\n{body}")
-        };
-        assert_eq!(a.board(&["show", id]).ok(), expected, "{id}");
-    }
 
     // The files, as the new tool writes them: a title without the join's
     // full stop, the check and the reference as keys, no order key.

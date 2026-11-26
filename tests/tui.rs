@@ -180,7 +180,8 @@ fn main() {
     assert_eq!(a.status(), "");
 
     // yy: the whole item, what `board show` prints, after the id of the
-    // first y: a chore with a body, an open brief, a filed one.
+    // first y: a chore with a body, an open brief, a filed one. A chore is
+    // its file, as a brief is.
     let chore = a
         .board_with_input(
             &[
@@ -226,5 +227,13 @@ fn main() {
             "{keys:?}"
         );
     }
+    fs::write(&clipboard, "").expect("empty the clipboard");
+    tui(&a, "2/Wash\ryy");
+    let file = text(a.file(&format!("proj/chores/{chore}.md")));
+    assert!(file.starts_with(&format!("id: {chore}\n")), "{file}");
+    assert_eq!(
+        fs::read_to_string(&clipboard).expect("wl-copy ran"),
+        format!("{chore}\n{file}\n")
+    );
     assert_eq!(a.status(), "");
 }

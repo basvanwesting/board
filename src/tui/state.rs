@@ -1013,8 +1013,8 @@ impl State {
     }
 
     /// `yy`: the whole item, as `board show` prints it, from the same code: a
-    /// brief's file, a chore's or backlog item's line with its body. The
-    /// bottom line says what was taken, never the text.
+    /// brief's or a chore's or backlog item's file, as stored. The bottom
+    /// line says what was taken, never the text.
     fn yank_whole(&mut self) -> Vec<Command> {
         let Some((source, row)) = self.cursor_item() else {
             return Vec::new();
@@ -1025,17 +1025,11 @@ impl State {
                 (brief.text.clone(), brief.row.number.to_string())
             }
             Some(kind) => {
-                let ListEntry::Item { shown, body, .. } = &self.data.list(kind)[row.at].entry
-                else {
+                let ListEntry::Item { file, .. } = &self.data.list(kind)[row.at].entry else {
                     return Vec::new();
                 };
                 let name = row.id_word(kind).unwrap_or_else(|| "the item".to_owned());
-                let what = if *body {
-                    format!("{name} with its body")
-                } else {
-                    name
-                };
-                (shown.clone(), what)
+                (file.clone(), name)
             }
         };
         let text = String::from_utf8_lossy(&text).into_owned();

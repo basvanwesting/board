@@ -33,7 +33,7 @@ enum Command {
         #[arg(long, value_name = "STATUS")]
         status: Option<Shown>,
     },
-    /// Print a brief, or a chore or backlog item: its line and its body
+    /// Print a brief's, a chore's or a backlog item's file, as stored
     Show {
         /// Like 128, c12 or b41
         id: ItemId,

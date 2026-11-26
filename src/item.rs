@@ -286,22 +286,6 @@ impl Item {
         }
         line
     }
-
-    /// The item as `show` prints it: its line, and when it has a body a
-    /// blank line and the body as the file has it. The TUI's preview and
-    /// `yy` show the same, from this code.
-    pub fn shown(&self, kind: ListKind, number: u32) -> Vec<u8> {
-        let mut shown = self.line(kind, number);
-        shown.push(b'\n');
-        if !self.body.is_empty() {
-            shown.push(b'\n');
-            shown.extend_from_slice(&self.body);
-            if !self.body.ends_with(b"\n") {
-                shown.push(b'\n');
-            }
-        }
-        shown
-    }
 }
 
 /// What goes between a chore's title and its `Check:`: a title that ends
@@ -499,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn the_line_and_show_are_what_ls_and_show_print() {
+    fn the_line_is_what_ls_prints() {
         let chore = Item::parse(b"id: c12\ngroup: g\ncheck: x\nfrom: 126\n\n# Do it\n");
         assert_eq!(
             chore.line(ListKind::Chores, 12),
@@ -511,13 +495,6 @@ mod tests {
         assert_eq!(plain.line(ListKind::Chores, 4), b"c4 Simple");
         let backlog = Item::parse(b"id: b41\ngroup: g\nfrom: c3\n\n# Later\n\nwhy\n\n## more\n");
         assert_eq!(backlog.line(ListKind::Backlog, 41), b"b41 Later  (from c3)");
-        assert_eq!(
-            backlog.shown(ListKind::Backlog, 41),
-            b"b41 Later  (from c3)\n\nwhy\n\n## more\n"
-        );
-        assert_eq!(plain.shown(ListKind::Chores, 4), b"c4 Simple\n");
-        let open = Item::parse(b"id: b1\ngroup: g\n\n# T\n\nno newline");
-        assert_eq!(open.shown(ListKind::Backlog, 1), b"b1 T\n\nno newline\n");
     }
 
     #[test]

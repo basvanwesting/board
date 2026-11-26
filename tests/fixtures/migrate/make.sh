@@ -10,8 +10,7 @@
 # indented by a tab instead of the two spaces, its last by one space, and
 # a chore without a check (c6). (A line of one space before text that
 # starts with blanks reads as two spaces before one less, so that case is
-# not made.) ls.txt and show.txt are the old tool's
-# output for the lists as they end up.
+# not made.) ls.txt is the old tool's output for the lists as they end up.
 set -eu
 old=$(realpath "$1")
 here=$(cd "$(dirname "$0")" && pwd)
@@ -54,8 +53,3 @@ git push -q origin main
 cp chores.md backlog.md "$here/"
 b ls chores >"$here/ls.txt"
 b ls backlog >>"$here/ls.txt"
-: >"$here/show.txt"
-for id in $(sed -n 's/^- \([cb][0-9]*\) .*/\1/p' chores.md backlog.md); do
-  b show "$id" >>"$here/show.txt"
-  echo "--" >>"$here/show.txt"
-done

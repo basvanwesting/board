@@ -210,8 +210,8 @@ fn retitle_changes_an_item_s_title_or_check_and_keeps_the_rest() {
         "retitled c1\n"
     );
     assert_eq!(
-        a.board(&["show", "c1"]).ok(),
-        "c1 Rotate both keys. Check: login works  (126)\n\nthe steps\n"
+        a.board(&["ls", "chores"]).ok(),
+        "## Home\nc1 Rotate both keys. Check: login works  (126)\n"
     );
     a.board(&["retitle", "c1", "--check", "the old key fails"])
         .ok();
@@ -227,8 +227,12 @@ fn retitle_changes_an_item_s_title_or_check_and_keeps_the_rest() {
     );
     a.board(&["retitle", "c1", "--check", ""]).ok();
     assert_eq!(
+        a.board(&["ls", "chores"]).ok(),
+        "## Home\nc1 Rotate both keys  (126)\n"
+    );
+    assert_eq!(
         a.board(&["show", "c1"]).ok(),
-        "c1 Rotate both keys  (126)\n\nthe steps\n"
+        text(a.file("proj/chores/c1.md"))
     );
     assert_eq!(
         world.remote_log()[..4],
@@ -307,10 +311,10 @@ fn add_body_amend_and_replace_write_an_item_s_body() {
             .ok(),
         "amended c1\n"
     );
-    let shown = format!(
-        "c1 Check the orders. Check: the query below returns 0\n\n{body}\n## Then\n- c9 not an item\n"
+    assert_eq!(
+        a.board(&["show", "c1"]).ok(),
+        text(a.file("proj/chores/c1.md"))
     );
-    assert_eq!(a.board(&["show", "c1"]).ok(), shown);
     assert_eq!(
         stamped(world.remote_file("proj/chores/c1.md")),
         format!(
@@ -328,19 +332,15 @@ fn add_body_amend_and_replace_write_an_item_s_body() {
             .ok(),
         "amended b1\n"
     );
-    assert_eq!(
-        a.board(&["show", "b1"]).ok(),
-        "b1 Dark mode\n\nwhy: battery\n"
-    );
+    assert!(text(a.file("proj/backlog/b1.md")).ends_with("# Dark mode\n\nwhy: battery\n"));
     a.board_with_input(&["amend", "b1", "--replace"], b"").ok();
-    assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n");
     assert_eq!(
         stamped(world.remote_file("proj/backlog/b1.md")),
         "id: b1\ngroup: Default\ncreated: T\n\n# Dark mode\n"
     );
     a.board_with_input(&["amend", "b1", "--replace"], b"back")
         .ok();
-    assert_eq!(a.board(&["show", "b1"]).ok(), "b1 Dark mode\n\nback\n");
+    assert!(text(a.file("proj/backlog/b1.md")).ends_with("# Dark mode\n\nback\n"));
     assert_eq!(
         world.remote_log()[..5],
         [

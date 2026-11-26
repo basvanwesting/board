@@ -147,9 +147,13 @@ impl Board {
         }
     }
 
-    /// What `show` prints: a brief's file as it is, open or filed, or an
-    /// item's line as `ls` prints it and, when it has a body, a blank line
-    /// and the body as its file has it.
+    /// What `show` prints: a brief's file or a chore's or backlog item's
+    /// file, as stored, byte for byte.
+    ///
+    /// An item as its file, as a brief is (owner, 2026-11-26: "I would do
+    /// it like briefs do for chores and backlogs as well"), reversing the
+    /// line and body of the list files, where an item had no header. The
+    /// one-line form stays what a list shows (`ls`, the rows, `Y`).
     pub fn show(&self, id: ItemId) -> Result<Vec<u8>, Error> {
         let project = self.load()?;
         let refused = |why: String| Error::Refused(format!("show {id}: {why}"));
@@ -159,10 +163,10 @@ impl Board {
                 .map(|file| file.brief.to_bytes())
                 .map_err(|why| refused(ops::no_brief(number, why))),
             ItemId::Chore(chore) => {
-                shown(project.list(ListKind::Chores), chore.get()).map_err(refused)
+                item_file(project.list(ListKind::Chores), chore.get()).map_err(refused)
             }
             ItemId::Backlog(backlog) => {
-                shown(project.list(ListKind::Backlog), backlog.get()).map_err(refused)
+                item_file(project.list(ListKind::Backlog), backlog.get()).map_err(refused)
             }
         }
     }
@@ -556,12 +560,12 @@ fn entry(text: &Text, what: &str) -> Result<EntryText, Error> {
     EntryText::new(text.clone()).map_err(|why| Error::Refused(format!("{what}: {why}")))
 }
 
-/// The item with this id as `show` prints it ([`crate::item::Item::shown`]),
-/// else why the id names none.
-fn shown(items: &Items, number: u32) -> Result<Vec<u8>, String> {
+/// The file of the item with this id, as stored, else why the id names
+/// none.
+fn item_file(items: &Items, number: u32) -> Result<Vec<u8>, String> {
     items
         .get(number)
-        .map(|item| item.shown(items.kind(), number))
+        .map(crate::item::Item::to_bytes)
         .ok_or_else(|| ops::not_one(items.kind(), number, FindError::Missing))
 }
 
@@ -869,7 +873,7 @@ mod tests {
         }
     }
 
-    fn shown<'a>(rows: impl Iterator<Item = &'a BriefRow>) -> Vec<String> {
+    fn listed<'a>(rows: impl Iterator<Item = &'a BriefRow>) -> Vec<String> {
         rows.map(BriefRow::ls_line).collect()
     }
 
@@ -892,7 +896,7 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(
-            shown(snapshot.briefs(None)),
+            listed(snapshot.briefs(None)),
             [
                 "5 started started",
                 "9 started started",
@@ -906,18 +910,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Shown::Status(Status::Started)))),
+            listed(snapshot.briefs(Some(Shown::Status(Status::Started)))),
             ["5 started started", "9 started started"]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Shown::Status(Status::Filed)))),
+            listed(snapshot.briefs(Some(Shown::Status(Status::Filed)))),
             ["7 filed older", "10 filed old"]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Shown::Status(Status::Blocked)))).len(),
+            listed(snapshot.briefs(Some(Shown::Status(Status::Blocked)))).len(),
             1
         );
-        assert_eq!(shown(snapshot.briefs(Some(Shown::Unpushed))).len(), 0);
+        assert_eq!(listed(snapshot.briefs(Some(Shown::Unpushed))).len(), 0);
     }
 
     /// A filed brief with unpushed commits is among the open ones, after
@@ -938,7 +942,7 @@ mod tests {
             &[2, 12, 99].map(BriefId::new).into(),
         );
         assert_eq!(
-            shown(snapshot.briefs(None)),
+            listed(snapshot.briefs(None)),
             [
                 "5 started started",
                 "3 reported reported",
@@ -947,15 +951,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Shown::Unpushed))),
+            listed(snapshot.briefs(Some(Shown::Unpushed))),
             ["12 unpushed newer"]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Shown::Status(Status::Filed)))),
+            listed(snapshot.briefs(Some(Shown::Status(Status::Filed)))),
             ["10 filed old", "120 filed other"]
         );
         assert_eq!(
-            shown(snapshot.briefs(Some(Shown::Status(Status::Queued)))),
+            listed(snapshot.briefs(Some(Shown::Status(Status::Queued)))),
             ["2 queued queued"]
         );
     }

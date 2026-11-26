@@ -42,14 +42,12 @@ pub enum ListEntry {
     /// A chores' group, as its name.
     Group(Vec<u8>),
     /// An item: its id (its file's name), its line as `ls` prints it, and
-    /// the item as `show` prints it, which the preview shows and `yy`
-    /// yanks.
+    /// its file as stored, which `show` prints, the preview shows and `yy`
+    /// yanks, as for a brief.
     Item {
         id: u32,
         text: Vec<u8>,
-        shown: Vec<u8>,
-        /// Whether its file has a body.
-        body: bool,
+        file: Vec<u8>,
         /// What it still waits on: its row ends with `  after <id>`.
         waits: Option<ItemId>,
     },
@@ -130,8 +128,7 @@ fn list_lines(project: &Project, kind: ListKind) -> Vec<ListLine> {
                 Row::Item(listed) => ListEntry::Item {
                     id: listed.number,
                     text: listed.item.line(items.kind(), listed.number),
-                    shown: listed.item.shown(items.kind(), listed.number),
-                    body: !listed.item.body().is_empty(),
+                    file: listed.item.to_bytes(),
                     waits: item_waits(project, kind, listed.number),
                 },
             },
@@ -168,7 +165,8 @@ impl BriefItem {
 #[cfg(test)]
 impl ListLine {
     /// The rows as given, an item's id read off its first word (`c12`),
-    /// without a body: what a load gives of files that list so.
+    /// its file a stand-in of its line: what a load gives of files that
+    /// list so.
     pub fn numbered(kind: ListKind, rows: Vec<crate::board::ListRow>) -> Vec<ListLine> {
         use crate::board::ListRow;
         rows.into_iter()
@@ -178,12 +176,11 @@ impl ListLine {
                     ListRow::Item(text) => {
                         let word = text.split(|b| *b == b' ').next().unwrap_or(&text);
                         let id = kind.parse_id(word).expect("a test row starts with its id");
-                        let shown = [text.as_slice(), b"\n"].concat();
+                        let file = [text.as_slice(), b"\n"].concat();
                         ListEntry::Item {
                             id,
                             text,
-                            shown,
-                            body: false,
+                            file,
                             waits: None,
                         }
                     }
@@ -200,7 +197,7 @@ mod tests {
     use crate::item::Item;
 
     #[test]
-    fn a_kind_s_rows_are_ls_s_with_what_show_prints() {
+    fn a_kind_s_rows_are_ls_s_with_the_files_as_stored() {
         let mut project = Project::empty(ProjectName::parse("shop").unwrap());
         for (number, text) in [
             (1, "id: c1\ngroup: home\n\n# one\n\nmore of c1\n"),
@@ -220,21 +217,19 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, Snapshot::of(&project, &BTreeSet::new()).chores);
-        let shown: Vec<(u32, &[u8], bool)> = data
+        let files: Vec<(u32, &[u8])> = data
             .chores
             .iter()
             .filter_map(|line| match &line.entry {
-                ListEntry::Item {
-                    id, shown, body, ..
-                } => Some((*id, shown.as_slice(), *body)),
+                ListEntry::Item { id, file, .. } => Some((*id, file.as_slice())),
                 ListEntry::Group(_) => None,
             })
             .collect();
         assert_eq!(
-            shown,
+            files,
             [
-                (2, &b"c2 two. Check: z\n"[..], false),
-                (1, &b"c1 one\n\nmore of c1\n"[..], true),
+                (2, &b"id: c2\ngroup: away\ncheck: z\n\n# two\n"[..]),
+                (1, &b"id: c1\ngroup: home\n\n# one\n\nmore of c1\n"[..]),
             ]
         );
     }
