@@ -1242,6 +1242,18 @@ impl State {
         self.preview.scroll = self.preview.scroll.min(max);
     }
 
+    /// How many items a tab lists, headings left out: as drawn, and of
+    /// all when the panel's filter hides some; `None` for the second when
+    /// no filter is set (an empty filter text is none).
+    pub fn count(&self, source: Source) -> (usize, Option<usize>) {
+        let items = |rows: Vec<Row>| rows.iter().filter(|row| row.key.is_some()).count();
+        let shown = items(self.rows(source));
+        let filtered = self.filters[source.panel() as usize]
+            .as_deref()
+            .is_some_and(|filter| !filter.is_empty());
+        (shown, filtered.then(|| items(all_rows(&self.data, source))))
+    }
+
     /// The rows of a list as drawn: all of them, less what the panel's
     /// filter hides. A heading stays while an item under it does.
     pub fn rows(&self, source: Source) -> Vec<Row> {

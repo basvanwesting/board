@@ -102,38 +102,51 @@ fn key_span(key: &str, focused: bool) -> Span<'static> {
     Span::styled(format!("─[{key}]─"), border(focused))
 }
 
-/// A panel's title as LazyGit draws it: `─[1]─Briefs - Parked - Filed`, the jump key
-/// in brackets, then the tabs; the panel's name is its first tab. The tab
-/// shown is bold, and green with the border when the panel has the focus.
+/// A panel's title as LazyGit draws it: `─[1]─Briefs (3) - Parked (2) -
+/// Filed`, the jump key in brackets, then the tabs, each with the number of
+/// items it lists (`(3/10)` under a filter: matches of all); the panel's
+/// name is its first tab. The tab shown is bold, and green with the border
+/// when the panel has the focus, its count with it.
+///
+/// Filed has no count (owner, 2026-11-26: "Maybe skip Filed as it isn't
+/// really actionable"). Matches of all rather than the matches alone: a
+/// bare `(3)` would read as three left.
 fn panel_title(state: &State, panel: Panel, focused: bool) -> Line<'static> {
-    let (key, tabs): (&str, &[(&'static str, Option<Tab>)]) = match panel {
+    // A tab, the tab it is when the panel has tabs, and what it counts.
+    type Tabs = [(&'static str, Option<Tab>, Option<Source>)];
+    let (key, tabs): (&str, &Tabs) = match panel {
         Panel::Briefs => (
             "1",
             &[
-                ("Briefs", Some(Tab::Open)),
-                ("Parked", Some(Tab::Parked)),
-                ("Filed", Some(Tab::Filed)),
+                ("Briefs", Some(Tab::Open), Some(Source::Open)),
+                ("Parked", Some(Tab::Parked), Some(Source::Parked)),
+                ("Filed", Some(Tab::Filed), None),
             ],
         ),
-        Panel::Chores => ("2", &[("Chores", None)]),
-        Panel::Backlog => ("3", &[("Backlog", None)]),
+        Panel::Chores => ("2", &[("Chores", None, Some(Source::Chores))]),
+        Panel::Backlog => ("3", &[("Backlog", None, Some(Source::Backlog))]),
     };
     // The block draws its title in the border's style; plain is said
     // outright, or a focused panel's whole title would be green.
     let plain = Style::new().fg(Color::Reset);
     let mut title = vec![key_span(key, focused)];
-    for (at, (name, tab)) in tabs.iter().enumerate() {
+    for (at, (name, tab, counted)) in tabs.iter().enumerate() {
         if at > 0 {
             title.push(Span::styled(" - ", plain));
         }
+        let text = match counted.map(|source| state.count(source)) {
+            Some((shown, Some(all))) => format!("{name} ({shown}/{all})"),
+            Some((shown, None)) => format!("{name} ({shown})"),
+            None => (*name).to_owned(),
+        };
         let shown = tab.is_none_or(|tab| state.tab() == tab);
         title.push(if shown {
             Span::styled(
-                *name,
+                text,
                 plain.patch(border(focused)).add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::styled(*name, plain)
+            Span::styled(text, plain)
         });
     }
     if let Some(filter) = state.filter(panel) {
@@ -527,15 +540,15 @@ mod tests {
         assert_eq!(
             screen(&state(100, 12)),
             [
-                "╭─[1]─Briefs - Parked - Filed───────────────╮╭─[0]─128 some-slug───────────────────────────────────╮",
+                "╭─[1]─Briefs (2) - Parked (0) - Filed───────╮╭─[0]─128 some-slug───────────────────────────────────╮",
                 "│▶128 started   some-slug                42m││id: 128                                              │",
                 "│ 127 reported  other-slug                  ││status: started                                      │",
                 "│                                           ││                                                     │",
                 "╰───────────────────────────────────────────╯│# Title                                              │",
-                "╭─[2]─Chores────────────────────────────────╮│## Task                                              │",
+                "╭─[2]─Chores (1)────────────────────────────╮│## Task                                              │",
                 "│▶c12 Rotate the key. Check: the old one fai││The task.                                            │",
                 "╰───────────────────────────────────────────╯│## Report                                            │",
-                "╭─[3]─Backlog───────────────────────────────╮│                                                     │",
+                "╭─[3]─Backlog (1)───────────────────────────╮│                                                     │",
                 "│▶b41 Cache the prices  (from 126)          ││                                                     │",
                 "╰───────────────────────────────────────────╯╰─────────────────────────────────────────────────────╯",
                 " shop · fetched 1m ago · 2 unsynced · 128 started 42m              e edit  y yank  / filter  ? help",
@@ -569,7 +582,7 @@ mod tests {
     fn the_filed_tab_shows_the_filed_briefs() {
         let lines = screen(&press(state(100, 12), "]]"));
         assert!(
-            lines[0].starts_with("╭─[1]─Briefs - Parked - Filed──"),
+            lines[0].starts_with("╭─[1]─Briefs (2) - Parked (0) - Filed──"),
             "{}",
             lines[0]
         );
@@ -589,7 +602,7 @@ mod tests {
             .position(|line| line.contains("[3]─Backlog"))
             .unwrap();
         assert!(
-            lines[backlog].starts_with("╭─[3]─Backlog  /zz▏──"),
+            lines[backlog].starts_with("╭─[3]─Backlog (0/1)  /zz▏──"),
             "{}",
             lines[backlog]
         );
@@ -891,7 +904,7 @@ mod tests {
         let (state, _) = State::new(data, 100, 20, Stamp::from_unix(NOW).unwrap());
         let lines = screen(&state);
         assert!(
-            lines[0].starts_with("╭─[1]─Briefs - Parked - Filed"),
+            lines[0].starts_with("╭─[1]─Briefs (1) - Parked (1) - Filed"),
             "{}",
             lines[0]
         );
@@ -927,6 +940,135 @@ mod tests {
         }
         let (_, commands) = step(press(state, "]"), 'F');
         assert_eq!(commands, Vec::<Command>::new());
+    }
+
+    /// The board of the count tests: briefs 1 and 2 open, 3 filed and
+    /// unpushed (so in the Briefs tab), 4 to 6 filed, 7 and 8 parked, three
+    /// of them `red`; five chores in two groups; ten backlog items in three
+    /// groups, three of them about an apple. `chores` leaves the last ones
+    /// out.
+    fn counted(chores: usize) -> Data {
+        let briefs: Vec<(String, &str)> = vec![
+            (
+                "briefs/1-red-one.md".into(),
+                "status: queued\nqueued: 2026-11-26T10:00:00Z\n",
+            ),
+            ("briefs/2-red-two.md".into(), "status: draft\n"),
+            ("briefs/done/3-blue.md".into(), "status: filed\n"),
+            ("briefs/done/4-four.md".into(), "status: filed\n"),
+            ("briefs/done/5-five.md".into(), "status: filed\n"),
+            ("briefs/done/6-six.md".into(), "status: filed\n"),
+            ("briefs/parked/7-red-wait.md".into(), "status: parked\n"),
+            ("briefs/parked/8-blue-wait.md".into(), "status: parked\n"),
+        ];
+        let briefs: Vec<(&str, &str)> = briefs.iter().map(|(p, t)| (p.as_str(), *t)).collect();
+        let chores: Vec<(u32, String)> = (1..=5)
+            .take(chores)
+            .map(|n| (n, format!("id: c{n}\ngroup: g{}\n\n# chore {n}\n", n % 2)))
+            .collect();
+        let backlog: Vec<(u32, String)> = (1..=10)
+            .map(|n| {
+                let title = if n <= 3 {
+                    format!("apple {n}")
+                } else {
+                    format!("item {n}")
+                };
+                (n, format!("id: b{n}\ngroup: g{}\n\n# {title}\n", n % 3))
+            })
+            .collect();
+        let chores: Vec<(u32, &str)> = chores.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        let backlog: Vec<(u32, &str)> = backlog.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        let mut data = from_files(&briefs, &chores, &backlog);
+        data.label(&BTreeSet::from([BriefId::new(3)]));
+        data
+    }
+
+    /// The titles of the three panels, as drawn: what follows `─[n]─` up
+    /// to the border's run of `─`.
+    fn titles(state: &State) -> [String; 3] {
+        let lines = screen(state);
+        ['1', '2', '3'].map(|key| {
+            let mark = format!("╭─[{key}]─");
+            let line = lines.iter().find(|line| line.contains(&mark)).unwrap();
+            let after = &line[line.find(&mark).unwrap() + mark.len()..];
+            let title = after.split("──").next().unwrap().trim_end_matches('╮');
+            // Without the filter text that follows.
+            title.split("  /").next().unwrap().to_owned()
+        })
+    }
+
+    #[test]
+    fn a_panel_title_counts_the_items_of_each_tab_but_filed() {
+        let (state, _) = State::new(counted(5), 120, 40, Stamp::from_unix(NOW).unwrap());
+        assert_eq!(
+            titles(&state),
+            [
+                "Briefs (3) - Parked (2) - Filed",
+                "Chores (5)",
+                "Backlog (10)"
+            ]
+        );
+        // A reload that takes a chore away.
+        let (state, _) = state.step(Event::Loaded(Box::new(counted(4))));
+        assert_eq!(titles(&state)[1], "Chores (4)");
+        let empty = Data::empty(ProjectName::parse("shop").unwrap());
+        let (state, _) = State::new(empty, 120, 40, Stamp::from_unix(NOW).unwrap());
+        assert_eq!(
+            titles(&state),
+            [
+                "Briefs (0) - Parked (0) - Filed",
+                "Chores (0)",
+                "Backlog (0)"
+            ]
+        );
+    }
+
+    /// Under a filter: matches of all, for each counted tab of the panel,
+    /// shown or not; an empty filter text is no filter.
+    #[test]
+    fn a_filter_counts_its_matches_of_all() {
+        let (state, _) = State::new(counted(5), 200, 40, Stamp::from_unix(NOW).unwrap());
+        let typed = |keys: &str| {
+            keys.chars().fold(state.clone(), |state, key| {
+                state.step(Event::Key(Key::Char(key))).0
+            })
+        };
+        let enter = |state: State| state.step(Event::Key(Key::Enter)).0;
+        let esc = |state: State| state.step(Event::Key(Key::Esc)).0;
+        let filtered = enter(typed("3/apple"));
+        assert_eq!(
+            titles(&filtered),
+            [
+                "Briefs (3) - Parked (2) - Filed",
+                "Chores (5)",
+                "Backlog (3/10)"
+            ]
+        );
+        // Briefs: `red` matches two of the three open and one of the two
+        // parked, on the Briefs tab and on the Parked tab alike.
+        let briefs = enter(typed("1/red"));
+        assert_eq!(titles(&briefs)[0], "Briefs (2/3) - Parked (1/2) - Filed");
+        let on_parked = briefs.clone().step(Event::Key(Key::Char(']'))).0;
+        assert_eq!(titles(&on_parked)[0], "Briefs (2/3) - Parked (1/2) - Filed");
+        assert_eq!(titles(&esc(briefs))[0], "Briefs (3) - Parked (2) - Filed");
+        // `/` alone, and a filter backspaced to empty: no filter.
+        assert_eq!(titles(&typed("3/"))[2], "Backlog (10)");
+        let emptied = typed("3/a").step(Event::Key(Key::Backspace)).0;
+        assert_eq!(titles(&emptied)[2], "Backlog (10)");
+    }
+
+    #[test]
+    fn a_count_has_the_style_of_its_tab() {
+        let (state, _) = State::new(counted(5), 120, 40, Stamp::from_unix(NOW).unwrap());
+        let parked = cells(&press(state, "]"));
+        assert_eq!(
+            styles(&parked, "Parked (2)"),
+            all("Parked (2)", (Color::Green, true))
+        );
+        assert_eq!(
+            styles(&parked, "Briefs (3)"),
+            all("Briefs (3)", (Color::Reset, false))
+        );
     }
 
     /// The state drawn, to read the cells' styles.
@@ -972,12 +1114,20 @@ mod tests {
     fn a_panel_title_names_its_key_in_brackets_then_its_tabs() {
         let lines = screen(&state(100, 12));
         assert!(
-            lines[0].starts_with("╭─[1]─Briefs - Parked - Filed─────"),
+            lines[0].starts_with("╭─[1]─Briefs (2) - Parked (0) - Filed─────"),
             "{}",
             lines[0]
         );
-        assert!(lines[5].starts_with("╭─[2]─Chores─────"), "{}", lines[5]);
-        assert!(lines[8].starts_with("╭─[3]─Backlog─────"), "{}", lines[8]);
+        assert!(
+            lines[5].starts_with("╭─[2]─Chores (1)─────"),
+            "{}",
+            lines[5]
+        );
+        assert!(
+            lines[8].starts_with("╭─[3]─Backlog (1)─────"),
+            "{}",
+            lines[8]
+        );
         // Briefs has the focus: its key and its tab shown are green, the
         // other tab plain; the other panels' names are bold, not green.
         let focused = cells(&state(100, 12));
@@ -986,9 +1136,9 @@ mod tests {
             all("─[1]─", (Color::Green, false))
         );
         assert_eq!(
-            styles(&focused, "Briefs - "),
+            styles(&focused, "Briefs (2) - "),
             [
-                vec![(Color::Green, true); 6],
+                vec![(Color::Green, true); 10],
                 all(" - ", (Color::Reset, false)),
             ]
             .concat()
@@ -1002,24 +1152,24 @@ mod tests {
             all("─[2]─", (Color::Reset, false))
         );
         assert_eq!(
-            styles(&focused, "Chores"),
-            all("Chores", (Color::Reset, true))
+            styles(&focused, "Chores (1)"),
+            all("Chores (1)", (Color::Reset, true))
         );
         // The Filed tab shown, and Chores focused.
         let filed = cells(&press(state(100, 12), "]]2"));
         assert_eq!(
-            styles(&filed, "Briefs - Parked - Filed"),
+            styles(&filed, "Briefs (2) - Parked (0) - Filed"),
             [
-                all("Briefs - Parked - ", (Color::Reset, false)),
+                all("Briefs (2) - Parked (0) - ", (Color::Reset, false)),
                 all("Filed", (Color::Reset, true)),
             ]
             .concat()
         );
         assert_eq!(
-            styles(&filed, "─[2]─Chores"),
+            styles(&filed, "─[2]─Chores (1)"),
             [
                 all("─[2]─", (Color::Green, false)),
-                all("Chores", (Color::Green, true)),
+                all("Chores (1)", (Color::Green, true)),
             ]
             .concat()
         );

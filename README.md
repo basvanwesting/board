@@ -95,7 +95,7 @@ $ board done c1
 done c1
 ```
 
-The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones and the unpushed, Parked and Filed), Chores and Backlog by group, each titled with its jump key (`[1]`); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
+The user runs `board` without a command for the TUI (piped, it prints the board as `board ls` does). On the left three panels: Briefs (tabs Briefs, the open ones and the unpushed, Parked and Filed), Chores and Backlog by group, each titled with its jump key (`[1]`) and how many items each tab holds (`Chores (5)`, `Backlog (3/10)` under a filter; Filed has no count); on the right a preview of the item under the cursor, `[0]`; at the bottom the project, the sync state and the brief in flight. The keys to start with:
 
 - `j`/`k` move, `1` `2` `3` or Tab focus a panel, `0` or Enter scrolls the preview, `/` filters the panel.
 - A click focuses a pane and selects the row clicked; the wheel moves as `j`/`k`. The TUI captures the mouse for that, so selecting text with the mouse takes the terminal's bypass (Shift-drag in most); `y`, `Y` and `yy` copy.
