@@ -861,50 +861,6 @@ fn a_refused_push_is_retried_on_fresh_state() {
     in_step(&world, &a);
 }
 
-/// Eight refused pushes count as offline: an id is refused, since only a
-/// push may publish it, and any other write is committed on the clone and
-/// pushed by the next write that gets through.
-#[test]
-fn eight_refused_pushes_refuse_an_id_and_keep_other_writes_on_the_clone() {
-    let world = World::new();
-    let a = world.a();
-    a.board(&["add", "chore", "x", "--group", "g", "--check", "x"])
-        .ok();
-    let before = world.remote_main();
-    world.reject_pushes(17);
-    let retries: String = (2..=8).map(|n| format!("board: retry {n}/8\n")).collect();
-    let refused = " -> main (pre-receive hook declined))\n";
-
-    let said = a.board(&["add", "backlog", "x"]).failed(3);
-    assert!(
-        said.starts_with(&format!(
-            "{retries}board: add backlog: not pushed after 8 attempts (! [remote rejected] "
-        )),
-        "{said}"
-    );
-    assert!(said.ends_with(refused), "{said}");
-    assert_eq!(a.status(), "");
-    assert_eq!(a.main(), before);
-
-    let ran = a.board(&["done", "c1"]);
-    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"done c1\n"[..]));
-    assert!(
-        ran.stderr.starts_with(&format!(
-            "{retries}board: not pushed: 1 commit (! [remote rejected] "
-        )),
-        "{ran:?}"
-    );
-    assert!(ran.stderr.ends_with(refused), "{ran:?}");
-    assert_eq!(world.remote_main(), before);
-    assert_eq!(a.file("proj/chores/c1.md"), None);
-
-    world.reject_pushes(0);
-    assert_eq!(a.board(&["add", "backlog", "y"]).ok(), "b1\n");
-    assert_eq!(listed(&world, "chores"), Vec::<String>::new());
-    assert_eq!(world.remote_log()[..2], ["proj: add b1", "proj: done c1"]);
-    in_step(&world, &a);
-}
-
 /// B writes while A's push is on its way: A's push is refused, and A runs
 /// its command again on what B pushed.
 #[test]
@@ -955,7 +911,7 @@ fn a_push_that_landed_unheard_is_not_applied_twice() {
     let ran = a.board(&["done", "c1"]);
     assert_eq!(
         (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
-        (0, &b"done c1\n"[..], "board: retry 2/8\n")
+        (0, &b"done c1\n"[..], "board: retry 2/2\n")
     );
     assert_eq!(
         world.remote_log()[..3],
@@ -979,6 +935,29 @@ fn a_push_that_landed_late_is_not_applied_again() {
     );
     assert_eq!(listed(&world, "backlog"), ["b1 once"]);
     assert_eq!(world.remote_log(), ["proj: add b1", "start"]);
+    in_step(&world, &a);
+}
+
+/// A local-first write's first push lands late, while its second is
+/// refused: the fetch after the last round finds it, so the command is
+/// not applied again and the write is in step, not left on the clone.
+#[test]
+fn a_local_first_push_that_landed_late_is_not_applied_again() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "chore", "x", "--group", "g", "--check", "x"])
+        .ok();
+    a.hook("pre-push", &pre_push::late_landing(world.dir()));
+    let ran = a.board(&["retitle", "c1", "once more"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (0, &b"retitled c1\n"[..], "board: retry 2/2\n")
+    );
+    assert_eq!(
+        world.remote_log(),
+        ["proj: retitle c1", "proj: add c1", "start"]
+    );
+    assert_eq!(on_remote(&world, "proj/chores/c1.md", "# once more"), 1);
     in_step(&world, &a);
 }
 

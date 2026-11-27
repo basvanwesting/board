@@ -653,7 +653,7 @@ fn a_report_made_while_an_amendment_lands_keeps_the_amendment() {
     );
     let ran = a.board_with_input(&["report", "1"], b"All done.\n");
     assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"reported 1\n"[..]));
-    assert!(ran.stderr.contains("board: retry 2/8"), "{ran:?}");
+    assert!(ran.stderr.ends_with("board: retry 2/2\n"), "{ran:?}");
     let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
     assert_eq!(window("window.code"), "0\n");
     assert_eq!(window("window.out"), "amended 1\n");
@@ -862,7 +862,7 @@ fn an_item_dropped_while_file_pushes_is_skipped() {
     );
     let ran = a.board(&["file", "1"]);
     assert_eq!(ran.code, 0, "{ran:?}");
-    assert!(ran.stderr.contains("board: retry 2/8"), "{ran:?}");
+    assert!(ran.stderr.ends_with("board: retry 2/2\n"), "{ran:?}");
     assert_eq!(ran.stdout, b"filed 1 (1 commit) closed b2\n");
     let window = |name: &str| fs::read_to_string(world.dir().join(name)).unwrap();
     assert_eq!(window("window.code"), "0\n");
@@ -895,4 +895,112 @@ fn a_file_that_landed_unheard_is_not_made_twice() {
         1
     );
     in_step(&world, &a);
+}
+
+// ---- local first and refereed ----
+
+/// A local-first write (every command but `add`, `new brief` and `next`)
+/// tries two pushes: when both are refused it succeeds on the clone, and
+/// the next write that gets through carries its commit.
+#[test]
+fn a_local_first_write_tries_twice_and_keeps_its_commit_on_the_clone() {
+    let world = World::new();
+    let a = world.a();
+    a.board(&["add", "chore", "x", "--group", "g", "--check", "x"])
+        .ok();
+    queued(&a, 1, "s");
+    a.board(&["next"]).ok();
+    let before = world.remote_main();
+    world.reject_pushes(100);
+    let yet = "board: retry 2/2\nboard: not pushed yet: 1 commit, \
+               they go out with the next write (! [remote rejected] ";
+    let refused = " -> main (pre-receive hook declined))\n";
+
+    let ran = a.board(&["retitle", "c1", "y"]);
+    assert_eq!(world.rejects_left(), 98, "two pushes, by the hook's count");
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice()),
+        (0, &b"retitled c1\n"[..])
+    );
+    assert!(ran.stderr.starts_with(yet), "{ran:?}");
+    assert!(ran.stderr.ends_with(refused), "{ran:?}");
+    assert_eq!(ran.stderr.matches("retry").count(), 1, "{ran:?}");
+
+    let ran = a.board_with_input(&["report", "1"], b"Done.\n");
+    assert_eq!(world.rejects_left(), 96);
+    assert_eq!((ran.code, ran.stdout.as_slice()), (0, &b"reported 1\n"[..]));
+    assert!(
+        ran.stderr
+            .starts_with(&yet.replace("1 commit", "2 commits")),
+        "{ran:?}"
+    );
+    assert_eq!(world.remote_main(), before);
+    assert!(text(a.file("proj/chores/c1.md")).contains("# y"));
+    assert!(text(a.file("proj/briefs/1-s.md")).contains("status: reported"));
+
+    world.reject_pushes(0);
+    assert_eq!(a.board(&["done", "c1"]).ok(), "done c1\n");
+    assert_eq!(
+        world.remote_log()[..3],
+        ["proj: done c1", "proj: reported 1", "proj: retitle c1"]
+    );
+    in_step(&world, &a);
+}
+
+/// The four refereed commands and `sync` keep the eight rounds: an id or a
+/// claim is refused when no push gets through, and nothing of theirs stays
+/// on the clone.
+#[test]
+fn eight_refused_pushes_refuse_an_id_or_a_claim() {
+    let world = World::new();
+    let a = world.a();
+    queued(&a, 1, "s");
+    let before = (world.remote_main(), a.main());
+    world.reject_pushes(1000);
+    let retries: String = (2..=8).map(|n| format!("board: retry {n}/8\n")).collect();
+    let refused = " -> main (pre-receive hook declined))\n";
+    let mut left = 1000;
+    for (args, what) in [
+        (&["add", "backlog", "x"][..], "add backlog"),
+        (&["add", "chore", "x", "--group", "g"][..], "add chore"),
+        (&["new", "brief", "t"][..], "new brief"),
+        (&["next"][..], "next"),
+    ] {
+        let ran = a.board(args);
+        left -= 8;
+        assert_eq!(world.rejects_left(), left, "{what}: eight pushes");
+        assert_eq!((ran.code, ran.stdout.as_slice()), (3, &b""[..]), "{ran:?}");
+        assert!(
+            ran.stderr.starts_with(&format!(
+                "{retries}board: {what}: not pushed after 8 attempts (! [remote rejected] "
+            )),
+            "{ran:?}"
+        );
+        assert!(ran.stderr.ends_with(refused), "{ran:?}");
+        assert_eq!((world.remote_main(), a.main()), before, "{what}");
+        assert_eq!(a.status(), "");
+    }
+    assert!(text(a.file("proj/briefs/1-s.md")).contains("status: queued"));
+
+    // A sync of a hand edit committed on the clone: eight rounds, and
+    // today's refusal.
+    a.write(
+        "proj/backlog/b9.md",
+        "id: b9\ngroup: g\ncreated: x\n\n# hand\n",
+    );
+    let ran = a.board(&["sync"]);
+    left -= 8;
+    assert_eq!(world.rejects_left(), left);
+    assert_eq!(ran.code, 3, "{ran:?}");
+    assert!(
+        ran.stderr.starts_with(&format!(
+            "{retries}board: not pushed: 1 commit (! [remote rejected] "
+        )),
+        "{ran:?}"
+    );
+    assert!(
+        ran.stderr
+            .contains("board: sync: not pushed after 8 attempts"),
+        "{ran:?}"
+    );
 }

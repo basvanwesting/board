@@ -102,7 +102,7 @@ impl Board {
             &self.project,
             "migrate",
             &*self.notes,
-            Some(&|tx| {
+            sync::Run::Command(sync::Kind::LocalFirst, &|tx| {
                 let migrated = migrate::migrate(&mut tx.project, now).map_err(|unplaced| {
                     let lines: Vec<String> =
                         unplaced.iter().map(|line| format!("\n  {line}")).collect();
@@ -181,7 +181,7 @@ impl Board {
     /// Adds a chore under its group; gives its new id.
     pub fn add_chore(&self, new: &NewChore) -> Result<ChoreId, Error> {
         let now = now()?;
-        self.command("add chore", &|tx| {
+        self.refereed("add chore", &|tx| {
             if let Some(target) = new.after {
                 tx.require_given("add chore", target)?;
             }
@@ -195,7 +195,7 @@ impl Board {
     /// none); gives its new id.
     pub fn add_backlog(&self, new: &NewBacklog) -> Result<BacklogId, Error> {
         let now = now()?;
-        self.command("add backlog", &|tx| {
+        self.refereed("add backlog", &|tx| {
             if let Some(target) = new.after {
                 tx.require_given("add backlog", target)?;
             }
@@ -218,7 +218,7 @@ impl Board {
         text: Option<&Line>,
         check: Option<&CheckChange>,
     ) -> Result<String, Error> {
-        self.command("retitle", &|tx| {
+        self.local_first("retitle", &|tx| {
             let retitled = ops::retitle(&mut tx.project, id, text, check)?;
             Ok((retitled, format!("retitle {id}")))
         })
@@ -227,7 +227,7 @@ impl Board {
     /// Appends to a chore's or backlog item's body, or replaces it; gives
     /// what it did, as `amended c12`.
     pub fn amend_item(&self, id: ListId, body: &Body, replace: bool) -> Result<String, Error> {
-        self.command("amend", &|tx| {
+        self.local_first("amend", &|tx| {
             let amended = ops::amend_item(&mut tx.project, id, body, replace)?;
             Ok((amended.clone(), amended))
         })
@@ -236,7 +236,7 @@ impl Board {
     /// Deletes chores' files, all or none; gives what it did, as `done c12
     /// c13`.
     pub fn done(&self, ids: &[ChoreId]) -> Result<String, Error> {
-        self.command("done", &|tx| {
+        self.local_first("done", &|tx| {
             let done = ops::done(&mut tx.project, ids)?;
             Ok((done.clone(), done))
         })
@@ -245,7 +245,7 @@ impl Board {
     /// Deletes backlog items' files, all or none; gives what it did, as
     /// `dropped b41`.
     pub fn drop_items(&self, ids: &[BacklogId]) -> Result<String, Error> {
-        self.command("drop", &|tx| {
+        self.local_first("drop", &|tx| {
             let dropped = ops::drop_items(&mut tx.project, ids)?;
             Ok((dropped.clone(), dropped))
         })
@@ -255,7 +255,7 @@ impl Board {
     /// what it did, as `grouped c12 b4 under Home`. Allocates nothing, so
     /// it works offline like `done`.
     pub fn group(&self, ids: &[ListId], to: &Line) -> Result<String, Error> {
-        self.command("group", &|tx| {
+        self.local_first("group", &|tx| {
             let grouped = ops::group(&mut tx.project, ids, to)?;
             Ok((grouped.clone(), grouped))
         })
@@ -266,7 +266,7 @@ impl Board {
     pub fn new_brief(&self, slug: &Slug) -> Result<PathBuf, Error> {
         let base = self.project_head()?;
         let now = now()?;
-        let path = self.command("new brief", &|tx| {
+        let path = self.refereed("new brief", &|tx| {
             let number = tx.alloc_brief()?;
             let path = ops::new_brief(&mut tx.project, number, slug, &base, now);
             Ok((path, format!("new brief {number}-{slug}")))
@@ -279,7 +279,7 @@ impl Board {
     /// first; gives what it did, as `queued 128`.
     pub fn queue(&self, id: BriefId, asked: Queueing<'_>) -> Result<String, Error> {
         let now = now()?;
-        self.command("queue", &|tx| {
+        self.local_first("queue", &|tx| {
             if let Some(target) = asked.after {
                 tx.require_given(&format!("queue {id}"), target)?;
             }
@@ -296,7 +296,7 @@ impl Board {
         after: Option<ItemId>,
     ) -> Result<String, Error> {
         let now = now()?;
-        self.command("park", &|tx| {
+        self.local_first("park", &|tx| {
             if let Some(target) = after {
                 tx.require_given(&format!("park {id}"), target)?;
             }
@@ -309,7 +309,7 @@ impl Board {
     /// `queued 31, 32`, or `nothing parked` with no commit.
     pub fn queue_parked(&self) -> Result<String, Error> {
         let now = now()?;
-        self.command("queue --parked", &|tx| {
+        self.local_first("queue --parked", &|tx| {
             let queued = ops::queue_parked(&mut tx.project, now)?;
             Ok((queued.clone(), queued))
         })
@@ -319,7 +319,7 @@ impl Board {
     /// it did, as `c3 after c9`. Allocates nothing, so it works offline
     /// like `done`.
     pub fn after(&self, id: ItemId, target: Option<ItemId>) -> Result<String, Error> {
-        self.command("after", &|tx| {
+        self.local_first("after", &|tx| {
             if let Some(target) = target {
                 tx.require_given(&format!("after {id}"), target)?;
             }
@@ -334,7 +334,7 @@ impl Board {
     /// claiming one brief offline would each hand it to a worker.
     pub fn next(&self) -> Result<Next, Error> {
         let now = now()?;
-        let claim = self.command("next", &|tx| {
+        let claim = self.refereed("next", &|tx| {
             tx.require_remote()?;
             let claim = ops::next(&mut tx.project, now)?;
             let subject = match &claim {
@@ -355,7 +355,7 @@ impl Board {
     pub fn block(&self, id: BriefId, question: &Text) -> Result<(), Error> {
         let question = entry(question, &format!("block {id}"))?;
         let now = now()?;
-        self.command("block", &|tx| {
+        self.local_first("block", &|tx| {
             let blocked = ops::block(&mut tx.project, id, &question, now)?;
             Ok(((), blocked))
         })
@@ -366,7 +366,7 @@ impl Board {
     pub fn amend(&self, id: BriefId, text: &Text) -> Result<String, Error> {
         let text = entry(text, &format!("amend {id}"))?;
         let now = now()?;
-        self.command("amend", &|tx| {
+        self.local_first("amend", &|tx| {
             let amended = ops::amend(&mut tx.project, id, &text, now)?;
             Ok((amended, format!("amended {id}")))
         })
@@ -375,7 +375,7 @@ impl Board {
     /// Makes the text the started brief's `## Report` and reports it.
     pub fn report(&self, id: BriefId, text: &Text) -> Result<(), Error> {
         let now = now()?;
-        self.command("report", &|tx| {
+        self.local_first("report", &|tx| {
             let reported = ops::report(&mut tx.project, id, text, now)?;
             Ok(((), reported))
         })
@@ -394,7 +394,7 @@ impl Board {
             CommitCheck::NotBuilt => Commits::NotBuilt,
         };
         let now = now()?;
-        self.command("file", &|tx| {
+        self.local_first("file", &|tx| {
             let filed = ops::file(&mut tx.project, id, &commits, now)?;
             Ok((filed, format!("filed {id}")))
         })
@@ -471,14 +471,41 @@ impl Board {
     /// is said at once.
     pub fn sync(&self) -> Result<(), Error> {
         self.load()?;
-        sync::write::<()>(&self.root, &self.project, "sync", &*self.notes, None)?;
+        sync::write::<()>(
+            &self.root,
+            &self.project,
+            "sync",
+            &*self.notes,
+            sync::Run::Sync,
+        )?;
         self.load().map(drop)
+    }
+
+    /// A command whose result the remote decides: it hands out an id or
+    /// claims something shared, so it is refused when it is not pushed
+    /// (`sync::Kind::Refereed`). The explicit exception (owner, 2026-11-27:
+    /// "local first as default and refereed as explicit exceptions on add,
+    /// new, next").
+    fn refereed<T>(&self, what: &str, apply: sync::Apply<'_, T>) -> Result<T, Error> {
+        self.command(what, sync::Kind::Refereed, apply)
+    }
+
+    /// Every other command: it succeeds on the clone when its push fails
+    /// twice, and its commit goes out with the next write
+    /// (`sync::Kind::LocalFirst`).
+    fn local_first<T>(&self, what: &str, apply: sync::Apply<'_, T>) -> Result<T, Error> {
+        self.command(what, sync::Kind::LocalFirst, apply)
     }
 
     /// A write that runs a command; `what` names it in an error. Refused for
     /// a project with a list file of the older storage, in the files and in
     /// the commit it applies to: one can come in with the merge.
-    fn command<T>(&self, what: &str, apply: sync::Apply<'_, T>) -> Result<T, Error> {
+    fn command<T>(
+        &self,
+        what: &str,
+        kind: sync::Kind,
+        apply: sync::Apply<'_, T>,
+    ) -> Result<T, Error> {
         self.load()?;
         let guarded = |tx: &mut sync::Tx| {
             tx.project.refuse_old_lists()?;
@@ -489,7 +516,7 @@ impl Board {
             &self.project,
             what,
             &*self.notes,
-            Some(&guarded),
+            sync::Run::Command(kind, &guarded),
         )?;
         Ok(value.expect("a write that runs a command gives its value"))
     }

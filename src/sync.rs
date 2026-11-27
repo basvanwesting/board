@@ -6,15 +6,17 @@
 //! check    a clone on main with origin and a commit, not shallow;
 //!          git's stale .git/index.lock and .git/board.index.lock removed
 //! absorb   board files changed by hand -> one commit on main, `board: hand edits`
-//! round    at most 8:
+//! round    at most 8 (refereed, sync) or 2 (local first, the second at once):
 //!            fetch; M = main, U = origin/main
 //!            any failed T found in U -> the command landed; it is not run again
 //!            X = integrate(M, U): U, M, or a merge commit of the two
 //!            T = the command's commit on X (built in the object store), else X
 //!            T == U -> done;  push T -> done, or the next round,
 //!            after a random wait when the push lost a race
-//! offline  no fetch, or eight failed pushes: X = integrate(M, U) and the
-//!          command once more, on main only; allocating an id is refused
+//! offline  no fetch, or the last round's push failed and the one more fetch
+//!          finds none landed: X = integrate(M, U) and the command once
+//!          more, on main only; allocating an id is refused (in a local-first
+//!          write always)
 //! advance  main fast-forwards to T; a file saved meanwhile is absorbed and
 //!          merged in, at most 3 times
 //! notes    commits not pushed, lint
@@ -50,14 +52,45 @@ use crate::merge::{LocalCopy, merge_trees};
 use crate::project::{BoardPath, Project, ProjectName, copy_paths, is_old_list};
 use crate::raw;
 
-/// Pushes per write. An agent's command has to end rather than retry
-/// without limit, and an id not yet published may not be printed; eight
-/// failed pushes are given up on even with a working fetch. Eight, where
-/// there were four (owner, 2026-11-25): with the waits of [`backoff`] the
-/// rounds are independent tries against a writer that keeps pushing, and
-/// enough of them get one through; the waits add at most 11.75 s to the
-/// rounds' own fetches and pushes.
+/// Pushes per refereed write and per sync. An agent's command has to end
+/// rather than retry without limit, and an id not yet published may not be
+/// printed; eight failed pushes are given up on even with a working fetch.
+/// Eight, where there were four (owner, 2026-11-25): with the waits of
+/// [`backoff`] the rounds are independent tries against a writer that keeps
+/// pushing, and enough of them get one through; the waits add at most
+/// 11.75 s to the rounds' own fetches and pushes.
 const ROUNDS: u8 = 8;
+
+/// Pushes per local-first write: the first, and one retry at once after it
+/// fails (owner, 2026-11-27: "local first when the sync is low risk later
+/// anyway and can be delayed"). With one file per item a commit left on
+/// the clone merges cleanly later, so a lost race costs nothing but the
+/// delay, and the next write that pushes carries it.
+const LOCAL_ROUNDS: u8 = 2;
+
+/// How a command's write meets the remote, stated where the command is
+/// defined (`Board::refereed`, `Board::local_first`), not found out while
+/// it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// The remote decides: an id (`add`, `new brief`) or a claim (`next`)
+    /// is good only once pushed, so it is refused when [`ROUNDS`] pushes
+    /// fail.
+    Refereed,
+    /// The clone decides, the default: [`LOCAL_ROUNDS`] pushes, and when
+    /// both fail the commit stays on the clone and the command succeeds.
+    LocalFirst,
+}
+
+/// What a write runs.
+pub(crate) enum Run<'a, T> {
+    /// No command: the clone and the remote brought together. [`ROUNDS`]
+    /// rounds, as a refereed write: it is what publishes the commits
+    /// local-first writes left on the clone, so giving up after two would
+    /// defeat it.
+    Sync,
+    Command(Kind, Apply<'a, T>),
+}
 
 /// Merges of a file saved during the write before the fast-forward is given
 /// up on. A save is a person's or an agent's, so a few are plenty; a loop
@@ -69,16 +102,21 @@ const SETTLES: u8 = 3;
 pub enum Note {
     /// Another write on this clone holds the lock; this one waits for it.
     LockWait,
-    /// A push failed; round `round` of [`ROUNDS`] starts over from a fetch,
-    /// after a wait when the push lost a race.
-    Retry { round: u8 },
+    /// A push failed; round `round` of the write's `of` starts over from a
+    /// fetch, after a wait when the push lost a race.
+    Retry { round: u8, of: u8 },
     /// The clone's own commits were merged with the remote's.
     Merged { commits: usize },
     /// The local version of a brief or an item lost to the remote's and
     /// was saved at `copy`.
     Conflict { of: ItemId, copy: PathBuf },
-    /// Commits of the clone that are not on the remote: git's reason.
+    /// Commits of the clone that are not on the remote: git's reason. A
+    /// failure: the remote was not reached, or a refereed write or a sync
+    /// gave up.
     NotPushed { commits: usize, reason: String },
+    /// A local-first write's commits left on the clone with the remote
+    /// reached: a normal end, they go out with the next write.
+    NotPushedYet { commits: usize, reason: String },
     /// The change is on the remote but the files of the clone were not
     /// updated: git's reason.
     CheckoutBehind(String),
@@ -94,7 +132,7 @@ impl fmt::Display for Note {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Note::LockWait => f.write_str("waiting for lock"),
-            Note::Retry { round } => write!(f, "retry {round}/{ROUNDS}"),
+            Note::Retry { round, of } => write!(f, "retry {round}/{of}"),
             Note::Merged { commits: n } => write!(f, "merged {n} local {}", commits(*n)),
             Note::Conflict { of, copy } => {
                 match of {
@@ -111,6 +149,11 @@ impl fmt::Display for Note {
             Note::NotPushed { commits: n, reason } => {
                 write!(f, "not pushed: {n} {} ({reason})", commits(*n))
             }
+            Note::NotPushedYet { commits: n, reason } => write!(
+                f,
+                "not pushed yet: {n} {}, they go out with the next write ({reason})",
+                commits(*n)
+            ),
             Note::CheckoutBehind(said) => write!(f, "local files not updated: {said}"),
             Note::Lint(finding) => write!(f, "lint: {finding}"),
         }
@@ -166,6 +209,7 @@ pub(crate) struct Tx<'a> {
     what: &'a str,
     /// Set when the run is on `main` only.
     offline: Option<&'a Offline>,
+    kind: Kind,
 }
 
 impl Tx<'_> {
@@ -256,7 +300,21 @@ impl Tx<'_> {
     /// Refuses a command that has to act on what the remote has. Where an id
     /// is allocated this is checked for every command; a command that
     /// allocates none but claims something shared (`next`) asks for it.
+    ///
+    /// In a local-first write it is always refused: such a write ends
+    /// unpushed after two rounds as a success, so an id or a claim from it
+    /// could be printed and never published. Checked here, where every id
+    /// is allocated, at run time rather than by the types: a second `Tx`
+    /// type and `Apply` for refereed commands would double the write's
+    /// signatures for four callers, and the test of each refereed command
+    /// against a refusing remote fails at once if one is declared wrong.
     pub(crate) fn require_remote(&self) -> Result<(), Error> {
+        if self.kind == Kind::LocalFirst {
+            return Err(Error::Refused(format!(
+                "{}: needs the remote, so its write must be refereed, not local first",
+                self.what
+            )));
+        }
         match self.offline {
             Some(offline) => Err(Error::NeedsRemote(offline.message(self.what))),
             None => Ok(()),
@@ -388,6 +446,7 @@ struct Ctx<'a> {
     merge_noted: Cell<bool>,
     /// This write's mark in its command's commit: see [`run_mark`].
     run: String,
+    kind: Kind,
 }
 
 /// A mark no other write has, for the message of the command's commit.
@@ -415,17 +474,18 @@ struct Built<T> {
     outcome: Option<Result<T, Error>>,
 }
 
-/// Runs a write: `apply` once per round until its commit is pushed, or no
-/// command (`sync`). Gives the value of the run that was pushed, or its
-/// refusal. `what` names the command in an error.
+/// Runs a write: its command once per round until its commit is pushed,
+/// or no command (`sync`). Gives the value of the run that was pushed, or
+/// its refusal; for a local-first write not pushed, the value of its run
+/// on the clone. `what` names the command in an error.
 pub(crate) fn write<T>(
     root: &Path,
     project: &ProjectName,
     what: &str,
     notes: &dyn Fn(Note),
-    apply: Option<Apply<'_, T>>,
+    run: Run<'_, T>,
 ) -> Result<Option<T>, Error> {
-    write_waiting(root, project, what, notes, apply, &std::thread::sleep)
+    write_waiting(root, project, what, notes, run, &std::thread::sleep)
 }
 
 /// The wait after a write's `race`th lost race (1 to 7, whatever round it
@@ -473,9 +533,17 @@ fn write_waiting<T>(
     project: &ProjectName,
     what: &str,
     notes: &dyn Fn(Note),
-    apply: Option<Apply<'_, T>>,
+    run: Run<'_, T>,
     wait: &dyn Fn(Duration),
 ) -> Result<Option<T>, Error> {
+    let (kind, apply) = match run {
+        Run::Sync => (Kind::Refereed, None),
+        Run::Command(kind, apply) => (kind, Some(apply)),
+    };
+    let rounds = match kind {
+        Kind::Refereed => ROUNDS,
+        Kind::LocalFirst => LOCAL_ROUNDS,
+    };
     let git = Git::at(root);
     let _lock = lock(root, notes)?;
     check(root, &git)?;
@@ -495,6 +563,7 @@ fn write_waiting<T>(
         notes,
         merge_noted: Cell::new(false),
         run: run_mark(),
+        kind,
     };
 
     let is_sync = apply.is_none();
@@ -507,7 +576,7 @@ fn write_waiting<T>(
     let mut last_refusal = None;
     let mut offline = None;
     let mut pushed = None;
-    for round in 1..=ROUNDS {
+    for round in 1..=rounds {
         if let Err(failure) = git.fetch() {
             offline = Some(if failed.is_empty() {
                 Offline::Unreached(failure)
@@ -540,8 +609,11 @@ fn write_waiting<T>(
             }
             Err(failure) => {
                 failed.push(built);
-                if round < ROUNDS {
-                    notes(Note::Retry { round: round + 1 });
+                if round < rounds {
+                    notes(Note::Retry {
+                        round: round + 1,
+                        of: rounds,
+                    });
                     if failure.lost_race() {
                         races += 1;
                         wait(backoff(races, random()));
@@ -575,8 +647,8 @@ fn write_waiting<T>(
         Some(built) => built,
         // The remote is out of reach: the command runs once more, on the
         // clone's own commits and what was last fetched, and its commit
-        // stays on `main` for the next write to push. Eight refused pushes
-        // count the same: an agent's command has to end.
+        // stays on `main` for the next write to push. A write's last
+        // refused push counts the same: an agent's command has to end.
         None => {
             let offline = offline.as_ref().expect("a write not pushed is offline");
             let main = head(&git)?;
@@ -596,9 +668,10 @@ fn write_waiting<T>(
             .count_between(&upstream, &head(&git)?)
             .map_err(git_error)?;
         if commits > 0 {
-            notes(Note::NotPushed {
-                commits,
-                reason: offline.reason(),
+            let reason = offline.reason();
+            notes(match (kind, offline) {
+                (Kind::LocalFirst, Offline::Refused(_)) => Note::NotPushedYet { commits, reason },
+                _ => Note::NotPushed { commits, reason },
             });
         }
     }
@@ -833,6 +906,7 @@ fn build<T>(
                 base: base.clone(),
                 what: ctx.what,
                 offline,
+                kind: ctx.kind,
             };
             match apply(&mut tx) {
                 // A command that changed nothing (`next` on an empty queue)
@@ -1191,7 +1265,7 @@ mod tests {
                 &ProjectName::parse("shop").unwrap(),
                 "sync",
                 &|note| notes.borrow_mut().push(note),
-                None,
+                Run::Sync,
                 &|wait| waits.borrow_mut().push(wait),
             );
             (ran.map(drop), waits.into_inner(), notes.into_inner())
@@ -1236,7 +1310,7 @@ mod tests {
         notes
             .iter()
             .filter_map(|note| match note {
-                Note::Retry { round } => Some(*round),
+                Note::Retry { round, .. } => Some(*round),
                 _ => None,
             })
             .collect()
@@ -1298,6 +1372,38 @@ mod tests {
         assert_eq!(waits.len(), 2, "{waits:?}");
         assert_eq!(waits[0], Duration::ZERO);
         assert_within_ceilings(&waits);
+    }
+
+    /// An id or a claim in a local-first write is refused before anything
+    /// is committed, however the remote answers: such a write could end on
+    /// the clone and print an id nobody else knows of.
+    #[test]
+    fn a_local_first_write_refuses_an_id_and_the_remote_s_check() {
+        let clone = Clone::new();
+        let notes = RefCell::new(Vec::new());
+        type Asks = fn(&mut Tx) -> Result<(), Error>;
+        let asks: [(&str, Asks); 4] = [
+            ("add chore", |tx| tx.alloc_chore().map(drop)),
+            ("add backlog", |tx| tx.alloc_backlog().map(drop)),
+            ("new brief", |tx| tx.alloc_brief().map(drop)),
+            ("next", |tx| tx.require_remote()),
+        ];
+        for (what, ask) in asks {
+            let apply = |tx: &mut Tx| ask(tx).map(|()| ((), "x".to_owned()));
+            let ran = write_waiting(
+                &clone.data(),
+                &ProjectName::parse("shop").unwrap(),
+                what,
+                &|note| notes.borrow_mut().push(note),
+                Run::Command(Kind::LocalFirst, &apply),
+                &|_| (),
+            );
+            assert!(
+                matches!(&ran, Err(Error::Refused(why)) if why.contains("must be refereed")),
+                "{what}: {ran:?}"
+            );
+        }
+        assert_eq!(git(&clone.data(), &["log", "--format=%s"]), "start\n");
     }
 
     /// No race lost, no wait: a remote whose hook declines every push is

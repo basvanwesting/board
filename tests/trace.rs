@@ -994,10 +994,19 @@ impl Effect {
     }
 }
 
-/// Whether a write tried all eight rounds and none was pushed: the last
-/// retry noted, and the write's commit left on the clone (`not pushed`).
+/// Whether a refereed write or a sync tried all eight rounds and none was
+/// pushed: the last retry noted, and the commit left on the clone or the
+/// command refused.
 fn given_up_online(run: &Run) -> bool {
     run.stderr.contains("board: retry 8/8") && run.stderr.contains("not pushed")
+}
+
+/// Whether a local-first write tried its two rounds and left its commit on
+/// the clone with the remote reached: a normal end.
+fn left_on_the_clone(run: &Run) -> bool {
+    run.code == Some(0)
+        && run.stderr.contains("board: retry 2/2\n")
+        && run.stderr.contains("board: not pushed yet: ")
 }
 
 /// Counts of what the trace went through, for the depth check.
@@ -1010,6 +1019,8 @@ struct Depth {
     not_pushed: u32,
     /// Every round's push refused with the remote there: given up online.
     given_up_online: u32,
+    /// A local-first write that ended with its commit on the clone.
+    left_on_the_clone: u32,
     refused: u32,
     offline_refused: u32,
     not_pushed_then_pushed: u32,
@@ -1020,6 +1031,9 @@ struct Depth {
     brief_conflicts: u32,
     lost_ack_recognised: u32,
     late_landing_recognised: u32,
+    /// The same in a local-first write: found by the fetch after its
+    /// second and last round.
+    late_landing_local_first: u32,
     kill_after_push_healed: u32,
     briefs_created: u32,
     briefs_queued: u32,
@@ -1081,6 +1095,7 @@ impl Depth {
         self.raced_in_the_window += other.raced_in_the_window;
         self.not_pushed += other.not_pushed;
         self.given_up_online += other.given_up_online;
+        self.left_on_the_clone += other.left_on_the_clone;
         self.refused += other.refused;
         self.offline_refused += other.offline_refused;
         self.not_pushed_then_pushed += other.not_pushed_then_pushed;
@@ -1090,6 +1105,7 @@ impl Depth {
         self.brief_conflicts += other.brief_conflicts;
         self.lost_ack_recognised += other.lost_ack_recognised;
         self.late_landing_recognised += other.late_landing_recognised;
+        self.late_landing_local_first += other.late_landing_local_first;
         self.kill_after_push_healed += other.kill_after_push_healed;
         self.briefs_created += other.briefs_created;
         self.briefs_queued += other.briefs_queued;
@@ -2121,6 +2137,7 @@ impl<'w> Oracle<'w> {
         };
         self.depth.commands += 1;
         self.depth.given_up_online += u32::from(given_up_online(&run));
+        self.depth.left_on_the_clone += u32::from(left_on_the_clone(&run));
         let conflicts = self.notes(who, &run)?;
         match run.code {
             Some(0) => {
@@ -2501,6 +2518,7 @@ impl<'w> Oracle<'w> {
         // Depth: what this command went through.
         let slot = who.slot();
         self.depth.given_up_online += u32::from(given_up_online(&run));
+        self.depth.left_on_the_clone += u32::from(left_on_the_clone(&run));
         if run.code == Some(0) {
             if std::mem::take(&mut self.healing[slot]) {
                 self.depth.kill_after_push_healed += 1;
@@ -2508,11 +2526,13 @@ impl<'w> Oracle<'w> {
             if matches!(fault, Some(Fault::LostAck)) && hook_ran && !rejecting {
                 self.depth.lost_ack_recognised += 1;
             }
-            if matches!(fault, Some(Fault::LateLanding))
-                && !rejecting
-                && run.stderr.contains("retry 3/8")
-            {
-                self.depth.late_landing_recognised += 1;
+            if matches!(fault, Some(Fault::LateLanding)) && !rejecting {
+                if run.stderr.contains("retry 3/8") {
+                    self.depth.late_landing_recognised += 1;
+                }
+                if run.stderr.contains("retry 2/2") && !run.stderr.contains("not pushed") {
+                    self.depth.late_landing_local_first += 1;
+                }
             }
             if window_edited.is_some() && run.stderr.contains("board: merged ") {
                 self.depth.window_edit_settled += 1;
@@ -2578,7 +2598,9 @@ impl<'w> Oracle<'w> {
                     "a lint finding the trace does not make: {run:?}"
                 );
             } else if line.starts_with("board: retry ") {
-            } else if line.starts_with("board: not pushed: ") {
+            } else if line.starts_with("board: not pushed: ")
+                || line.starts_with("board: not pushed yet: ")
+            {
                 self.unpushed[who.slot()] = true;
             } else {
                 prop_assert!(
@@ -2587,7 +2609,7 @@ impl<'w> Oracle<'w> {
                 );
             }
         }
-        let pushed_all = run.code == Some(0) && !run.stderr.contains("board: not pushed: ");
+        let pushed_all = run.code == Some(0) && !run.stderr.contains("board: not pushed");
         if pushed_all && self.online[who.slot()] && std::mem::take(&mut self.unpushed[who.slot()]) {
             self.depth.not_pushed_then_pushed += 1;
         }
@@ -2663,7 +2685,7 @@ impl<'w> Oracle<'w> {
         // Offline nothing is pushed, though a write that changed nothing (a
         // `group` of items there already) has no commit to note as not
         // pushed.
-        let pushed = run.code == Some(0) && !offline && !run.stderr.contains("board: not pushed: ");
+        let pushed = run.code == Some(0) && !offline && !run.stderr.contains("board: not pushed");
         if run.code == Some(0) && !offline {
             self.pulled(who, pushed);
         }
@@ -3928,6 +3950,7 @@ fn the_traces_get_deep() {
     assert!(depth.raced_in_the_window > 0, "{depth:?}");
     assert!(depth.not_pushed > 0, "{depth:?}");
     assert!(depth.given_up_online > 0, "{depth:?}");
+    assert!(depth.left_on_the_clone > 0, "{depth:?}");
     assert!(depth.refused > 0, "{depth:?}");
     assert!(depth.offline_refused > 0, "{depth:?}");
     assert!(depth.not_pushed_then_pushed > 0, "{depth:?}");
@@ -3936,6 +3959,7 @@ fn the_traces_get_deep() {
     assert!(depth.brief_conflicts > 0, "{depth:?}");
     assert!(depth.lost_ack_recognised > 0, "{depth:?}");
     assert!(depth.late_landing_recognised > 0, "{depth:?}");
+    assert!(depth.late_landing_local_first > 0, "{depth:?}");
     assert!(depth.kill_after_push_healed > 0, "{depth:?}");
     assert!(depth.briefs_created > 0, "{depth:?}");
     assert!(depth.briefs_queued > 0, "{depth:?}");

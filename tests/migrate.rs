@@ -545,3 +545,24 @@ fn the_next_id_is_past_every_id_the_lists_held() {
         "c5\n"
     );
 }
+
+/// `migrate` is a local-first write: two pushes refused, and it succeeds
+/// with its commit on the clone, for the next write to carry.
+#[test]
+fn migrate_is_local_first() {
+    let world = World::new();
+    let a = old_board(&world);
+    let before = world.remote_main();
+    world.reject_pushes(100);
+    let ran = a.board(&["migrate"]);
+    assert_eq!(world.rejects_left(), 98, "two pushes, by the hook's count");
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert_eq!(ran.stdout, b"migrated 6 chores, 4 backlog items\n");
+    assert!(
+        ran.stderr
+            .starts_with("board: retry 2/2\nboard: not pushed yet: 1 commit, "),
+        "{ran:?}"
+    );
+    assert_eq!(world.remote_main(), before);
+    assert_eq!(a.file("proj/chores.md"), None);
+}
