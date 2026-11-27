@@ -824,7 +824,8 @@ enum Subject {
     Retitle(Id, String, Option<String>),
     /// The slug, a token.
     NewBrief(String),
-    Queue(u32),
+    /// `queue <n>`, with `--first` or not.
+    Queue(u32, bool),
     /// `queue <n> --first`.
     First(u32),
     /// `park <n>`.
@@ -859,7 +860,7 @@ impl Subject {
             | Subject::Group(..)
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
-            | Subject::Queue(_)
+            | Subject::Queue(..)
             | Subject::First(_)
             | Subject::Park(_)
             | Subject::Release(_)
@@ -878,7 +879,7 @@ impl Subject {
             Subject::Add(..)
             | Subject::Close(_)
             | Subject::NewBrief(_)
-            | Subject::Queue(_)
+            | Subject::Queue(..)
             | Subject::First(_)
             | Subject::Park(_)
             | Subject::Release(_)
@@ -902,7 +903,7 @@ impl Subject {
             | Subject::Group(..)
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
-            | Subject::Queue(_)
+            | Subject::Queue(..)
             | Subject::First(_)
             | Subject::Park(_)
             | Subject::Release(_)
@@ -927,7 +928,7 @@ impl Subject {
             | Subject::Group(..)
             | Subject::Retitle(..)
             | Subject::NewBrief(_)
-            | Subject::Queue(_)
+            | Subject::Queue(..)
             | Subject::First(_)
             | Subject::Park(_)
             | Subject::Release(_)
@@ -1635,7 +1636,7 @@ impl<'w> Oracle<'w> {
                 if *first {
                     args.push("--first".to_owned());
                 }
-                (args, Subject::Queue(number))
+                (args, Subject::Queue(number, *first))
             }
             Op::Park {
                 pick: draft,
@@ -2180,7 +2181,7 @@ impl<'w> Oracle<'w> {
         subject: &Subject,
     ) -> Result<(), TestCaseError> {
         let number = match (op, subject) {
-            (Op::Queue { write: true, .. }, Subject::Queue(number))
+            (Op::Queue { write: true, .. }, Subject::Queue(number, _))
             | (Op::Park { .. }, Subject::Park(number)) => number,
             _ => return Ok(()),
         };
@@ -2624,7 +2625,7 @@ impl<'w> Oracle<'w> {
                             | Subject::Body(..)
                             | Subject::Group(..)
                             | Subject::Retitle(..)
-                            | Subject::Queue(_)
+                            | Subject::Queue(..)
                             | Subject::First(_)
                             | Subject::Park(_)
                             | Subject::Release(_)
@@ -2953,11 +2954,16 @@ impl<'w> Oracle<'w> {
                 ),
                 Some(_) | None => {}
             },
-            Subject::Queue(number) => match run.code {
+            Subject::Queue(number, first) => match run.code {
                 Some(0) => {
+                    // Picked as a draft; queued when it ran (queued on the
+                    // clone offline, or by the other clone and brought in by
+                    // the write's fetch) it is only put first, as `First`
+                    // says the other way round.
                     prop_assert!(
                         run.stdout == format!("queued {number}\n")
-                            || run.stdout == format!("queued {number}, first\n"),
+                            || run.stdout == format!("queued {number}, first\n")
+                            || (*first && run.stdout == format!("{number} first\n")),
                         "{run:?}"
                     );
                     // Queued, or claimed since: a queue run in the window of
@@ -2975,7 +2981,11 @@ impl<'w> Oracle<'w> {
                         status,
                         run
                     );
-                    self.depth.briefs_queued += 1;
+                    if run.stdout == format!("{number} first\n") {
+                        self.depth.briefs_put_first += 1;
+                    } else {
+                        self.depth.briefs_queued += 1;
+                    }
                 }
                 Some(1) => {
                     let last = run.stderr.lines().last().unwrap_or_default();
