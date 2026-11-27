@@ -40,9 +40,13 @@
 //!   moves as `j`/`k`; either is an unrelated key first (it calls off an
 //!   edit waited for, clears a pending `g` or `y`), and does
 //!   nothing at all while the filter is typed, a question is asked, help
-//!   is open or a quit waits. Where a click lands comes from the frame
+//!   is open or a quit waits. A click on a tab's label in the Briefs
+//!   title (as drawn, a cut one by what is drawn of it; the filter text is
+//!   none) shows that tab as `1` and `[`/`]` would; anywhere else on a
+//!   panel it changes no tab. Where a click lands comes from the frame
 //!   drawn before it (the panes' boxes found by their `[n]` titles and
-//!   corners), not from the state's own hit test;
+//!   corners, the labels read off the title row), not from the state's own
+//!   hit test;
 //! - T13 `queue --first` is sent only by `F` on the queued brief under
 //!   the cursor, alone; `F` on another brief sends nothing and says why,
 //!   on a list item nothing at all.
@@ -231,6 +235,9 @@ fn step() -> impl Strategy<Value = Step> {
         // Anywhere, off the screen too: the sizes go up to 200 x 50.
         6 => prop_oneof![
             4 => (0u16..220, 0u16..56).prop_map(|(column, row)| Mouse::Click { column, row }),
+            // The Briefs title's row, where its tabs are: a random click
+            // over the screen rarely meets a label.
+            2 => (0u16..120).prop_map(|column| Mouse::Click { column, row: 0 }),
             1 => Just(Mouse::WheelUp),
             1 => Just(Mouse::WheelDown),
         ]
@@ -312,6 +319,20 @@ fn put_first() -> impl Strategy<Value = Vec<Step>> {
     })
 }
 
+/// A click on the Briefs title of a narrow screen, where its last labels
+/// are cut, from the first tab: random clicks seldom meet a cut label.
+fn cut_tab_click() -> impl Strategy<Value = Vec<Step>> {
+    (60u16..80, 20u16..40, 0u16..40).prop_map(|(width, height, column)| {
+        vec![
+            Step::Resize(width, height),
+            Step::Key(Key::Char('1')),
+            Step::Key(Key::Char('[')),
+            Step::Key(Key::Char('[')),
+            Step::Mouse(Mouse::Click { column, row: 0 }),
+        ]
+    })
+}
+
 /// `e` while a write is out: the editor waits for its answer and the load
 /// after it, which may give the item an id. Random steps rarely bring the
 /// three in that order.
@@ -379,6 +400,7 @@ fn trace() -> impl Strategy<Value = (Files, Vec<Step>)> {
         3 => asked(),
         1 => released(),
         1 => put_first(),
+        1 => cut_tab_click(),
         1 => edit_waits(),
         1 => previewed(),
         1 => yanked_whole(),
@@ -587,6 +609,10 @@ struct Depth {
     click_selected: u32,
     /// A click into the preview.
     click_previewed: u32,
+    /// A click on a Briefs tab's label, drawn whole, that showed another tab.
+    tab_clicked: u32,
+    /// The same on a label cut by the panel's width.
+    tab_clicked_cut: u32,
     /// A click or the wheel while a key is waited for: nothing.
     mouse_waited: u32,
     wheeled: u32,
@@ -644,6 +670,8 @@ impl Depth {
             click_focused,
             click_selected,
             click_previewed,
+            tab_clicked,
+            tab_clicked_cut,
             mouse_waited,
             wheeled,
             upper_jk,
@@ -1509,8 +1537,34 @@ fn judge(
     if acts {
         prop_assert!(!after.pending_g && after.pending_y.is_none());
         match &drawn {
+            Drawn::Tab { tab, cut } => {
+                // As `1` and the `[`/`]` presses to it, from the same state,
+                // but for the messages: the keys clear a note of an edit
+                // called off with their second press.
+                let mut keys = before.clone().step(Event::Key(Key::Char('1'))).0;
+                while keys.tab != *tab {
+                    let step = if (keys.tab as usize) < (*tab as usize) {
+                        ']'
+                    } else {
+                        '['
+                    };
+                    keys = keys.step(Event::Key(Key::Char(step))).0;
+                }
+                keys.messages = after.messages.clone();
+                prop_assert_eq!(untouched(after), untouched(&keys));
+                prop_assert_eq!(&after.cursors, &keys.cursors);
+                prop_assert_eq!(after.preview.scroll, keys.preview.scroll);
+                if before.tab != *tab {
+                    if *cut {
+                        depth.tab_clicked_cut += 1;
+                    } else {
+                        depth.tab_clicked += 1;
+                    }
+                }
+            }
             Drawn::Panel(panel, _) => {
                 prop_assert_eq!((after.focus, after.in_preview), (*panel, false));
+                prop_assert_eq!(after.tab, before.tab);
                 if *panel != before.focus || before.in_preview {
                     depth.click_focused += 1;
                 }
@@ -1549,6 +1603,11 @@ fn judge(
 enum Drawn {
     /// A list panel's box, and the item on the row clicked inside it.
     Panel(Panel, Option<ItemKey>),
+    /// A tab's label in the Briefs title, and whether it is cut.
+    Tab {
+        tab: Tab,
+        cut: bool,
+    },
     Preview,
     /// Outside every box, with all four found.
     Nothing,
@@ -1590,6 +1649,51 @@ fn drawn_hit(state: &State, column: u16, row: u16) -> Drawn {
         None
     };
     let boxes = ['1', '2', '3', '0'].map(find);
+    // The Briefs title's labels, read off its top border: after `╭─[1]─`,
+    // up to the run of `─` before the corner or to the filter's `  /`,
+    // parted by ` - `; each the whole label or a prefix of it, which a cut
+    // title leaves.
+    if let Some((left, top, right, _)) = boxes[0]
+        && row == top
+        && column > left
+        && column < right
+    {
+        let cells: Vec<String> = (left + 6..right).map(|x| cell(x, top)).collect();
+        let mut text: String = cells.concat();
+        if let Some(filter) = text.find("  /") {
+            text.truncate(filter);
+        }
+        let text = text.trim_end_matches('─');
+        let labels = [
+            (Tab::Open, "Briefs ("),
+            (Tab::Parked, "Parked ("),
+            (Tab::Filed, "Filed"),
+        ];
+        let mut x = left + 6;
+        for (at, part) in text.split(" - ").enumerate() {
+            let width = u16::try_from(part.chars().count()).unwrap();
+            // The label in the part: up to its count's `)` or to `Filed`'s
+            // end, or all of it when the cut falls inside; what follows (a
+            // cut separator's ` -`, the filter's spaces) is none.
+            let (label, whole) = match part.find(')') {
+                Some(close) => (&part[..=close], true),
+                None if part.starts_with("Filed") => ("Filed", true),
+                None => (part, false),
+            };
+            let label_width = u16::try_from(label.chars().count()).unwrap();
+            if let Some((tab, name)) = labels.get(at)
+                && !label.is_empty()
+                && (label.starts_with(name) || name.starts_with(label))
+                && (x..x + label_width).contains(&column)
+            {
+                return Drawn::Tab {
+                    tab: *tab,
+                    cut: !whole,
+                };
+            }
+            x += width + 3;
+        }
+    }
     let inside = |(left, top, right, bottom): (u16, u16, u16, u16)| {
         (left..=right).contains(&column) && (top..=bottom).contains(&row)
     };
@@ -1702,6 +1806,8 @@ fn the_traces_get_deep() {
         ("click_focused", depth.click_focused > 0),
         ("click_selected", depth.click_selected > 0),
         ("click_previewed", depth.click_previewed > 0),
+        ("tab_clicked", depth.tab_clicked > 0),
+        ("tab_clicked_cut", depth.tab_clicked_cut > 0),
         ("mouse_waited", depth.mouse_waited > 0),
         ("wheeled", depth.wheeled > 0),
         ("upper_jk", depth.upper_jk > 0),

@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 
 use super::layout::{self, inner_height};
-use super::state::{Panel, Row, Source, State, Tab};
+use super::state::{Panel, Row, Source, State};
 use crate::board::Shown;
 use crate::brief::Status;
 
@@ -19,7 +19,10 @@ const HELP: [(&str, &str); 22] = [
     ("ctrl-d ctrl-u", "half a page down, up"),
     ("1 2 3", "Briefs, Chores, Backlog"),
     ("h l S-Tab Tab", "previous, next panel"),
-    ("click", "focus the pane, select the row clicked"),
+    (
+        "click",
+        "focus the pane, select the row or the Briefs tab clicked",
+    ),
     ("[ ]", "the Briefs tabs: Briefs, Parked, Filed"),
     ("0 Enter", "into the preview, to scroll; h back"),
     ("/", "filter the panel: Enter keeps it, Esc clears it"),
@@ -99,7 +102,7 @@ fn status_style(shown: Shown) -> Style {
 /// green when it has them. One function for the panels and the preview, so
 /// the four cannot drift.
 fn key_span(key: &str, focused: bool) -> Span<'static> {
-    Span::styled(format!("─[{key}]─"), border(focused))
+    Span::styled(layout::key_text(key), border(focused))
 }
 
 /// A panel's title as LazyGit draws it: `─[1]─Briefs (3) - Parked (2) -
@@ -112,33 +115,14 @@ fn key_span(key: &str, focused: bool) -> Span<'static> {
 /// really actionable"). Matches of all rather than the matches alone: a
 /// bare `(3)` would read as three left.
 fn panel_title(state: &State, panel: Panel, focused: bool) -> Line<'static> {
-    // A tab, the tab it is when the panel has tabs, and what it counts.
-    type Tabs = [(&'static str, Option<Tab>, Option<Source>)];
-    let (key, tabs): (&str, &Tabs) = match panel {
-        Panel::Briefs => (
-            "1",
-            &[
-                ("Briefs", Some(Tab::Open), Some(Source::Open)),
-                ("Parked", Some(Tab::Parked), Some(Source::Parked)),
-                ("Filed", Some(Tab::Filed), None),
-            ],
-        ),
-        Panel::Chores => ("2", &[("Chores", None, Some(Source::Chores))]),
-        Panel::Backlog => ("3", &[("Backlog", None, Some(Source::Backlog))]),
-    };
     // The block draws its title in the border's style; plain is said
     // outright, or a focused panel's whole title would be green.
     let plain = Style::new().fg(Color::Reset);
-    let mut title = vec![key_span(key, focused)];
-    for (at, (name, tab, counted)) in tabs.iter().enumerate() {
+    let mut title = vec![key_span(panel.key(), focused)];
+    for (at, (text, tab)) in state.title_tabs(panel).into_iter().enumerate() {
         if at > 0 {
-            title.push(Span::styled(" - ", plain));
+            title.push(Span::styled(layout::TAB_SEPARATOR, plain));
         }
-        let text = match counted.map(|source| state.count(source)) {
-            Some((shown, Some(all))) => format!("{name} ({shown}/{all})"),
-            Some((shown, None)) => format!("{name} ({shown})"),
-            None => (*name).to_owned(),
-        };
         let shown = tab.is_none_or(|tab| state.tab() == tab);
         title.push(if shown {
             Span::styled(
@@ -425,7 +409,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::super::data::{BriefItem, Data, ListLine};
-    use super::super::state::{Action, Command, Event, Key, Mouse, Question};
+    use super::super::state::{Action, Command, Event, Key, Mouse, Question, Tab};
     use super::*;
     use crate::board::{BriefRow, ListRow};
     use crate::brief::{Stamp, Status};
@@ -1625,6 +1609,196 @@ mod tests {
         let state = clicked(state, 5, 15);
         let state = press(state, "g");
         assert_eq!(on(&state), on_row(Panel::Backlog, "b12 item 12"));
+    }
+
+    /// The columns of a Briefs tab's label on the screen's top row, read
+    /// off the drawing: `name`, and its count in parentheses when one
+    /// follows; cut where the panel's border starts.
+    fn label(state: &State, name: &str) -> std::ops::Range<u16> {
+        let line: Vec<char> = screen(state)[0].chars().collect();
+        let name: Vec<char> = name.chars().collect();
+        let start = (0..line.len())
+            .find(|at| line[*at..].starts_with(&name))
+            .unwrap_or_else(|| panic!("{name:?} in {:?}", screen(state)[0]));
+        let mut end = start + name.len();
+        if line[end..].starts_with(&[' ', '(']) {
+            end += line[end..].iter().position(|c| *c == ')').unwrap() + 1;
+        }
+        let cut = line[start..end].iter().position(|c| *c == '─' || *c == '╮');
+        let end = cut.map_or(end, |cut| start + cut);
+        u16::try_from(start).unwrap()..u16::try_from(end).unwrap()
+    }
+
+    /// What the view's tests can see of a state: for a click and the keys
+    /// it stands for.
+    fn seen(state: &State) -> (Tab, (Panel, bool, Option<String>), usize, Vec<String>) {
+        (
+            state.tab(),
+            on(state),
+            state.offset(state.source()),
+            screen(state),
+        )
+    }
+
+    #[test]
+    fn a_click_on_a_briefs_tab_shows_it_as_its_keys_do() {
+        // From each pane, the preview included, and from another tab for
+        // `Briefs`: first, a middle and last column of the label.
+        for start in ["", "2", "3", "0"] {
+            for (name, from, keys) in [
+                ("Parked", "", "1]"),
+                ("Filed", "", "1]]"),
+                ("Briefs", "]]", "1[["),
+            ] {
+                let state = press(press(mouse_state(100, 16), from), start);
+                let columns = label(&state, name);
+                let middle = columns.start + (columns.end - columns.start) / 2;
+                for column in [columns.start, middle, columns.end - 1] {
+                    let click = clicked(state.clone(), column, 0);
+                    let keys = press(state.clone(), keys);
+                    assert_eq!(seen(&click), seen(&keys), "{start:?} {name} {column}");
+                    assert_eq!(click.focus(), Panel::Briefs);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_beside_a_label_only_focuses() {
+        let state = press(press(mouse_state(100, 16), "]"), "3");
+        let title: Vec<char> = screen(&state)[0].chars().collect();
+        let labels = [
+            label(&state, "Briefs"),
+            label(&state, "Parked"),
+            label(&state, "Filed"),
+        ];
+        // Every column of the top row of Briefs that is no label but the
+        // one shown: the corners, `[1]`, the separators, the border after.
+        let right = u16::try_from(title.iter().position(|c| *c == '╮').unwrap()).unwrap();
+        for column in 0..=right {
+            if labels[0].contains(&column) || labels[2].contains(&column) {
+                continue;
+            }
+            let after = clicked(state.clone(), column, 0);
+            assert_eq!(after.tab(), Tab::Parked, "column {column}");
+            assert_eq!(after.focus(), Panel::Briefs, "column {column}");
+        }
+        // Just beside each label: the off-by-one columns.
+        for columns in &labels {
+            for column in [columns.start - 1, columns.end] {
+                assert_eq!(clicked(state.clone(), column, 0).tab(), Tab::Parked);
+            }
+        }
+        // The titles of Chores and Backlog have no tabs: a click focuses.
+        let state = press(mouse_state(100, 16), "]");
+        for (row, panel) in [(9, Panel::Chores), (12, Panel::Backlog)] {
+            for column in 0..45 {
+                let after = clicked(state.clone(), column, row);
+                assert_eq!((after.tab(), after.focus()), (Tab::Parked, panel));
+            }
+        }
+    }
+
+    #[test]
+    fn under_a_filter_the_labels_are_as_drawn_and_its_text_is_none() {
+        let state = press(mouse_state(200, 16), "1/some");
+        let state = state.step(Event::Key(Key::Enter)).0;
+        let line = screen(&state)[0].clone();
+        assert!(
+            line.contains("Briefs (1/2) - Parked (0/0) - Filed  /some"),
+            "{line}"
+        );
+        for (name, tab) in [("Parked", Tab::Parked), ("Filed", Tab::Filed)] {
+            let columns = label(&state, name);
+            for column in columns {
+                assert_eq!(clicked(state.clone(), column, 0).tab(), tab);
+            }
+        }
+        let filed = label(&state, "Filed");
+        for column in filed.end..filed.end + 7 {
+            assert_eq!(
+                clicked(state.clone(), column, 0).tab(),
+                Tab::Open,
+                "{column}"
+            );
+        }
+        let on_filed = press(state.clone(), "]]");
+        for column in label(&on_filed, "Briefs") {
+            assert_eq!(clicked(on_filed.clone(), column, 0).tab(), Tab::Open);
+        }
+    }
+
+    #[test]
+    fn a_cut_label_is_clickable_on_what_is_drawn_of_it() {
+        // At 80 columns the title is cut inside `Filed`.
+        let state = mouse_state(80, 24);
+        let cut = label(&state, "Fil");
+        assert!(
+            !screen(&state)[0].contains("Filed"),
+            "{}",
+            screen(&state)[0]
+        );
+        for column in cut.clone() {
+            assert_eq!(clicked(state.clone(), column, 0).tab(), Tab::Filed);
+        }
+        assert_eq!(clicked(state.clone(), cut.end, 0).tab(), Tab::Open);
+        // A width that cuts inside `Parked (0)`: that label clicks, and no
+        // click reaches Filed.
+        let (state, width) = (40..80)
+            .map(|width| (mouse_state(width, 24), width))
+            .find(|(state, _)| {
+                let line = &screen(state)[0];
+                line.contains("- Pa") && !line.contains("Parked (0)")
+            })
+            .expect("a width that cuts inside Parked");
+        let cut = label(&state, "Pa");
+        for column in cut.clone() {
+            assert_eq!(clicked(state.clone(), column, 0).tab(), Tab::Parked);
+        }
+        for column in cut.end..width {
+            assert_eq!(
+                clicked(state.clone(), column, 0).tab(),
+                Tab::Open,
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tab_click_does_nothing_where_a_key_is_waited_for() {
+        let parked = |state: &State| label(state, "Parked").start;
+        let waits = [
+            press(mouse_state(100, 16), "3/item"),
+            press(mouse_state(100, 16), "3x"),
+            press(mouse_state(100, 16), "3?"),
+        ];
+        for state in waits {
+            let column = label(&press(mouse_state(100, 16), "3"), "Parked").start;
+            let (after, commands) = click(state.clone(), column, 0);
+            assert_eq!(commands, Vec::<Command>::new());
+            assert_eq!((after.tab(), screen(&after)), (Tab::Open, screen(&state)));
+        }
+        let (state, _) = press(mouse_state(100, 16), "3x").step(Event::Key(Key::Char('y')));
+        let (state, _) = state.step(Event::Key(Key::Char('q')));
+        assert!(state.quitting());
+        let column = parked(&press(mouse_state(100, 16), "3"));
+        let (after, commands) = click(state, column, 0);
+        assert_eq!((after.tab(), commands), (Tab::Open, Vec::new()));
+    }
+
+    #[test]
+    fn a_tab_click_clears_a_pending_g() {
+        // On Filed, the Briefs tab's cursor on its second row; `g`, a click
+        // on `Briefs (n)`, `g`: no `gg`.
+        let state = press(mouse_state(100, 16), "j]]");
+        let state = press(state, "g");
+        let state = clicked(state.clone(), label(&state, "Briefs").start, 0);
+        let state = press(state, "g");
+        assert_eq!(state.tab(), Tab::Open);
+        assert_eq!(
+            on(&state),
+            on_row(Panel::Briefs, "127 reported  other-slug")
+        );
     }
 
     #[test]

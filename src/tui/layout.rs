@@ -16,6 +16,14 @@ use super::view::id_style;
 const LEFT_PERCENT: u32 = 45;
 const LEFT_MAX: u16 = 90;
 
+/// What a pane's title starts with: its jump key, `─[1]─`.
+pub(crate) fn key_text(key: &str) -> String {
+    format!("─[{key}]─")
+}
+
+/// Between the tabs of a panel's title.
+pub(crate) const TAB_SEPARATOR: &str = " - ";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Areas {
     /// Briefs, Chores, Backlog, top to bottom.

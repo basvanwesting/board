@@ -60,6 +60,8 @@ pub(crate) enum Mouse {
 enum Hit {
     /// A list panel, and the item on the row clicked, if any.
     Panel(Panel, Option<ItemKey>),
+    /// A tab's label in the Briefs panel's title.
+    Tab(Tab),
     Preview,
     /// The status line, or off the screen.
     Nothing,
@@ -170,6 +172,15 @@ pub(crate) enum Panel {
 
 impl Panel {
     pub const ALL: [Panel; 3] = [Panel::Briefs, Panel::Chores, Panel::Backlog];
+
+    /// Its jump key, which its title names.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Panel::Briefs => "1",
+            Panel::Chores => "2",
+            Panel::Backlog => "3",
+        }
+    }
 
     fn next(self) -> Panel {
         Panel::ALL[(self as usize + 1) % 3]
@@ -675,6 +686,13 @@ impl State {
                     cursor.key = Some(key);
                 }
             }
+            // What `[` and `]` do to get there: the tab, nothing else of
+            // the panel. Unlike the keys it leaves the preview, as every
+            // click on a panel does.
+            (Mouse::Click { .. }, Some(Hit::Tab(tab))) => {
+                self.focus_on(Panel::Briefs);
+                self.tab = tab;
+            }
             // As `0`: only with an item under the cursor.
             (Mouse::Click { .. }, Some(Hit::Preview)) => {
                 if self.cursor(self.source()).key.is_some() {
@@ -699,6 +717,11 @@ impl State {
             .find(|panel| areas.panel(*panel).contains(at))
         {
             let area = areas.panel(panel);
+            if row == area.y
+                && let Some(tab) = self.tab_at(panel, area, column)
+            {
+                return Hit::Tab(tab);
+            }
             let inside = ratatui::layout::Rect::new(
                 area.x.saturating_add(1),
                 area.y.saturating_add(1),
@@ -717,6 +740,62 @@ impl State {
         } else {
             Hit::Nothing
         }
+    }
+
+    /// The tab whose label in `panel`'s title, drawn on the top border of
+    /// `area`, is at `column`. Measured from what the view draws
+    /// ([`State::title_tabs`], [`layout::key_text`],
+    /// [`layout::TAB_SEPARATOR`]), placed as the block places a title:
+    /// after the left corner, cut before the right one, so a cut label is
+    /// clickable on what is drawn of it and nothing past it. The filter text
+    /// after the labels is none.
+    fn tab_at(&self, panel: Panel, area: ratatui::layout::Rect, column: u16) -> Option<Tab> {
+        let width = |text: &str| u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+        let end = area.x.saturating_add(area.width.saturating_sub(1));
+        let mut x = area
+            .x
+            .saturating_add(1)
+            .saturating_add(width(&layout::key_text(panel.key())));
+        for (at, (label, tab)) in self.title_tabs(panel).into_iter().enumerate() {
+            if at > 0 {
+                x = x.saturating_add(width(layout::TAB_SEPARATOR));
+            }
+            let after = x.saturating_add(width(&label));
+            if (x..after.min(end)).contains(&column) {
+                return tab;
+            }
+            x = after;
+        }
+        None
+    }
+
+    /// The tabs of `panel`'s title, as drawn: each label (its name and the
+    /// number of items it lists, `(3/10)` under a filter, Filed with none)
+    /// and the tab it shows; `None` for a panel of one tab. The view draws
+    /// them and [`State::hit`] measures them, so a click and the drawing
+    /// cannot disagree.
+    pub(crate) fn title_tabs(&self, panel: Panel) -> Vec<(String, Option<Tab>)> {
+        // A tab, the tab it is when the panel has tabs, and what it counts.
+        type Tabs = [(&'static str, Option<Tab>, Option<Source>)];
+        let tabs: &Tabs = match panel {
+            Panel::Briefs => &[
+                ("Briefs", Some(Tab::Open), Some(Source::Open)),
+                ("Parked", Some(Tab::Parked), Some(Source::Parked)),
+                ("Filed", Some(Tab::Filed), None),
+            ],
+            Panel::Chores => &[("Chores", None, Some(Source::Chores))],
+            Panel::Backlog => &[("Backlog", None, Some(Source::Backlog))],
+        };
+        tabs.iter()
+            .map(|(name, tab, counted)| {
+                let text = match counted.map(|source| self.count(source)) {
+                    Some((shown, Some(all))) => format!("{name} ({shown}/{all})"),
+                    Some((shown, None)) => format!("{name} ({shown})"),
+                    None => (*name).to_owned(),
+                };
+                (text, *tab)
+            })
+            .collect()
     }
 
     /// Esc leaves the preview, closes help, answers no, or clears a filter,
