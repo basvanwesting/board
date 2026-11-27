@@ -19,6 +19,11 @@ struct Cli {
     /// (also: BOARD)
     #[arg(long, global = true, value_name = "NAME")]
     board: Option<String>,
+    /// Commit on the board-data clone only, no fetch and no push: for a
+    /// sweep of many writes, published by one `board sync` after. Not for
+    /// `add`, `new brief`, `next` and `sync`, which need the remote
+    #[arg(long, global = true)]
+    local: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -310,7 +315,9 @@ fn usage(error: &clap::Error) -> ExitCode {
 /// The command's stdout and exit code.
 fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
     // What is wrong with the command line comes before what is wrong with
-    // the machine.
+    // the machine, and before stdin is read.
+    refuse_local(&cli)?;
+    let local = cli.local;
     let command = match cli.command {
         // The plain board when piped: what an agent or a script reads.
         None if io::stdout().is_terminal() => Run::Tui,
@@ -400,6 +407,7 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
         return line("synced".to_owned());
     }
     let board = Board::open(env, notes)?;
+    let board = if local { board.local() } else { board };
     match command {
         Run::Tui => {
             board::tui::run(board)?;
@@ -457,6 +465,74 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
                 Ok((lines.into_bytes(), Exit::Refused))
             }
         }
+    }
+}
+
+/// `--local` where it does not fit, as a usage error: a write that needs
+/// the remote, the one that publishes, and what writes nothing.
+///
+/// Decided from the command line alone, so it comes before stdin is read
+/// and before the environment, and `mod docs` asks the same of every
+/// invocation the README and the skill name. The four refereed commands
+/// are a second list beside their `Board::refereed` calls; the write loop
+/// holds the two together (a refereed command run with the flag still
+/// allocates nothing: `sync::Offline::Asked`). The TUI is refused with the
+/// plain board: its `d`, `x`, `F` and `Q` write, and a screen whose every
+/// write waits on the clone for a sync is a mode nobody asked for. An
+/// exhaustive match, so a new command is sorted here when it is added.
+fn refuse_local(cli: &Cli) -> Result<(), Error> {
+    if !cli.local {
+        return Ok(());
+    }
+    let needs_remote = |what: &str| {
+        Err(Error::Usage(format!(
+            "{what} --local: {what} needs the remote (it is pushed or refused), \
+             so run it without --local"
+        )))
+    };
+    let writes_nothing = |what: &str| {
+        Err(Error::Usage(format!(
+            "{what} --local: --local is for a command that writes, and {what} writes nothing"
+        )))
+    };
+    match &cli.command {
+        None => Err(Error::Usage(
+            "board --local: --local is for a write command, not the board itself \
+             (the TUI, or the plain board when piped)"
+                .to_owned(),
+        )),
+        Some(Command::Ls { .. }) => writes_nothing("ls"),
+        Some(Command::Show { .. }) => writes_nothing("show"),
+        Some(Command::Lint) => writes_nothing("lint"),
+        Some(Command::New {
+            item: NewItem::Brief { .. },
+        }) => needs_remote("new brief"),
+        Some(Command::Add {
+            item: AddItem::Chore { .. },
+        }) => needs_remote("add chore"),
+        Some(Command::Add {
+            item: AddItem::Backlog { .. },
+        }) => needs_remote("add backlog"),
+        Some(Command::Next) => needs_remote("next"),
+        Some(Command::Sync) => Err(Error::Usage(
+            "sync --local: sync is the command that publishes what --local left on the clone; \
+             run it without --local"
+                .to_owned(),
+        )),
+        Some(
+            Command::Queue { .. }
+            | Command::Park { .. }
+            | Command::Block { .. }
+            | Command::Amend { .. }
+            | Command::Report { .. }
+            | Command::File { .. }
+            | Command::Done { .. }
+            | Command::Drop { .. }
+            | Command::Retitle { .. }
+            | Command::Group { .. }
+            | Command::After { .. }
+            | Command::Migrate,
+        ) => Ok(()),
     }
 }
 
@@ -632,9 +708,10 @@ fn list_lines(rows: &[ListRow]) -> Vec<u8> {
 #[cfg(test)]
 mod docs {
     use board::Status;
-    use clap::CommandFactory;
 
-    use super::Cli;
+    use clap::Parser;
+
+    use super::{Cli, refuse_local};
 
     const SKILL: &str = include_str!("../skill/my-plan.SKILL.md");
     const README: &str = include_str!("../README.md");
@@ -742,8 +819,13 @@ mod docs {
         }
         let mut error = String::new();
         for argv in argvs {
-            match Cli::command().try_get_matches_from(argv) {
-                Ok(_) => return Ok(()),
+            // As `main` takes a command line: parsed, then `--local`
+            // where it does not fit refused.
+            match Cli::try_parse_from(argv) {
+                Ok(cli) => match refuse_local(&cli) {
+                    Ok(()) => return Ok(()),
+                    Err(refused) => error = refused.to_string(),
+                },
                 // `--help` and the like: not an error, main prints it.
                 Err(help) if !help.use_stderr() => return Ok(()),
                 Err(wrong) => error = wrong.render().to_string(),
@@ -815,6 +897,18 @@ mod docs {
                 "`board done <id>`",
                 "`board done <id> <slug>`",
                 "board done <id> <slug>",
+            ),
+            // Parsed, and refused as `main` refuses it: `--local` on a
+            // command that needs the remote, and on the one that publishes.
+            (
+                "`board retitle <id> \"<text>\" --local`",
+                "`board add backlog \"<text>\" --local`",
+                "board add backlog \"<text>\" --local",
+            ),
+            (
+                "`board amend <id> --replace --local`",
+                "`board sync --local`",
+                "board sync --local",
             ),
         ] {
             let text = SKILL.replacen(from, to, 1);

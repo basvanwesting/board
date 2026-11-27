@@ -611,6 +611,28 @@ impl Machine<'_> {
         rev(&self.world.git_output(&self.data(), ["rev-parse", "main"]))
     }
 
+    /// The commit the board-data clone's `origin/main` is on: the remote as
+    /// last fetched. Asked of git, as packed refs are not in `.git/refs`.
+    pub fn origin_main(&self) -> String {
+        rev(&self
+            .world
+            .git_output(&self.data(), ["rev-parse", "refs/remotes/origin/main"]))
+    }
+
+    /// The subjects of the commits of the board-data clone's `main`, newest
+    /// first.
+    pub fn log(&self) -> Vec<String> {
+        let output = self
+            .world
+            .git_output(&self.data(), ["log", "--format=%s", "main"]);
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The commit `HEAD` of a repository of the machine is on.
     pub fn head_of(&self, repository: &Path) -> String {
         rev(&self.world.git_output(repository, ["rev-parse", "HEAD"]))

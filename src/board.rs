@@ -35,6 +35,10 @@ pub struct Board {
     /// as it comes: `waiting for lock` has to show before the wait. `Send`:
     /// the TUI's writes run on a thread of their own.
     notes: Box<dyn Fn(Note) + Send>,
+    /// `--local`: its writes make no fetch and no push (`sync::Run`).
+    /// `main` refuses the flag on every command it would not fit, so only
+    /// local-first writes get here with it.
+    local: bool,
 }
 
 impl Board {
@@ -66,7 +70,16 @@ impl Board {
             project,
             in_project,
             notes,
+            local: false,
         })
+    }
+
+    /// The board whose writes stay on the clone (`--local`).
+    pub fn local(self) -> Board {
+        Board {
+            local: true,
+            ..self
+        }
     }
 
     /// `board sync` without `--board`, run in the board-data clone itself:
@@ -141,6 +154,7 @@ impl Board {
             sync::Run::Command {
                 project: &self.project,
                 kind: sync::Kind::LocalFirst,
+                local: self.local,
                 apply: &apply,
             },
         )?;
@@ -545,6 +559,7 @@ impl Board {
             sync::Run::Command {
                 project: &self.project,
                 kind,
+                local: self.local,
                 apply: &guarded,
             },
         )?;

@@ -566,3 +566,19 @@ fn migrate_is_local_first() {
     assert_eq!(world.remote_main(), before);
     assert_eq!(a.file("proj/chores.md"), None);
 }
+
+/// `migrate --local`: converted on the clone, the remote left alone.
+#[test]
+fn migrate_takes_the_local_flag() {
+    let world = World::new();
+    let a = old_board(&world);
+    let before = (world.remote_main(), a.origin_main());
+    let ran = a.board(&["migrate", "--local"]);
+    assert_eq!(
+        (ran.code, ran.stdout.as_slice(), ran.stderr.as_str()),
+        (0, &b"migrated 6 chores, 4 backlog items\n"[..], "")
+    );
+    assert_eq!((world.remote_main(), a.origin_main()), before);
+    assert_eq!(a.file("proj/chores.md"), None);
+    assert_eq!(a.status(), "");
+}

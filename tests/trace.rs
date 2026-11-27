@@ -255,6 +255,12 @@ enum Step {
     Sync {
         who: Who,
     },
+    /// A local-first command with `--local`: no fetch, no push, its commit
+    /// on the clone for a later sync. No fault: every fault is on a push.
+    Local {
+        who: Who,
+        op: Op,
+    },
     Quiesce,
 }
 
@@ -294,6 +300,17 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (any::<Index>(), prop::bool::weighted(0.8))
             .prop_map(|(pick, trailer)| Op::File { pick, trailer }),
     ]
+}
+
+/// An op whose write is local first, the ones `--local` takes: not `add`,
+/// `new brief` or `next`.
+fn local_op() -> impl Strategy<Value = Op> {
+    op().prop_filter("a local-first write", |op| {
+        !matches!(
+            op,
+            Op::AddChore { .. } | Op::AddBacklog | Op::AddWithBody { .. } | Op::NewBrief | Op::Next
+        )
+    })
 }
 
 fn brief_pick() -> impl Strategy<Value = BriefPick> {
@@ -377,6 +394,7 @@ fn step() -> impl Strategy<Value = Step> {
         5 => (who(), edit()).prop_map(|(who, edit)| Step::HandEdit { who, edit }),
         3 => (who(), prop::bool::weighted(0.65)).prop_map(|(who, online)| Step::Net { who, online }),
         2 => who().prop_map(|who| Step::Sync { who }),
+        2 => (who(), local_op()).prop_map(|(who, op)| Step::Local { who, op }),
         // Up to 11: a write's eight pushes, a lost ack's own push and more,
         // so a trace can still give up while online.
         1 => (0..12u8).prop_map(Step::RejectPushes),
@@ -435,6 +453,84 @@ fn scene() -> impl Strategy<Value = Vec<Step>> {
                 Step::Sync { who },
             ]
         })
+}
+
+/// A sweep as the planner skill writes it: a sync, flagged writes of
+/// items, and a sync, with a write of the other clone pushed in between,
+/// so the closing sync merges the flagged commits with it. Left to chance,
+/// flagged writes seldom meet the other clone's before a sync.
+fn swept() -> impl Strategy<Value = Vec<Step>> {
+    (
+        who(),
+        prop::collection::vec((any::<bool>(), any::<Index>(), 0..3u8), 1..=3),
+    )
+        .prop_map(|(who, items)| {
+            let mut steps = vec![Step::Sync { who }];
+            steps.extend(items.into_iter().map(|(backlog, item, write)| {
+                let op = match write {
+                    0 => Op::Retitle {
+                        backlog,
+                        item,
+                        text: true,
+                        check: false,
+                    },
+                    1 => Op::Body {
+                        backlog,
+                        item,
+                        replace: false,
+                        lines: 1,
+                    },
+                    _ => Op::Group {
+                        items: vec![(backlog, item)],
+                        name: 2,
+                    },
+                };
+                Step::Local { who, op }
+            }));
+            steps.extend([
+                Step::Cmd {
+                    who: who.other(),
+                    op: Op::AddBacklog,
+                    fault: None,
+                },
+                Step::Sync { who },
+            ]);
+            steps
+        })
+}
+
+/// The ends of a write's rounds with the clone online: a local-first
+/// write whose first push lands only after its second round's fetch; then,
+/// pushes refused, one that ends with its commit on the clone, and an `add`
+/// that gives up after its eight. Left to chance, a fault or a refusal
+/// seldom meets the write it is about while the clone is online.
+fn rounds_ended() -> impl Strategy<Value = Vec<Step>> {
+    (who(), any::<Index>()).prop_map(|(who, item)| {
+        let cmd = |op| Step::Cmd {
+            who,
+            op,
+            fault: None,
+        };
+        let body = Op::Body {
+            backlog: true,
+            item,
+            replace: false,
+            lines: 1,
+        };
+        vec![
+            Step::Net { who, online: true },
+            Step::RejectPushes(0),
+            cmd(Op::AddBacklog),
+            Step::Cmd {
+                who,
+                op: body.clone(),
+                fault: Some(Fault::LateLanding),
+            },
+            Step::RejectPushes(10),
+            cmd(body),
+            cmd(Op::AddBacklog),
+        ]
+    })
 }
 
 /// A brief queued to wait on a chore, the queue drained by `next` until it
@@ -519,6 +615,8 @@ fn steps() -> impl Strategy<Value = Vec<Step>> {
             1 => scene(),
             1 => waited(),
             1 => parked_through(),
+            1 => swept(),
+            1 => rounds_ended(),
         ],
         1..=30,
     )
@@ -1035,6 +1133,11 @@ struct Depth {
     /// second and last round.
     late_landing_local_first: u32,
     kill_after_push_healed: u32,
+    /// Writes with `--local` that ended 0, the remote and the clone's
+    /// `origin/main` where they were.
+    local_writes: u32,
+    /// A sync that merged a clone's flagged commits with the other clone's.
+    local_merged: u32,
     briefs_created: u32,
     briefs_queued: u32,
     briefs_claimed: u32,
@@ -1107,6 +1210,8 @@ impl Depth {
         self.late_landing_recognised += other.late_landing_recognised;
         self.late_landing_local_first += other.late_landing_local_first;
         self.kill_after_push_healed += other.kill_after_push_healed;
+        self.local_writes += other.local_writes;
+        self.local_merged += other.local_merged;
         self.briefs_created += other.briefs_created;
         self.briefs_queued += other.briefs_queued;
         self.briefs_claimed += other.briefs_claimed;
@@ -1273,6 +1378,8 @@ struct Oracle<'w> {
     online: [bool; 2],
     /// A clone with commits a write said it did not push.
     unpushed: [bool; 2],
+    /// A clone with commits of a flagged write that no write pushed yet.
+    local_unsynced: [bool; 2],
     /// A clone whose command was killed after its push landed: the next
     /// command there has to work.
     healing: [bool; 2],
@@ -1326,6 +1433,7 @@ impl<'w> Oracle<'w> {
             typed: BTreeMap::new(),
             online: [true; 2],
             unpushed: [false; 2],
+            local_unsynced: [false; 2],
             healing: [false; 2],
             content_owner: BTreeMap::new(),
             content_made: BTreeMap::new(),
@@ -2115,7 +2223,8 @@ impl<'w> Oracle<'w> {
                 self.check_everywhere()
             }
             Step::Sync { who } => self.sync(*who),
-            Step::Cmd { who, op, fault } => self.command(*who, op, fault.as_ref()),
+            Step::Cmd { who, op, fault } => self.command(*who, op, fault.as_ref(), false),
+            Step::Local { who, op } => self.command(*who, op, None, true),
         }
     }
 
@@ -2138,7 +2247,8 @@ impl<'w> Oracle<'w> {
         self.depth.commands += 1;
         self.depth.given_up_online += u32::from(given_up_online(&run));
         self.depth.left_on_the_clone += u32::from(left_on_the_clone(&run));
-        let conflicts = self.notes(who, &run)?;
+        self.count_local_merged(who, &run);
+        let conflicts = self.notes(who, &run, false)?;
         match run.code {
             Some(0) => {
                 self.depth.succeeded += 1;
@@ -2156,6 +2266,17 @@ impl<'w> Oracle<'w> {
         }
         self.conflicts_stay(who, &conflicts, &[])?;
         self.check_everywhere()
+    }
+
+    /// Depth: a sync that merged flagged writes of the clone, not pushed
+    /// yet, with what the other clone pushed meanwhile.
+    fn count_local_merged(&mut self, who: Who, run: &Run) {
+        if run.code == Some(0)
+            && run.stderr.contains("board: merged ")
+            && self.local_unsynced[who.slot()]
+        {
+            self.depth.local_merged += 1;
+        }
     }
 
     /// A run of `who` got the remote's commits, and pushed all of its own
@@ -2243,7 +2364,7 @@ impl<'w> Oracle<'w> {
                     group: ids.is_empty(),
                 }
             };
-            self.command(who, &add, None)?;
+            self.command(who, &add, None, false)?;
         }
         Ok(())
     }
@@ -2314,12 +2435,19 @@ impl<'w> Oracle<'w> {
             } else {
                 Op::NewBrief
             };
-            self.command(who, &before, None)?;
+            self.command(who, &before, None, false)?;
         }
         Ok(())
     }
 
-    fn command(&mut self, who: Who, op: &Op, fault: Option<&Fault>) -> Result<(), TestCaseError> {
+    /// `local`: run with `--local`.
+    fn command(
+        &mut self,
+        who: Who,
+        op: &Op,
+        fault: Option<&Fault>,
+        local: bool,
+    ) -> Result<(), TestCaseError> {
         let machine = self.machine(who);
         let other = self.machine(who.other());
         self.prepare(who, op)?;
@@ -2328,7 +2456,10 @@ impl<'w> Oracle<'w> {
         }
         self.actor = Some(who);
         let rejecting = self.world.rejects_left() > 0;
-        let (args, subject) = self.args(who, op);
+        let (mut args, subject) = self.args(who, op);
+        if local {
+            args.push("--local".to_owned());
+        }
         self.write_before_queue(who, op, &subject)?;
         let mut window = None;
         let mut window_edit = None;
@@ -2396,6 +2527,13 @@ impl<'w> Oracle<'w> {
         }
 
         let claimed_before = self.claimed_on_remote();
+        // Asked of git, not taken from the notes: a flagged write prints no
+        // `not pushed`, so its notes cannot tell it pushed nothing.
+        let before = (
+            self.world.remote_main(),
+            machine.origin_main(),
+            machine.main(),
+        );
         let mut command = machine.command();
         command.args(&args);
         if let Some(input) = subject.input() {
@@ -2422,6 +2560,21 @@ impl<'w> Oracle<'w> {
             run.code.is_some() || output.status.signal() == Some(9),
             "{run:?}"
         );
+        // Refused or not: a flagged run never fetches or pushes.
+        if local && run.code.is_some() {
+            prop_assert_eq!(
+                (self.world.remote_main(), machine.origin_main()),
+                (before.0.clone(), before.1.clone()),
+                "a flagged write fetched or pushed: {:?}",
+                run
+            );
+        }
+        if local && run.code == Some(0) {
+            self.depth.local_writes += 1;
+            if machine.main() != before.2 {
+                self.local_unsynced[who.slot()] = true;
+            }
+        }
         let killable = matches!(fault, Some(Fault::KillBeforePush | Fault::KillAfterPush));
         prop_assert!(
             run.code.is_some() || killable,
@@ -2468,7 +2621,7 @@ impl<'w> Oracle<'w> {
                 window_run,
                 rejecting,
                 None,
-                true,
+                (true, false),
             )?;
             if window_run.code == Some(0) && run.code == Some(0) && run.stderr.contains("retry") {
                 self.depth.raced_in_the_window += 1;
@@ -2486,7 +2639,7 @@ impl<'w> Oracle<'w> {
                 self.depth.group_met += 1;
             }
         }
-        self.judge(who, &subject, &run, rejecting, fault, false)?;
+        self.judge(who, &subject, &run, rejecting, fault, (false, local))?;
         // Saved after the push it waited on: the clone's to push still.
         if let Some(Some(id)) = window_edited {
             self.pending[who.slot()].insert(id);
@@ -2551,7 +2704,9 @@ impl<'w> Oracle<'w> {
     /// the trace can cause, or the one line of a run that failed; a
     /// conflict copy of an item is there, of that item. Gives the items
     /// whose conflict was noted.
-    fn notes(&mut self, who: Who, run: &Run) -> Result<Vec<Id>, TestCaseError> {
+    /// `local`: a run with `--local`, which pushed nothing whatever its
+    /// notes say.
+    fn notes(&mut self, who: Who, run: &Run, local: bool) -> Result<Vec<Id>, TestCaseError> {
         let machine = self.machine(who);
         let lines: Vec<&str> = run.stderr.lines().collect();
         let mut conflicts = Vec::new();
@@ -2609,16 +2764,25 @@ impl<'w> Oracle<'w> {
                 );
             }
         }
-        let pushed_all = run.code == Some(0) && !run.stderr.contains("board: not pushed");
+        let pushed_all = run.code == Some(0) && !run.stderr.contains("board: not pushed") && !local;
         if pushed_all && self.online[who.slot()] && std::mem::take(&mut self.unpushed[who.slot()]) {
             self.depth.not_pushed_then_pushed += 1;
+        }
+        // A refused plain run pushes the clone's commits too: its round
+        // builds no commit of its own on the merged base, and pushes that.
+        let published =
+            matches!(run.code, Some(0 | 1)) && !run.stderr.contains("board: not pushed") && !local;
+        if published && self.online[who.slot()] {
+            self.local_unsynced[who.slot()] = false;
         }
         Ok(conflicts)
     }
 
     /// Checks one run of `who` against the places after the step, and
     /// records what became of its subject. `window`: the run was made while
-    /// the step's command pushed, which went on after it.
+    /// the step's command pushed, which went on after it. `local`: run with
+    /// `--local`, judged as a run whose fetch failed: it applies on what was
+    /// last fetched and pushes nothing.
     fn judge(
         &mut self,
         who: Who,
@@ -2626,11 +2790,11 @@ impl<'w> Oracle<'w> {
         run: &Run,
         rejecting: bool,
         fault: Option<&Fault>,
-        window: bool,
+        (window, local): (bool, bool),
     ) -> Result<(), TestCaseError> {
         self.depth.commands += 1;
         let slot = who.slot();
-        let offline = !self.online[slot];
+        let offline = !self.online[slot] || local;
         match run.code {
             Some(0) => {
                 self.depth.succeeded += 1;
@@ -2678,7 +2842,7 @@ impl<'w> Oracle<'w> {
             Some(_) => prop_assert!(false, "unexpected exit: {run:?}"),
         }
         let conflicts = if run.code.is_some() {
-            self.notes(who, run)?
+            self.notes(who, run, local)?
         } else {
             Vec::new()
         };
@@ -3788,7 +3952,8 @@ impl<'w> Oracle<'w> {
                 "{:?}",
                 run
             );
-            let conflicts = self.notes(who, &run)?;
+            self.count_local_merged(who, &run);
+            let conflicts = self.notes(who, &run, false)?;
             self.pulled(who, true);
             if std::mem::take(&mut self.healing[who.slot()]) {
                 self.depth.kill_after_push_healed += 1;
@@ -3961,6 +4126,8 @@ fn the_traces_get_deep() {
     assert!(depth.late_landing_recognised > 0, "{depth:?}");
     assert!(depth.late_landing_local_first > 0, "{depth:?}");
     assert!(depth.kill_after_push_healed > 0, "{depth:?}");
+    assert!(depth.local_writes > 0, "{depth:?}");
+    assert!(depth.local_merged > 0, "{depth:?}");
     assert!(depth.briefs_created > 0, "{depth:?}");
     assert!(depth.briefs_queued > 0, "{depth:?}");
     assert!(depth.briefs_claimed > 0, "{depth:?}");

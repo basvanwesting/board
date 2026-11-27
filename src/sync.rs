@@ -14,9 +14,9 @@
 //!            T == U -> done;  push T -> done, or the next round,
 //!            after a random wait when the push lost a race
 //! offline  no fetch, or the last round's push failed and the one more fetch
-//!          finds none landed: X = integrate(M, U) and the command once
-//!          more, on main only; allocating an id is refused (in a local-first
-//!          write always)
+//!          finds none landed, or no round at all (`--local`): X =
+//!          integrate(M, U) and the command once more, on main only;
+//!          allocating an id is refused (in a local-first write always)
 //! advance  main fast-forwards to T; a file saved meanwhile is absorbed and
 //!          merged in, at most 3 times
 //! notes    commits not pushed, lint
@@ -96,10 +96,14 @@ pub(crate) enum Run<'a, T> {
     /// write: it is what publishes the commits local-first writes left on
     /// the clone, so giving up after two would defeat it.
     Sync { lint: Option<&'a ProjectName> },
-    /// A command of `project`'s.
+    /// A command of `project`'s; with `local` (`--local`) no round runs:
+    /// no fetch, no push, the command on `main` and what was last fetched,
+    /// its commit left on the clone for a later `board sync` (a sweep of
+    /// many commands, one push at its end).
     Command {
         project: &'a ProjectName,
         kind: Kind,
+        local: bool,
         apply: Apply<'a, T>,
     },
 }
@@ -180,14 +184,21 @@ enum Offline {
     UnreachedAfterPush(Failure),
     /// Every round's push failed with the remote reachable.
     Refused(Failure),
+    /// The caller asked for no fetch and no push (`--local`): no failure,
+    /// so no note says the commits are not pushed; a sweep would print one
+    /// per command for what it asked for.
+    Asked,
 }
 
 impl Offline {
-    fn reason(&self) -> String {
+    /// git's reason, for the note of commits not pushed; `None` when none
+    /// was tried.
+    fn reason(&self) -> Option<String> {
         match self {
             Offline::Unreached(failure)
             | Offline::UnreachedAfterPush(failure)
-            | Offline::Refused(failure) => failure.to_string(),
+            | Offline::Refused(failure) => Some(failure.to_string()),
+            Offline::Asked => None,
         }
     }
 
@@ -204,6 +215,11 @@ impl Offline {
             ),
             Offline::Refused(failure) => {
                 format!("{what}: not pushed after {ROUNDS} attempts ({failure})")
+            }
+            Offline::Asked => {
+                format!(
+                    "{what}: needs the remote, which --local leaves alone; run it without --local"
+                )
             }
         }
     }
@@ -545,17 +561,23 @@ fn write_waiting<T>(
     run: Run<'_, T>,
     wait: &dyn Fn(Duration),
 ) -> Result<Option<T>, Error> {
-    let (kind, apply, lint_of) = match run {
-        Run::Sync { lint } => (Kind::Refereed, None, lint),
+    let (kind, local, apply, lint_of) = match run {
+        Run::Sync { lint } => (Kind::Refereed, false, None, lint),
         Run::Command {
             project,
             kind,
+            local,
             apply,
-        } => (kind, Some((project, apply)), Some(project)),
+        } => (kind, local, Some((project, apply)), Some(project)),
     };
-    let rounds = match kind {
-        Kind::Refereed => ROUNDS,
-        Kind::LocalFirst => LOCAL_ROUNDS,
+    // `--local` runs no round, so it takes the offline path below as a
+    // write whose fetch failed does, without trying the fetch. Refereed
+    // commands are refused the flag in `main`; one that got past would
+    // still allocate nothing, as `Offline::Asked` refuses the remote.
+    let rounds = match (local, kind) {
+        (true, _) => 0,
+        (false, Kind::Refereed) => ROUNDS,
+        (false, Kind::LocalFirst) => LOCAL_ROUNDS,
     };
     let git = Git::at(root);
     let _lock = lock(root, notes)?;
@@ -586,7 +608,7 @@ fn write_waiting<T>(
     // Lost races so far, for the wait of the next: see [`backoff`].
     let mut races = 0;
     let mut last_refusal = None;
-    let mut offline = None;
+    let mut offline = local.then_some(Offline::Asked);
     let mut pushed = None;
     for round in 1..=rounds {
         if let Err(failure) = git.fetch() {
@@ -674,13 +696,13 @@ fn write_waiting<T>(
 
     advance(&ctx, built.tip, offline.is_none())?;
     if let Some(offline) = &offline
+        && let Some(reason) = offline.reason()
         && let Some(upstream) = git.commit("refs/remotes/origin/main").map_err(git_error)?
     {
         let commits = git
             .count_between(&upstream, &head(&git)?)
             .map_err(git_error)?;
         if commits > 0 {
-            let reason = offline.reason();
             notes(match (kind, offline) {
                 (Kind::LocalFirst, Offline::Refused(_)) => Note::NotPushedYet { commits, reason },
                 _ => Note::NotPushed { commits, reason },
@@ -1411,6 +1433,7 @@ mod tests {
                 Run::Command {
                     project: &ProjectName::parse("shop").unwrap(),
                     kind: Kind::LocalFirst,
+                    local: false,
                     apply: &apply,
                 },
                 &|_| (),
@@ -1421,6 +1444,57 @@ mod tests {
             );
         }
         assert_eq!(git(&clone.data(), &["log", "--format=%s"]), "start\n");
+    }
+
+    /// A refereed command run with `local` (which `main` refuses) still
+    /// allocates nothing and claims nothing: the flag counts as offline.
+    /// No fetch either: the remote moved, `origin/main` did not.
+    #[test]
+    fn a_refereed_write_with_local_hands_out_nothing() {
+        let clone = Clone::new();
+        // The remote moves past what the clone fetched: pushed by a URL
+        // spelled otherwise than `origin`'s, which git would take for it
+        // and move `origin/main`.
+        let data = clone.data();
+        let remote = clone.dir.path().join("remote.git");
+        let other = git(
+            &data,
+            &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "other"],
+        );
+        let refspec = format!("{}:refs/heads/main", other.trim());
+        git(&data, &["push", "-q", remote.to_str().unwrap(), &refspec]);
+        let fetched = git(&clone.data(), &["rev-parse", "refs/remotes/origin/main"]);
+        type Asks = fn(&mut Tx) -> Result<(), Error>;
+        let asks: [(&str, Asks); 4] = [
+            ("add chore", |tx| tx.alloc_chore().map(drop)),
+            ("add backlog", |tx| tx.alloc_backlog().map(drop)),
+            ("new brief", |tx| tx.alloc_brief().map(drop)),
+            ("next", |tx| tx.require_remote()),
+        ];
+        for (what, ask) in asks {
+            let apply = |tx: &mut Tx| ask(tx).map(|()| ((), "x".to_owned()));
+            let ran = write_waiting(
+                &clone.data(),
+                what,
+                &|_| (),
+                Run::Command {
+                    project: &ProjectName::parse("shop").unwrap(),
+                    kind: Kind::Refereed,
+                    local: true,
+                    apply: &apply,
+                },
+                &|_| (),
+            );
+            assert!(
+                matches!(&ran, Err(Error::NeedsRemote(why)) if why.contains("which --local leaves alone")),
+                "{what}: {ran:?}"
+            );
+        }
+        assert_eq!(git(&clone.data(), &["log", "--format=%s"]), "start\n");
+        assert_eq!(
+            git(&clone.data(), &["rev-parse", "refs/remotes/origin/main"]),
+            fetched
+        );
     }
 
     /// No race lost, no wait: a remote whose hook declines every push is
