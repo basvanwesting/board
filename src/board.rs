@@ -16,7 +16,7 @@ use crate::list::{FindError, Line};
 use crate::migrate;
 use crate::ops::{self, CheckChange, Claim, Commits, Filed, NewBacklog, NewChore, Queueing};
 use crate::project::{
-    BoardPath, BriefFile, Env, Place, Project, ProjectName, QueuePlace, Slug, resolve,
+    self, BoardPath, BriefFile, Env, Place, Project, ProjectName, QueuePlace, Slug, resolve,
 };
 use crate::sync::{self, Fetched, Note};
 
@@ -69,6 +69,28 @@ impl Board {
         })
     }
 
+    /// `board sync` without `--board`, run in the board-data clone itself:
+    /// the write with no command, lint left out (owner, 2026-11-27: "make
+    /// board sync the one exception to the refusal in the clone root, and
+    /// print no lint there"; lint is per project, and a sync covers the
+    /// whole clone). The refusal of a project with a list file of the older
+    /// storage is left out with it: it is per project too, and a list a hand
+    /// edit left is committed as any write of another project commits it.
+    /// `false` when the command does not run in the clone, for
+    /// [`Board::open`] to take it from there.
+    pub fn sync_in_clone(env: &Env, notes: &dyn Fn(Note)) -> Result<bool, Error> {
+        if !matches!(project::locate(env)?, project::Located::Clone(_)) {
+            return Ok(false);
+        }
+        sync::write::<()>(
+            &env.cwd.join(&env.root),
+            "sync",
+            notes,
+            sync::Run::Sync { lint: None },
+        )?;
+        Ok(true)
+    }
+
     pub fn project(&self) -> &ProjectName {
         &self.project
     }
@@ -97,26 +119,30 @@ impl Board {
     /// command a project with a list file takes.
     pub fn migrate(&self) -> Result<String, Error> {
         let now = now()?;
+        let apply = |tx: &mut sync::Tx| {
+            let migrated = migrate::migrate(&mut tx.project, now).map_err(|unplaced| {
+                let lines: Vec<String> =
+                    unplaced.iter().map(|line| format!("\n  {line}")).collect();
+                Error::Refused(format!(
+                    "migrate: nothing converted; fix these lines by hand and run it again:{}",
+                    lines.concat()
+                ))
+            })?;
+            if migrated.is_nothing() {
+                // Nothing changed, so nothing is committed under a subject.
+                return Ok(("nothing to migrate".to_owned(), String::new()));
+            }
+            Ok((migrated.to_string(), migrated.to_string()))
+        };
         let value = sync::write(
             &self.root,
-            &self.project,
             "migrate",
             &*self.notes,
-            sync::Run::Command(sync::Kind::LocalFirst, &|tx| {
-                let migrated = migrate::migrate(&mut tx.project, now).map_err(|unplaced| {
-                    let lines: Vec<String> =
-                        unplaced.iter().map(|line| format!("\n  {line}")).collect();
-                    Error::Refused(format!(
-                        "migrate: nothing converted; fix these lines by hand and run it again:{}",
-                        lines.concat()
-                    ))
-                })?;
-                if migrated.is_nothing() {
-                    // Nothing changed, so nothing is committed under a subject.
-                    return Ok(("nothing to migrate".to_owned(), String::new()));
-                }
-                Ok((migrated.to_string(), migrated.to_string()))
-            }),
+            sync::Run::Command {
+                project: &self.project,
+                kind: sync::Kind::LocalFirst,
+                apply: &apply,
+            },
         )?;
         Ok(value.expect("a write that runs a command gives its value"))
     }
@@ -473,10 +499,11 @@ impl Board {
         self.load()?;
         sync::write::<()>(
             &self.root,
-            &self.project,
             "sync",
             &*self.notes,
-            sync::Run::Sync,
+            sync::Run::Sync {
+                lint: Some(&self.project),
+            },
         )?;
         self.load().map(drop)
     }
@@ -513,10 +540,13 @@ impl Board {
         };
         let value = sync::write(
             &self.root,
-            &self.project,
             what,
             &*self.notes,
-            sync::Run::Command(kind, &guarded),
+            sync::Run::Command {
+                project: &self.project,
+                kind,
+                apply: &guarded,
+            },
         )?;
         Ok(value.expect("a write that runs a command gives its value"))
     }

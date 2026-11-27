@@ -83,13 +83,25 @@ pub(crate) enum Kind {
 }
 
 /// What a write runs.
+///
+/// The project goes with what needs it, the command's commit and the lint
+/// notes, so a sync in the board-data clone itself, which has no project
+/// (owner, 2026-11-27: "make board sync the one exception to the refusal
+/// in the clone root"), cannot name one: no made-up name reaches a commit
+/// or a note. Rejected: a second write function for that sync (the loop
+/// twice).
 pub(crate) enum Run<'a, T> {
-    /// No command: the clone and the remote brought together. [`ROUNDS`]
-    /// rounds, as a refereed write: it is what publishes the commits
-    /// local-first writes left on the clone, so giving up after two would
-    /// defeat it.
-    Sync,
-    Command(Kind, Apply<'a, T>),
+    /// No command: the clone and the remote brought together, then `lint`
+    /// linted; `None` in the clone itself. [`ROUNDS`] rounds, as a refereed
+    /// write: it is what publishes the commits local-first writes left on
+    /// the clone, so giving up after two would defeat it.
+    Sync { lint: Option<&'a ProjectName> },
+    /// A command of `project`'s.
+    Command {
+        project: &'a ProjectName,
+        kind: Kind,
+        apply: Apply<'a, T>,
+    },
 }
 
 /// Merges of a file saved during the write before the fast-forward is given
@@ -438,7 +450,6 @@ fn brief_mark(git: &Git, commit: &Oid, project: &ProjectName) -> Result<Option<u
 struct Ctx<'a> {
     root: &'a Path,
     git: &'a Git,
-    project: &'a ProjectName,
     what: &'a str,
     notes: &'a dyn Fn(Note),
     /// Whether the write said it merged: once, however many rounds merge
@@ -480,12 +491,11 @@ struct Built<T> {
 /// on the clone. `what` names the command in an error.
 pub(crate) fn write<T>(
     root: &Path,
-    project: &ProjectName,
     what: &str,
     notes: &dyn Fn(Note),
     run: Run<'_, T>,
 ) -> Result<Option<T>, Error> {
-    write_waiting(root, project, what, notes, run, &std::thread::sleep)
+    write_waiting(root, what, notes, run, &std::thread::sleep)
 }
 
 /// The wait after a write's `race`th lost race (1 to 7, whatever round it
@@ -530,15 +540,18 @@ fn random() -> u64 {
 /// accepted cost.
 fn write_waiting<T>(
     root: &Path,
-    project: &ProjectName,
     what: &str,
     notes: &dyn Fn(Note),
     run: Run<'_, T>,
     wait: &dyn Fn(Duration),
 ) -> Result<Option<T>, Error> {
-    let (kind, apply) = match run {
-        Run::Sync => (Kind::Refereed, None),
-        Run::Command(kind, apply) => (kind, Some(apply)),
+    let (kind, apply, lint_of) = match run {
+        Run::Sync { lint } => (Kind::Refereed, None, lint),
+        Run::Command {
+            project,
+            kind,
+            apply,
+        } => (kind, Some((project, apply)), Some(project)),
     };
     let rounds = match kind {
         Kind::Refereed => ROUNDS,
@@ -558,7 +571,6 @@ fn write_waiting<T>(
     let ctx = Ctx {
         root,
         git: &git,
-        project,
         what,
         notes,
         merge_noted: Cell::new(false),
@@ -677,7 +689,9 @@ fn write_waiting<T>(
     }
     // The write is done whatever lint finds, and a project that cannot be
     // read now was read a moment ago; lint is a note, never the result.
-    if let Ok(project) = Project::load(root, project) {
+    if let Some(project) = lint_of
+        && let Ok(project) = Project::load(root, project)
+    {
         for finding in lint(&project) {
             notes(Note::Lint(finding));
         }
@@ -894,14 +908,14 @@ fn build<T>(
     main: &Oid,
     upstream: &Oid,
     offline: Option<&Offline>,
-    apply: Option<Apply<'_, T>>,
+    apply: Option<(&ProjectName, Apply<'_, T>)>,
 ) -> Result<Built<T>, Error> {
     let base = integrate(ctx, main, upstream)?;
     let (tip, outcome) = match apply {
         None => (base, None),
-        Some(apply) => {
+        Some((project, apply)) => {
             let mut tx = Tx {
-                project: Project::load_commit(ctx.root, ctx.project, &base)?,
+                project: Project::load_commit(ctx.root, project, &base)?,
                 git: ctx.git,
                 base: base.clone(),
                 what: ctx.what,
@@ -919,7 +933,7 @@ fn build<T>(
                         ctx.git,
                         &base,
                         &tx.project,
-                        &format!("{}: {subject}\n\nBoard-Run: {}", ctx.project, ctx.run),
+                        &format!("{project}: {subject}\n\nBoard-Run: {}", ctx.run),
                     )?,
                     Some(Ok(value)),
                 ),
@@ -1260,12 +1274,12 @@ mod tests {
             .unwrap();
             let waits = RefCell::new(Vec::new());
             let notes = RefCell::new(Vec::new());
+            let shop = ProjectName::parse("shop").unwrap();
             let ran = write_waiting::<()>(
                 &data,
-                &ProjectName::parse("shop").unwrap(),
                 "sync",
                 &|note| notes.borrow_mut().push(note),
-                Run::Sync,
+                Run::Sync { lint: Some(&shop) },
                 &|wait| waits.borrow_mut().push(wait),
             );
             (ran.map(drop), waits.into_inner(), notes.into_inner())
@@ -1392,10 +1406,13 @@ mod tests {
             let apply = |tx: &mut Tx| ask(tx).map(|()| ((), "x".to_owned()));
             let ran = write_waiting(
                 &clone.data(),
-                &ProjectName::parse("shop").unwrap(),
                 what,
                 &|note| notes.borrow_mut().push(note),
-                Run::Command(Kind::LocalFirst, &apply),
+                Run::Command {
+                    project: &ProjectName::parse("shop").unwrap(),
+                    kind: Kind::LocalFirst,
+                    apply: &apply,
+                },
                 &|_| (),
             );
             assert!(

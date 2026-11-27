@@ -393,8 +393,13 @@ fn run(cli: Cli) -> Result<(Vec<u8>, Exit), Error> {
     // A note is written as it comes, before the command goes on: `waiting
     // for lock` has to show while the command waits.
     let notes = Box::new(|note: board::Note| complain(&note.to_string()));
-    let board = Board::open(Env::from_process(cli.board)?, notes)?;
     let line = |text: String| Ok((format!("{text}\n").into_bytes(), Exit::Ok));
+    let env = Env::from_process(cli.board)?;
+    // The one command the board-data clone itself takes (`Board::sync_in_clone`).
+    if matches!(command, Run::Sync) && Board::sync_in_clone(&env, &*notes)? {
+        return line("synced".to_owned());
+    }
+    let board = Board::open(env, notes)?;
     match command {
         Run::Tui => {
             board::tui::run(board)?;

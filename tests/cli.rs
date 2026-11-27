@@ -590,6 +590,123 @@ fn a_linked_worktree_of_a_repository_that_gives_no_project_is_a_usage_error() {
     assert_eq!(a.board_in(&worktree, &["--board", "proj", "ls"]).code, 0);
 }
 
+/// `board sync` is the one command the clone itself takes (owner,
+/// 2026-11-27): the clone's hand edits of every project in one commit, and
+/// no lint, which is per project. A directory inside the clone is not read
+/// as a project's name.
+#[test]
+fn board_sync_runs_in_the_board_data_clone_without_lint() {
+    let world = World::new();
+    let a = world.a();
+    let data = a.data();
+    let lint = "board: lint: proj/backlog/b1.md: no `group:` line";
+    for (directory, title) in [(data.clone(), "one"), (data.join("proj/chores"), "two")] {
+        // A lint finding in proj, a plain edit in another project, and a
+        // finding under the clone's own name: a sync that took the clone for
+        // a project `board-data` would lint it.
+        a.write(
+            "board-data/backlog/b1.md",
+            format!("id: b1\ncreated: x\n\n# {title}\n"),
+        );
+        a.write(
+            "proj/backlog/b1.md",
+            format!("id: b1\ncreated: x\n\n# {title}\n"),
+        );
+        a.write(
+            "proj/chores/c1.md",
+            format!("id: c1\ngroup: g\ncreated: x\n\n# {title}\n"),
+        );
+        a.write(
+            "shop/chores/c1.md",
+            format!("id: c1\ngroup: g\ncreated: x\n\n# {title}\n"),
+        );
+        let before = world.remote_log().len();
+        let ran = a.board_in(&directory, &["sync"]);
+        assert_eq!(
+            (ran.code, ran.stdout.as_slice()),
+            (0, &b"synced\n"[..]),
+            "{ran:?}"
+        );
+        assert!(!ran.stderr.contains("lint:"), "{ran:?}");
+        assert!(!ran.stderr.contains("board-data"), "{ran:?}");
+        let log = world.remote_log();
+        assert_eq!(log.len(), before + 1);
+        assert_eq!(log[0], "board: hand edits");
+        let mut changed = world.remote_changed("main");
+        changed.sort();
+        assert_eq!(
+            changed,
+            [
+                "board-data/backlog/b1.md",
+                "proj/backlog/b1.md",
+                "proj/chores/c1.md",
+                "shop/chores/c1.md"
+            ]
+        );
+    }
+
+    // The same finding, from proj's checkout or named: linted.
+    a.write("proj/backlog/b1.md", "id: b1\ncreated: x\n\n# three\n");
+    let ran = a.board(&["sync"]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert!(ran.stderr.contains(lint), "{ran:?}");
+    let ran = a.board_in(&data, &["--board", "proj", "sync"]);
+    assert_eq!(ran.code, 0, "{ran:?}");
+    assert!(ran.stderr.contains(lint), "{ran:?}");
+    let ran = a.board_in(&data, &["--board", "board-data", "sync"]);
+    assert!(
+        ran.stderr
+            .contains("board: lint: board-data/backlog/b1.md: no `group:` line"),
+        "{ran:?}"
+    );
+
+    // Every other command stays refused there, and commits nothing.
+    let refused = format!(
+        "board: no project for {}: it is the board-data clone, which holds every \
+         project's board; name the board with --board <name>\n",
+        data.display()
+    );
+    a.write(
+        "shop/chores/c2.md",
+        "id: c2\ngroup: g\ncreated: x\n\n# hand\n",
+    );
+    let main = a.main();
+    for command in [&["ls"][..], &["lint"], &["add", "backlog", "x"]] {
+        assert_eq!(a.board_in(&data, command).failed(2), refused, "{command:?}");
+    }
+    assert_eq!(a.main(), main);
+
+    // Offline: as from a project, the hand edit committed on the clone.
+    a.set_online(false);
+    let ran = a.board_in(&data, &["sync"]);
+    assert_eq!(ran.code, 3, "{ran:?}");
+    assert!(
+        ran.stderr
+            .contains("sync: needs the remote, which was not reached"),
+        "{ran:?}"
+    );
+    assert!(!ran.stderr.contains("board-data"), "{ran:?}");
+    assert_ne!(a.main(), main);
+    assert_eq!(a.status(), "");
+    a.set_online(true);
+
+    // A work tree added to the clone stays refused, sync included.
+    let worktree = a.home().join("Work").join("data-wt");
+    add_worktree(&a, &data, &worktree);
+    let main = a.main();
+    assert_eq!(
+        a.board_in(&worktree, &["sync"]).failed(2),
+        format!(
+            "board: no project for {}, the repository of the worktree {}: it is the \
+             board-data clone, which holds every project's board; name the board with \
+             --board <name>\n",
+            data.display(),
+            worktree.display()
+        )
+    );
+    assert_eq!(a.main(), main);
+}
+
 /// The board-data clone is a repository below `~/Work` too, and the place
 /// where lists are edited by hand. Its path names a project nobody has, so
 /// the board there would be a wrong one that looks right: empty, lint `ok`.

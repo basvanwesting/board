@@ -102,9 +102,34 @@ fn not_a_project_name(name: &str, origin: &str) -> String {
 /// A given name replaces the name only. It runs no git, so a read with
 /// `--board` works anywhere.
 pub fn resolve(env: &Env) -> Result<ProjectName, Error> {
-    const HINT: &str = "name the board with --board <name>";
+    match locate(env)? {
+        Located::Project(name) => Ok(name),
+        Located::Clone(checkout) => Err(Error::Usage(format!(
+            "no project for {}: it is the board-data clone, which holds every project's \
+             board; {HINT}",
+            checkout.display()
+        ))),
+    }
+}
+
+const HINT: &str = "name the board with --board <name>";
+
+/// Where a command without `--board` runs, as [`resolve`] reads it.
+pub(crate) enum Located {
+    Project(ProjectName),
+    /// The board-data clone's own work tree, at this checkout, or a
+    /// directory in it: no project, though `board sync` runs there. A work
+    /// tree added to the clone is not this (it is refused as before): a sync
+    /// commits the clone's own work tree, so one there would leave the edits
+    /// of the added one out and say `synced`.
+    Clone(PathBuf),
+}
+
+/// [`resolve`], with the board-data clone told apart instead of refused.
+pub(crate) fn locate(env: &Env) -> Result<Located, Error> {
     if let Some(name) = &env.board {
         return ProjectName::parse(name)
+            .map(Located::Project)
             .ok_or_else(|| Error::Usage(not_a_project_name(name, "--board or BOARD")));
     }
     let git = Git::at(&env.cwd);
@@ -144,6 +169,7 @@ pub fn resolve(env: &Env) -> Result<ProjectName, Error> {
     let work = fs::canonicalize(&work).unwrap_or(work);
     let checkout =
         fs::canonicalize(&checkout).map_err(|source| Error::io("resolve", &checkout, source))?;
+    let added = worktree.is_some();
     let shown = match worktree {
         None => checkout.display().to_string(),
         Some(worktree) => format!(
@@ -155,21 +181,26 @@ pub fn resolve(env: &Env) -> Result<ProjectName, Error> {
     // Canonical like the checkout. A clone that is not there is no checkout,
     // and `Board::open` says that it is missing.
     let root = fs::canonicalize(&env.root).unwrap_or_else(|_| env.root.clone());
+    if checkout == root && !added {
+        return Ok(Located::Clone(checkout));
+    }
     if checkout == root {
         return Err(Error::Usage(format!(
             "no project for {shown}: it is the board-data clone, which holds every project's \
              board; {HINT}"
         )));
     }
-    name_below(&work, &checkout).map_err(|why| {
-        Error::Usage(match why {
-            NoName::Outside => format!(
-                "no project for {shown}: it is not below {}; {HINT}",
-                work.display()
-            ),
-            NoName::Not(name) => format!("{}; {HINT}", not_a_project_name(&name, &shown)),
+    name_below(&work, &checkout)
+        .map(Located::Project)
+        .map_err(|why| {
+            Error::Usage(match why {
+                NoName::Outside => format!(
+                    "no project for {shown}: it is not below {}; {HINT}",
+                    work.display()
+                ),
+                NoName::Not(name) => format!("{}; {HINT}", not_a_project_name(&name, &shown)),
+            })
         })
-    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
